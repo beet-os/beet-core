@@ -2,11 +2,18 @@
 
 ## What is this project?
 
-BeetOS is a secure, minimal OS for Apple Silicon MacBook Air M1, built on the **Xous microkernel** cherry-picked from [KeyOS](https://github.com/Foundation-Devices/KeyOS) (Foundation Devices' hardware wallet OS). We keep Xous's platform-agnostic kernel core (~7500 LOC) and rewrite only the hardware layer for AArch64 / Apple Silicon (~5000 LOC).
+BeetOS is a secure, minimal OS for AArch64, built on the **Xous microkernel** cherry-picked from [KeyOS](https://github.com/Foundation-Devices/KeyOS) (Foundation Devices' hardware wallet OS). We keep Xous's platform-agnostic kernel core (~7500 LOC) and rewrite only the hardware layer for AArch64 (~5000 LOC).
 
-The boot chain on hardware is: iBoot (Apple firmware) → m1n1 (Asahi bootloader) → BeetOS loader → BeetOS kernel + services.
+BeetOS is **multi-platform**: the `arch/aarch64/` code is generic AArch64 (page tables, exception vectors, context switch, ASID, eret — same ISA everywhere). All hardware-specific code lives in `platform/` modules. Adding a new platform = new platform module, no kernel rewrite.
 
-For development, the **hosted mode** runs the entire OS as a normal process on your laptop — no hardware needed.
+**Supported platforms:**
+- **QEMU virt** — primary development & CI target (GIC, PL011 UART, virtio)
+- **Apple M1** (MacBook Air j313, T8103) — real hardware target (AIC, m1n1, SPI keyboard, ANS NVMe)
+- **Raspberry Pi 4** — future
+
+The boot chain on Apple M1 hardware is: iBoot (Apple firmware) → m1n1 (Asahi bootloader) → BeetOS loader → BeetOS kernel + services.
+
+For development, the **hosted mode** runs the entire OS as a normal process on your laptop — no hardware needed. The **QEMU virt** platform allows testing real AArch64 code without owning specific hardware.
 
 ## Origin of the code
 
@@ -21,8 +28,9 @@ The `xous/` subtree is cherry-picked from KeyOS, NOT written from scratch. Key f
 | `xous/kernel/src/scheduler.rs`          | KeyOS  | Copied as-is                     |
 | `xous/kernel/src/mem.rs`                | KeyOS  | Copied, adapted for 64-bit       |
 | `xous/kernel/src/arch/hosted/`          | KeyOS  | Copied as-is (for dev/test)      |
-| `xous/kernel/src/arch/aarch64/`         | —      | **NEW** (our AArch64 port)       |
-| `xous/kernel/src/platform/apple_t8103/` | —      | **NEW** (our Apple M1 platform)  |
+| `xous/kernel/src/arch/aarch64/`         | —      | **NEW** (our AArch64 port, generic — no platform-specific code) |
+| `xous/kernel/src/platform/qemu_virt/`   | —      | **NEW** (QEMU virt: GIC, PL011, virtio) |
+| `xous/kernel/src/platform/apple_t8103/` | —      | **NEW** (Apple M1: AIC, m1n1, SPI, ANS) |
 | `xous/xous-rs/`                         | KeyOS  | Copied + new `arch/aarch64/`     |
 | `xous/ipc/`                             | KeyOS  | Copied as-is                     |
 | `xous/{log,names,ticktimer,trng}/`      | KeyOS  | Copied, platform/ rewritten      |
@@ -35,9 +43,10 @@ When modifying copied Xous code, understand the existing design before changing 
 ```
 xous/           ← Xous microkernel (cherry-picked from KeyOS)
   kernel/       ← the microkernel: syscalls, IPC, scheduler, memory
-    src/arch/aarch64/   ← our AArch64 port (NEW)
+    src/arch/aarch64/   ← our AArch64 port (generic, no platform-specific code)
     src/arch/hosted/    ← hosted mode for dev/test (from KeyOS)
-    src/platform/apple_t8103/  ← Apple M1 platform (NEW)
+    src/platform/qemu_virt/    ← QEMU virt platform (GIC, PL011, virtio)
+    src/platform/apple_t8103/  ← Apple M1 platform (AIC, m1n1, SPI, ANS)
   xous-rs/      ← userspace syscall library (like libc for Xous)
   ipc/          ← shared IPC types
   api/          ← core service APIs (log, names, ticktimer)
@@ -73,6 +82,17 @@ In hosted mode:
 This tests all kernel logic: IPC, scheduling, syscall dispatch, service registration, the shell, the ramfs — everything except hardware-specific code.
 
 ## How to Build for Hardware
+
+### QEMU virt (primary hardware target — no special hardware needed)
+
+```bash
+cargo xtask build          # cross-compile for aarch64-unknown-none
+cargo xtask qemu           # launch QEMU virt with the kernel (UART output to terminal)
+```
+
+Requires: `qemu-system-aarch64` installed on host.
+
+### Apple M1 (real hardware)
 
 ```bash
 cargo xtask build          # cross-compile for aarch64-unknown-none
@@ -130,6 +150,13 @@ Full `std` support (via custom Rust toolchain fork) is planned as M7, optional, 
 - `https://github.com/Foundation-Devices/KeyOS` — KeyOS (ARM port we cherry-pick from)
 - KeyOS `xous/kernel/src/arch/arm/` — reference for our `arch/aarch64/` port
 
+**For QEMU virt platform** — standard ARM hardware:
+
+- **GICv3**: ARM GIC Architecture Specification (IHI 0069), Linux `drivers/irqchip/irq-gic-v3.c`
+- **PL011 UART**: ARM PL011 Technical Reference Manual, Linux `drivers/tty/serial/amba-pl011.c`
+- **virtio**: virtio spec v1.2, Linux `drivers/virtio/`
+- **QEMU virt machine**: QEMU source `hw/arm/virt.c` for memory map and device layout
+
 **For Apple Silicon hardware** — consult the Asahi Linux kernel tree:
 
 - **AIC**: `drivers/irqchip/irq-apple-aic.c`
@@ -143,12 +170,13 @@ These are C files. Reimplement the protocol in Rust — do not translate C line-
 ## Testing Strategy
 
 1. **Hosted mode** (`cargo test`, `cargo run`): Primary. Tests all kernel logic, IPC, services, shell, ramfs. No hardware needed. 80% of development happens here.
-2. **Hardware** (via m1n1 USB proxy): Tests AArch64 arch code, Apple platform code, real drivers. 7-second cycle.
-3. **Conditional compilation**: `#[cfg(beetos)]` for hardware paths, `#[cfg(not(beetos))]` for hosted paths. `#[cfg(test)]` for unit tests.
+2. **QEMU virt** (`cargo xtask qemu`): Tests real AArch64 arch code (page tables, exceptions, context switch) on standard hardware (GIC, PL011). Any developer can run this. Ideal for CI.
+3. **Apple M1 hardware** (via m1n1 USB proxy): Tests Apple platform code, real drivers. 7-second cycle. Requires physical hardware.
+4. **Conditional compilation**: `#[cfg(beetos)]` for hardware paths, `#[cfg(not(beetos))]` for hosted paths. `#[cfg(test)]` for unit tests.
 
 ## Git Workflow
 
-- `main` branch is always functional in hosted mode (from M0 onwards) and bootable on hardware (from M2 onwards).
+- `main` branch is always functional in hosted mode (from M0 onwards), bootable on QEMU (from M2 onwards), and bootable on Apple M1 (from M3 onwards).
 - Feature branches per milestone: `m0-cherry-pick`, `m1-aarch64`, `m2-first-boot`, `m3-shell`, etc.
 - Squash merge to main when milestone passes all tests.
 - Tag releases: `v0.1.0` (M0), `v0.2.0` (M1), etc.
