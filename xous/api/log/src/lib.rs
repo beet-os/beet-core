@@ -29,7 +29,7 @@ impl XousLogger {
     fn log_impl(&self, record: &log::Record) {
         let interrupts_enabled = interrupts_enabled();
         let mut buf =
-            xous::map_memory(None, None, 0x1000, xous::MemoryFlags::W | xous::MemoryFlags::POPULATE).unwrap();
+            xous::map_memory(None, None, xous::PAGE_SIZE, xous::MemoryFlags::W | xous::MemoryFlags::POPULATE).unwrap();
         let mut wrapper = BufferWrapper::new(buf.as_slice_mut());
         let level = match record.level() {
             log::Level::Error => "ERR",

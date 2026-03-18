@@ -439,6 +439,7 @@ impl JoinWithSpaces for [&str] {
 }
 
 #[cfg(test)]
+#[allow(static_mut_refs)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -451,6 +452,15 @@ mod tests {
         ramfs::reset();
         ramfs::init();
         guard
+    }
+
+    #[test]
+    fn test_shell_init() {
+        let _g = setup();
+        init();
+        // init creates /tmp, /etc, /etc/motd
+        let data = ramfs::read("/etc/motd").expect("motd should exist after init");
+        assert_eq!(data, b"Welcome to BeetOS!\n");
     }
 
     #[test]

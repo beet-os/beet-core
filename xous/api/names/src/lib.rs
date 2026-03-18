@@ -10,14 +10,16 @@ use xous::MemoryFlags;
 
 use crate::api::NAME_MAX_LENGTH;
 
-/// A page-aligned stack allocation for connection requests
-#[repr(C, align(4096))]
+/// A page-aligned stack allocation for connection requests.
+/// Aligned to 16KB (AArch64 page size) — safe on all targets since hosted mode
+/// uses 4KB pages and 16KB alignment satisfies both.
+#[repr(C, align(16384))]
 struct AlignedBuffer {
-    data: [u8; 4096],
+    data: [u8; xous::PAGE_SIZE],
 }
 impl AlignedBuffer {
     pub fn new_connect_request(name: &str) -> Self {
-        let mut cr = AlignedBuffer { data: [0u8; 4096] };
+        let mut cr = AlignedBuffer { data: [0u8; xous::PAGE_SIZE] };
         let name_bytes = name.as_bytes();
         // Copy the string into our backing store.
         for (&src_byte, dest_byte) in name_bytes.iter().zip(&mut cr.data[0..NAME_MAX_LENGTH]) {
@@ -27,7 +29,7 @@ impl AlignedBuffer {
     }
 
     pub fn new_register_request(sid: xous::SID, name: &str) -> Self {
-        let mut cr = AlignedBuffer { data: [0u8; 4096] };
+        let mut cr = AlignedBuffer { data: [0u8; xous::PAGE_SIZE] };
         let name_bytes = name.as_bytes();
         cr.data[0..16].copy_from_slice(&sid.to_bytes());
         // Copy the string into our backing store.
@@ -56,7 +58,7 @@ impl XousNames {
         let msg = xous::MemoryMessage {
             id: api::Opcode::Register as usize,
             buf: unsafe {
-                // safety: `request` is #[repr(C, align(4096))], and should be exactly on page in size
+                // safety: `request` is page-aligned and exactly one page in size
                 xous::MemoryRange::new(
                     &mut request as *mut _ as *mut u8 as usize,
                     core::mem::size_of::<AlignedBuffer>(),
@@ -85,7 +87,7 @@ impl XousNames {
                 api::Opcode::TryConnect as usize
             },
             buf: unsafe {
-                // safety: `request` is #[repr(C, align(4096))], and should be exactly on page in size
+                // safety: `request` is page-aligned and exactly one page in size
                 xous::MemoryRange::new(
                     &mut request as *mut _ as *mut u8 as usize,
                     core::mem::size_of::<AlignedBuffer>(),
@@ -130,7 +132,7 @@ impl XousNames {
         let mut buf = DropDeallocate(xous::map_memory(
             None,
             None,
-            manifest_data.len().next_multiple_of(0x1000),
+            manifest_data.len().next_multiple_of(xous::PAGE_SIZE),
             MemoryFlags::W,
         )?);
         buf.0.as_slice_mut()[..manifest_data.len()].copy_from_slice(manifest_data);

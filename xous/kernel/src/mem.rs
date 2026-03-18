@@ -726,7 +726,7 @@ impl MemoryManager {
     #[cfg(beetos)]
     fn claim_release_move(&mut self, addr: usize, pid: PID, action: ClaimReleaseMove) -> Result<(), Error> {
         // Ensure the address lies on a page boundary
-        if addr & 0xfff != 0 {
+        if addr & (beetos::PAGE_SIZE - 1) != 0 {
             return Err(Error::BadAlignment);
         }
 
@@ -742,9 +742,9 @@ impl MemoryManager {
             for base in crate::arch::mem::SHARED_PERIPHERALS.iter() {
                 if pid.get() != 1
                     && (addr == *base
-                        || addr == *base + 0x1000
-                        || addr == *base + 0x2000
-                        || addr == *base + 0x3000)
+                        || addr == *base + beetos::PAGE_SIZE
+                        || addr == *base + 2 * beetos::PAGE_SIZE
+                        || addr == *base + 3 * beetos::PAGE_SIZE)
                 {
                     klog!("[!] Peripheral sharing workaround used for {:08x} address", addr);
                     return Ok(());

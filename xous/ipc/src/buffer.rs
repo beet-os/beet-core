@@ -33,7 +33,7 @@ pub struct Buffer<'buf> {
 
 impl<'buf> Buffer<'buf> {
     pub fn new(len: usize) -> Self {
-        let len = core::cmp::max(len.next_multiple_of(0x1000), 0x1000);
+        let len = core::cmp::max(len.next_multiple_of(xous::PAGE_SIZE), xous::PAGE_SIZE);
         // Allocate enough memory to hold the requested data
         let new_mem = map_memory(None, None, len, MemoryFlags::W).expect("Buffer: error in new()/map_memory");
         Buffer {

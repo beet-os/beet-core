@@ -15,9 +15,10 @@ impl<'a> Carton<'a> {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let src_mem = bytes.as_ptr();
 
-        // Ensure our byte size is a multiple of 4096
-        let remainder = bytes.len() & 4095;
-        let size = bytes.len() + (4096 - remainder);
+        // Ensure our byte size is a multiple of PAGE_SIZE
+        let page_mask = crate::PAGE_SIZE - 1;
+        let remainder = bytes.len() & page_mask;
+        let size = bytes.len() + (crate::PAGE_SIZE - remainder);
 
         let new_mem = crate::map_memory(None, None, size, crate::MemoryFlags::W).unwrap();
 

@@ -1,5 +1,6 @@
 use crate::{Error, MemoryAddress, MemoryFlags, MemoryRange};
-const PAGE_SIZE: usize = 4096;
+// In hosted mode, use the host-appropriate page size from crate root.
+const PAGE_SIZE: usize = crate::PAGE_SIZE;
 
 extern crate alloc;
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};

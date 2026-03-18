@@ -31,14 +31,15 @@ impl<'a> StringBuffer<'a> {
     /// Create a new StringBuffer with enough space to hold
     /// `usize` characters
     pub fn with_capacity(capacity: usize) -> Self {
+        let page_mask = crate::PAGE_SIZE - 1;
         let remainder =
-            if ((capacity & 0xFFF) == 0) && (capacity > 0) { 0 } else { 0x1000 - (capacity & 0xFFF) };
+            if ((capacity & page_mask) == 0) && (capacity > 0) { 0 } else { crate::PAGE_SIZE - (capacity & page_mask) };
 
         // Allocate enough memory to hold the requested data
         let new_mem = map_memory(
             None,
             None,
-            // Ensure our byte size is a multiple of 4096
+            // Ensure our byte size is a multiple of PAGE_SIZE
             capacity + remainder,
             crate::MemoryFlags::W,
         )
@@ -60,10 +61,11 @@ impl<'a> StringBuffer<'a> {
             return;
         }
 
-        let remainder = if ((new_capacity & 0xFFF) == 0) && (new_capacity > 0) {
+        let page_mask = crate::PAGE_SIZE - 1;
+        let remainder = if ((new_capacity & page_mask) == 0) && (new_capacity > 0) {
             0
         } else {
-            0x1000 - (new_capacity & 0xFFF)
+            crate::PAGE_SIZE - (new_capacity & page_mask)
         };
 
         // If the new size is the same as the current size, don't do anything.

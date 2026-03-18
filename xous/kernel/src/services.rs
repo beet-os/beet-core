@@ -334,13 +334,13 @@ impl SystemServices {
         if len == 0 {
             return Err(Error::BadAddress);
         }
-        if len & 0xfff != 0 {
+        if len & (beetos::PAGE_SIZE - 1) != 0 {
             return Err(Error::BadAddress);
         }
-        if src_virt as usize & 0xfff != 0 {
+        if src_virt as usize & (beetos::PAGE_SIZE - 1) != 0 {
             return Err(Error::BadAddress);
         }
-        if dest_virt as usize & 0xfff != 0 {
+        if dest_virt as usize & (beetos::PAGE_SIZE - 1) != 0 {
             return Err(Error::BadAddress);
         }
         if (dest_virt as usize) + len > beetos::USER_AREA_END {
@@ -376,8 +376,8 @@ impl SystemServices {
 
             // Move each subsequent page.
             for offset in (0..usize_len).step_by(usize_page) {
-                assert_eq!(((src_virt.wrapping_add(offset) as usize) & 0xfff), 0);
-                assert_eq!(((dest_virt.wrapping_add(offset) as usize) & 0xfff), 0);
+                assert_eq!(((src_virt.wrapping_add(offset) as usize) & (beetos::PAGE_SIZE - 1)), 0);
+                assert_eq!(((dest_virt.wrapping_add(offset) as usize) & (beetos::PAGE_SIZE - 1)), 0);
                 mm.ensure_page_exists(src_virt.wrapping_add(offset))?;
                 mm.move_page(
                     src_mapping,
@@ -438,13 +438,13 @@ impl SystemServices {
         if len == 0 {
             return Err(Error::BadAddress);
         }
-        if len & 0xfff != 0 {
+        if len & (beetos::PAGE_SIZE - 1) != 0 {
             return Err(Error::BadAlignment);
         }
-        if src_virt as usize & 0xfff != 0 {
+        if src_virt as usize & (beetos::PAGE_SIZE - 1) != 0 {
             return Err(Error::BadAlignment);
         }
-        if dest_virt as usize & 0xfff != 0 {
+        if dest_virt as usize & (beetos::PAGE_SIZE - 1) != 0 {
             return Err(Error::BadAlignment);
         }
         // Iterators and `ptr.wrapping_add()` operate on `usize` types,
@@ -458,7 +458,7 @@ impl SystemServices {
         if current_pid == dest_pid {
             MemoryManager::with_mut(|mm| {
                 for offset in (0..usize_len).step_by(usize_page) {
-                    assert!(((src_virt.wrapping_add(offset) as usize) & 0xfff) == 0);
+                    assert!(((src_virt.wrapping_add(offset) as usize) & (beetos::PAGE_SIZE - 1)) == 0);
                     mm.ensure_page_exists(src_virt.wrapping_add(offset))?;
                 }
                 Ok(())
@@ -477,8 +477,8 @@ impl SystemServices {
 
             // Lend each subsequent page.
             for offset in (0..usize_len).step_by(usize_page) {
-                assert!(((src_virt.wrapping_add(offset) as usize) & 0xfff) == 0);
-                assert!(((dest_virt.wrapping_add(offset) as usize) & 0xfff) == 0);
+                assert!(((src_virt.wrapping_add(offset) as usize) & (beetos::PAGE_SIZE - 1)) == 0);
+                assert!(((dest_virt.wrapping_add(offset) as usize) & (beetos::PAGE_SIZE - 1)) == 0);
                 mm.ensure_page_exists(src_virt.wrapping_add(offset))?;
                 mm.lend_page(
                     src_mapping,
@@ -539,15 +539,15 @@ impl SystemServices {
             // klog!("No len");
             return Err(Error::BadAddress);
         }
-        if len & 0xfff != 0 {
+        if len & (beetos::PAGE_SIZE - 1) != 0 {
             // klog!("len not aligned");
             return Err(Error::BadAddress);
         }
-        if src_virt as usize & 0xfff != 0 {
+        if src_virt as usize & (beetos::PAGE_SIZE - 1) != 0 {
             // klog!("Src virt not aligned");
             return Err(Error::BadAddress);
         }
-        if dest_virt as usize & 0xfff != 0 {
+        if dest_virt as usize & (beetos::PAGE_SIZE - 1) != 0 {
             // klog!("dest virt not aligned");
             return Err(Error::BadAddress);
         }
@@ -572,8 +572,8 @@ impl SystemServices {
 
             // Lend each subsequent page.
             for offset in (0..usize_len).step_by(usize_page) {
-                assert!(((src_virt.wrapping_add(offset) as usize) & 0xfff) == 0);
-                assert!(((dest_virt.wrapping_add(offset) as usize) & 0xfff) == 0);
+                assert!(((src_virt.wrapping_add(offset) as usize) & (beetos::PAGE_SIZE - 1)) == 0);
+                assert!(((dest_virt.wrapping_add(offset) as usize) & (beetos::PAGE_SIZE - 1)) == 0);
                 mm.unlend_page(
                     src_mapping,
                     src_virt.wrapping_add(offset),
@@ -714,7 +714,7 @@ impl SystemServices {
                 })?;
 
                 #[cfg(not(beetos))]
-                let backing = unsafe { MemoryRange::new(4096, 4096).unwrap() };
+                let backing = unsafe { MemoryRange::new(beetos::PAGE_SIZE, beetos::PAGE_SIZE).unwrap() };
 
                 Server::init(entry, pid, sid, backing, initial_permissions).unwrap();
 

@@ -44,7 +44,7 @@ impl Trng {
         // Manually mapping memory instead of using a Buffer, because we want to
         // set the `valid` field to the data length in the Message
         let aligned_buffer =
-            xous::map_memory(None, None, (data.len() * 4).next_multiple_of(4096), xous::MemoryFlags::W)?;
+            xous::map_memory(None, None, (data.len() * 4).next_multiple_of(xous::PAGE_SIZE), xous::MemoryFlags::W)?;
         let result = xous::send_message(
             self.conn,
             xous::Message::MutableBorrow(xous::MemoryMessage {
