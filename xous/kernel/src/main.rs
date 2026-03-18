@@ -29,6 +29,9 @@ mod server;
 mod services;
 mod syscall;
 
+#[cfg(beetos)]
+mod shell;
+
 #[cfg(not(beetos))]
 use services::SystemServices;
 #[cfg(not(beetos))]
@@ -68,8 +71,12 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     // Unmask IRQs so timer ticks are delivered
     core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack)); // Clear IRQ mask
 
+    // Enable UART RX interrupt for shell input
     #[cfg(feature = "platform-qemu-virt")]
-    platform::qemu_virt::uart::puts("Kernel initialized. Entering idle loop.\n");
+    platform::qemu_virt::uart::enable_rx_interrupt();
+
+    // Initialize the interactive shell
+    shell::init();
 
     kmain();
 

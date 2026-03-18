@@ -99,12 +99,14 @@ fn handle_irq() {
 
         match irq {
             timer::TIMER_IRQ => {
-                let tick = timer::handle_tick();
-                // Log every 100th tick (100Hz timer = once per second)
-                if tick % 100 == 0 {
-                    use core::fmt::Write;
-                    let _ = write!(uart::UartWriter, "tick {} ({}s)\n", tick, tick / 100);
+                timer::handle_tick();
+            }
+            uart::UART_IRQ => {
+                // Read all pending characters and feed to shell
+                while let Some(c) = uart::try_getc() {
+                    crate::shell::process_char(c);
                 }
+                uart::clear_rx_interrupt();
             }
             irq_id => {
                 use core::fmt::Write;

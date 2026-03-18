@@ -75,13 +75,14 @@ pub fn init(base: usize) {
     }
 }
 
-/// Enable RX interrupt (for future input handling).
-#[allow(dead_code)]
+/// Enable RX interrupt for character input.
 pub fn enable_rx_interrupt() {
     unsafe {
         let imsc = read_reg(regs::IMSC);
         write_reg(regs::IMSC, imsc | regs::IMSC_RXIM);
     }
+    // Enable UART IRQ in the GIC
+    super::gic::enable_irq(UART_IRQ);
 }
 
 /// Write a single byte to the UART (polled).
@@ -119,6 +120,16 @@ pub fn try_getc() -> Option<u8> {
         } else {
             Some((read_reg(regs::DR) & 0xFF) as u8)
         }
+    }
+}
+
+/// GIC IRQ number for UART0 on QEMU virt (SPI 1 = INTID 33).
+pub const UART_IRQ: u32 = 33;
+
+/// Clear the RX interrupt (call after reading all pending characters).
+pub fn clear_rx_interrupt() {
+    unsafe {
+        write_reg(regs::ICR, regs::IMSC_RXIM);
     }
 }
 
