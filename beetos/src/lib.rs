@@ -82,6 +82,10 @@ pub const IRQ_STACK_BOTTOM: usize = 0xFFFF_FFFF_FFFE_4000;
 pub const IRQ_STACK_PAGE_COUNT: usize = 4;
 pub const IRQ_STACK_TOP_GUARD: usize = IRQ_STACK_BOTTOM - PAGE_SIZE * (IRQ_STACK_PAGE_COUNT + 1);
 
+/// Aliases for compatibility with copied kernel code (services.rs).
+pub const KERNEL_IRQ_HANDLER_STACK_BOTTOM: usize = IRQ_STACK_BOTTOM;
+pub const KERNEL_IRQ_HANDLER_STACK_PAGE_COUNT: usize = IRQ_STACK_PAGE_COUNT;
+
 /// Exception stack.
 pub const EXCEPTION_STACK_BOTTOM: usize = 0xFFFF_FFFF_FFFF_0000;
 pub const EXCEPTION_STACK_PAGE_COUNT: usize = 8;

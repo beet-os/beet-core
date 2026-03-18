@@ -862,8 +862,8 @@ impl MemoryManager {
             // commit random data after we gave the pages to another process (if it is mapped non-cached
             // there), but in this case it's faster to just flush everything, because a whole process' worth
             // of memory is much bigger than the L2 cache.
-            crate::platform::atsama5d2::cache::clean_cache_l1();
-            crate::platform::atsama5d2::cache::clean_cache_l2();
+            crate::platform::apple_t8103::cache::clean_cache_l1();
+            crate::platform::apple_t8103::cache::clean_cache_l2();
             // And we need to start zeroing the deallocated pages
             crate::platform::page_zeroer::start(self);
         }

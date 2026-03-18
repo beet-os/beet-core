@@ -93,7 +93,7 @@ pub fn debug_command(cmd: u8, mut output: impl core::fmt::Write) {
             });
         }
         b'c' => {
-            crate::platform::atsama5d2::cache::print_l2cache_stats();
+            crate::platform::apple_t8103::cache::print_cache_stats();
         }
         b'a' => print_app_ids(&mut output),
         b'k' => {

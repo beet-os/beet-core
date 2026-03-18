@@ -41,7 +41,7 @@ pub fn init(serial: &'static mut dyn SerialWrite) {
     for line in banner_lines {
         writeln!(output, "{}", line).ok();
     }
-    writeln!(output, "KeyOS kernel {} ({})", env!("VERGEN_GIT_DESCRIBE"), env!("VERGEN_GIT_SHA")).ok();
+    writeln!(output, "BeetOS kernel {} ({})", option_env!("VERGEN_GIT_DESCRIBE").unwrap_or("dev"), option_env!("VERGEN_GIT_SHA").unwrap_or("unknown")).ok();
     writeln!(output).ok();
 
     writeln!(output, "=== Kernel Debug Shell Available ====").ok();

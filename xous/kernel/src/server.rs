@@ -218,9 +218,10 @@ enum QueuedMessage {
     WaitingReturnScalarTerminated,
 }
 
-// Size should be exactly 8 words / 32 bytes, yielding 128 queued messages per server
+// Size should be exactly 8 words per entry, yielding efficient packing for queued messages.
+// On 32-bit ARM: 8 × 4 = 32 bytes. On 64-bit AArch64: 8 × 8 = 64 bytes.
 #[cfg(beetos)]
-pub const _: () = assert!(core::mem::size_of::<QueuedMessage>() == 32);
+const _: () = assert!(core::mem::size_of::<QueuedMessage>() == 8 * core::mem::size_of::<usize>());
 
 #[derive(Debug, Clone, Default)]
 pub struct MessagePermissions {
