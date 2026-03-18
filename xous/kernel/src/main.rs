@@ -85,10 +85,10 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
 
 /// Common main function for BeetOS and hosted environments.
 pub(crate) fn kmain() {
-    // On hosted mode, yield_slice() triggers the scheduler via IPC.
-    // On bare metal, the scheduler is driven by timer interrupts,
-    // so we skip this and go straight to the idle loop.
-    #[cfg(not(beetos))]
+    // On bare metal, yield the initial time slice so spawned processes can run.
+    // In hosted mode the kernel main thread IS the server — it has no TCP
+    // connection to itself, so calling yield_slice() here would panic.
+    #[cfg(beetos)]
     yield_slice();
     // Special case for testing: idle can return `false` to indicate exit
     while arch::idle() {}
