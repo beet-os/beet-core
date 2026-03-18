@@ -964,18 +964,19 @@ impl SystemServices {
     /// Calls the provided function with the current inner process state.
     pub fn shutdown(&mut self) -> Result<(), Error> {
         #[cfg(beetos)]
-        crate::platform::shutdown();
+        crate::platform::shutdown(); // diverges (-> !)
 
         // Destroy all processes. This will cause them to immediately terminate.
         #[cfg(not(beetos))]
-        for process in &mut self.processes {
-            if let Some(process) = process {
-                process.activate();
-                process.terminate(0).unwrap_or_default();
+        {
+            for process in &mut self.processes {
+                if let Some(process) = process {
+                    process.activate();
+                    process.terminate(0).unwrap_or_default();
+                }
             }
+            Ok(())
         }
-
-        Ok(())
     }
 
     #[cfg(all(beetos, any(not(feature = "production"), feature = "log-serial")))]

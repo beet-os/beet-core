@@ -31,8 +31,10 @@ mod gicd {
     /// Interrupt Priority Registers (8 bits per IRQ).
     pub const IPRIORITYR: usize = 0x0400;
     /// Interrupt Processor Targets Registers (for GICv2 compat, SPI only).
+    #[allow(dead_code)]
     pub const ITARGETSR: usize = 0x0800;
     /// Interrupt Configuration Registers (2 bits per IRQ).
+    #[allow(dead_code)]
     pub const ICFGR: usize = 0x0C00;
 
     // CTLR bits
@@ -50,6 +52,7 @@ mod gicd {
 mod gicr {
     // RD_base frame (first 64KB)
     /// Redistributor Control Register.
+    #[allow(dead_code)]
     pub const CTLR: usize = 0x0000;
     /// Redistributor Wake Register.
     pub const WAKER: usize = 0x0014;

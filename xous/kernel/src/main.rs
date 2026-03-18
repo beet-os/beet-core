@@ -29,7 +29,9 @@ mod server;
 mod services;
 mod syscall;
 
+#[cfg(not(beetos))]
 use services::SystemServices;
+#[cfg(not(beetos))]
 use xous::*;
 
 #[cfg(beetos)]
@@ -64,9 +66,7 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     platform::rand::get_u32();
 
     // Unmask IRQs so timer ticks are delivered
-    unsafe {
-        core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack)); // Clear IRQ mask
-    }
+    core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack)); // Clear IRQ mask
 
     #[cfg(feature = "platform-qemu-virt")]
     platform::qemu_virt::uart::puts("Kernel initialized. Entering idle loop.\n");

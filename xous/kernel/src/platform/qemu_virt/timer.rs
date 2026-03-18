@@ -33,6 +33,7 @@ fn read_cntfrq() -> u64 {
 
 /// Read the current counter value.
 #[inline]
+#[allow(dead_code)]
 pub fn read_counter() -> u64 {
     let cnt: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt, options(nomem, nostack)) };

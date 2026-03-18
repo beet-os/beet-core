@@ -18,6 +18,7 @@ pub fn init() { self::apple_t8103::init(); }
 
 /// Platform init stub for hosted mode (no platform hardware).
 #[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
+#[allow(dead_code)]
 pub fn init() {}
 
 /// Halt / shutdown the system.
@@ -28,6 +29,7 @@ pub fn shutdown() -> ! { self::qemu_virt::shutdown(); }
 pub fn shutdown() -> ! { self::apple_t8103::shutdown(); }
 
 #[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
+#[allow(dead_code)]
 pub fn shutdown() -> ! { loop {} }
 
 /// Platform cache operations.
