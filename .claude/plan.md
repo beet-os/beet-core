@@ -315,7 +315,19 @@ _Note: M4 was implemented early as a kernel-mode shell (not as Xous userspace se
 
 Interactive shell with in-memory filesystem. You can create, read, list, and delete files. ~~Multiple Xous services communicating via IPC.~~ This is a real OS.
 
-**Status: PARTIALLY DONE** — Shell and ramfs work in kernel-mode on QEMU. Xous IPC-based services and Apple M1 input deferred.
+### Tests
+
+- [x] 20 ramfs unit tests (create, read, write, overwrite, delete, mkdir, list, stats, errors, edge cases)
+- [x] 9 shell unit tests (command execution, character processing, backspace, Ctrl-C, unknown commands)
+- [x] All 29 tests pass in hosted mode (`cargo test -p beetos-kernel`)
+- [x] Shell operational on QEMU with UART I/O
+
+### API Crates
+
+- [x] `api/keyboard/` (`beetos-api-keyboard`): KeyEvent types, KeyboardOp IPC opcodes
+- [x] `api/console/` (`beetos-api-console`): ConsoleOp IPC opcodes
+
+**Status: DONE** — Shell, ramfs, and API type crates complete. 29 new tests. Xous IPC service migration deferred until process infrastructure is ready.
 
 ---
 

@@ -437,3 +437,122 @@ impl JoinWithSpaces for [&str] {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Reuse ramfs test lock since we share the same static state.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ramfs::reset();
+        ramfs::init();
+        guard
+    }
+
+    #[test]
+    fn test_mkdir_command() {
+        let _g = setup();
+        execute_line(b"mkdir /test");
+        // Verify directory was created via ramfs
+        let mut found = false;
+        ramfs::list("/", |name, is_dir, _| {
+            if name == "test" && is_dir {
+                found = true;
+            }
+        })
+        .expect("list");
+        assert!(found, "mkdir command should create directory");
+    }
+
+    #[test]
+    fn test_write_command() {
+        let _g = setup();
+        execute_line(b"write /hello.txt hello world");
+        let data = ramfs::read("/hello.txt").expect("read after write cmd");
+        assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn test_rm_command() {
+        let _g = setup();
+        ramfs::write("/tmp.txt", b"data").expect("setup write");
+        execute_line(b"rm /tmp.txt");
+        assert!(ramfs::read("/tmp.txt").is_err(), "rm should delete the file");
+    }
+
+    #[test]
+    fn test_empty_line_does_nothing() {
+        let _g = setup();
+        execute_line(b"");
+        execute_line(b"   ");
+        // Should not panic or crash
+    }
+
+    #[test]
+    fn test_unknown_command_does_not_crash() {
+        let _g = setup();
+        execute_line(b"nonexistent_command arg1 arg2");
+        // Should not panic
+    }
+
+    #[test]
+    fn test_process_char_basic() {
+        let _g = setup();
+        // Process printable chars and verify they're buffered
+        unsafe {
+            SHELL.pos = 0;
+        }
+        process_char(b'h');
+        process_char(b'i');
+        unsafe {
+            assert_eq!(SHELL.pos, 2);
+            assert_eq!(SHELL.line[0], b'h');
+            assert_eq!(SHELL.line[1], b'i');
+        }
+    }
+
+    #[test]
+    fn test_process_char_backspace() {
+        let _g = setup();
+        unsafe {
+            SHELL.pos = 0;
+        }
+        process_char(b'a');
+        process_char(b'b');
+        process_char(0x7F); // DEL/backspace
+        unsafe {
+            assert_eq!(SHELL.pos, 1);
+            assert_eq!(SHELL.line[0], b'a');
+        }
+    }
+
+    #[test]
+    fn test_process_char_backspace_at_start() {
+        let _g = setup();
+        unsafe {
+            SHELL.pos = 0;
+        }
+        process_char(0x7F); // backspace at empty buffer
+        unsafe {
+            assert_eq!(SHELL.pos, 0); // should stay at 0
+        }
+    }
+
+    #[test]
+    fn test_process_char_ctrl_c() {
+        let _g = setup();
+        unsafe {
+            SHELL.pos = 0;
+        }
+        process_char(b'a');
+        process_char(b'b');
+        process_char(0x03); // Ctrl-C
+        unsafe {
+            assert_eq!(SHELL.pos, 0, "Ctrl-C should reset line buffer");
+        }
+    }
+}

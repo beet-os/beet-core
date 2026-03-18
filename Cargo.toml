@@ -12,6 +12,8 @@ members = [
     "xous/names",
     "xous/ticktimer",
     "xous/trng",
+    "api/keyboard",
+    "api/console",
     "os/app-manifest",
     "xtask",
     # loader is no_std + aarch64 only, excluded from default workspace for now

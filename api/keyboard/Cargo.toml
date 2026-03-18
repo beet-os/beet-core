@@ -1,0 +1,10 @@
+[package]
+name = "beetos-api-keyboard"
+version = "0.1.0"
+edition = "2021"
+description = "BeetOS keyboard input API — types and client stubs for the keyboard service"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+xous = { path = "../../xous/xous-rs" }
+xous-ipc = { path = "../../xous/ipc" }

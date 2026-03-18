@@ -297,6 +297,16 @@ where
     Ok(())
 }
 
+/// Reset the filesystem to empty state (for testing).
+#[cfg(test)]
+pub fn reset() {
+    unsafe {
+        for i in 0..MAX_FILES {
+            FS[i] = FileEntry::empty();
+        }
+    }
+}
+
 /// Get filesystem statistics: (used_files, total_files, used_bytes).
 pub fn stats() -> (usize, usize, usize) {
     let mut used = 0;
@@ -310,4 +320,236 @@ pub fn stats() -> (usize, usize, usize) {
         }
     }
     (used, MAX_FILES, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Guard to serialize tests that share the global `static mut FS`.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Helper: reset + init before each test.
+    /// Returns the MutexGuard to hold the lock for the test's duration.
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        init();
+        guard
+    }
+
+    #[test]
+    fn test_init_creates_root() {
+        let _g = setup();
+        assert!(find_entry("/").is_some());
+        let (used, _, _) = stats();
+        assert_eq!(used, 1); // just root
+    }
+
+    #[test]
+    fn test_mkdir_and_list() {
+        let _g = setup();
+        mkdir("/tmp").expect("mkdir /tmp");
+        mkdir("/etc").expect("mkdir /etc");
+
+        let mut entries = Vec::new();
+        list("/", |name, is_dir, _| entries.push((name.to_string(), is_dir)))
+            .expect("list /");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|(n, d)| n == "tmp" && *d));
+        assert!(entries.iter().any(|(n, d)| n == "etc" && *d));
+    }
+
+    #[test]
+    fn test_mkdir_duplicate_fails() {
+        let _g = setup();
+        mkdir("/tmp").expect("first mkdir");
+        match mkdir("/tmp") {
+            Err(FsError::AlreadyExists) => {}
+            other => panic!("expected AlreadyExists, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_write_and_read() {
+        let _g = setup();
+        write("/hello.txt", b"Hello, BeetOS!").expect("write");
+        let data = read("/hello.txt").expect("read");
+        assert_eq!(data, b"Hello, BeetOS!");
+    }
+
+    #[test]
+    fn test_write_overwrite() {
+        let _g = setup();
+        write("/file", b"first").expect("write 1");
+        write("/file", b"second").expect("write 2");
+        let data = read("/file").expect("read");
+        assert_eq!(data, b"second");
+    }
+
+    #[test]
+    fn test_read_nonexistent() {
+        let _g = setup();
+        match read("/nope") {
+            Err(FsError::NotFound) => {}
+            other => panic!("expected NotFound, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_read_directory_fails() {
+        let _g = setup();
+        mkdir("/dir").expect("mkdir");
+        match read("/dir") {
+            Err(FsError::IsDirectory) => {}
+            other => panic!("expected IsDirectory, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_write_to_directory_fails() {
+        let _g = setup();
+        mkdir("/dir").expect("mkdir");
+        match write("/dir", b"data") {
+            Err(FsError::IsDirectory) => {}
+            other => panic!("expected IsDirectory, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_remove_file() {
+        let _g = setup();
+        write("/file", b"data").expect("write");
+        remove("/file").expect("remove");
+        match read("/file") {
+            Err(FsError::NotFound) => {}
+            other => panic!("expected NotFound after remove, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_remove_empty_dir() {
+        let _g = setup();
+        mkdir("/empty").expect("mkdir");
+        remove("/empty").expect("remove");
+        match mkdir("/empty") {
+            Ok(()) => {} // slot freed, can recreate
+            other => panic!("expected Ok, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_remove_nonempty_dir_fails() {
+        let _g = setup();
+        mkdir("/dir").expect("mkdir");
+        write("/dir/file", b"data").expect("write");
+        match remove("/dir") {
+            Err(FsError::NotEmpty) => {}
+            other => panic!("expected NotEmpty, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_remove_root_fails() {
+        let _g = setup();
+        match remove("/") {
+            Err(FsError::NotEmpty) => {}
+            other => panic!("expected NotEmpty for root, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_list_subdirectory() {
+        let _g = setup();
+        mkdir("/dir").expect("mkdir");
+        write("/dir/a.txt", b"aaa").expect("write a");
+        write("/dir/b.txt", b"bbb").expect("write b");
+        write("/other.txt", b"xxx").expect("write other");
+
+        let mut entries = Vec::new();
+        list("/dir", |name, is_dir, size| {
+            entries.push((name.to_string(), is_dir, size));
+        })
+        .expect("list /dir");
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|(n, d, s)| n == "a.txt" && !d && *s == 3));
+        assert!(entries.iter().any(|(n, d, s)| n == "b.txt" && !d && *s == 3));
+    }
+
+    #[test]
+    fn test_list_nonexistent_fails() {
+        let _g = setup();
+        match list("/nope", |_, _, _| {}) {
+            Err(FsError::NotFound) => {}
+            other => panic!("expected NotFound, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_list_file_fails() {
+        let _g = setup();
+        write("/file", b"data").expect("write");
+        match list("/file", |_, _, _| {}) {
+            Err(FsError::NotDirectory) => {}
+            other => panic!("expected NotDirectory, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_stats() {
+        let _g = setup();
+        write("/a", b"hello").expect("write a");
+        write("/b", b"world!!").expect("write b");
+        let (used, total, bytes) = stats();
+        assert_eq!(used, 3); // root + 2 files
+        assert_eq!(total, MAX_FILES);
+        assert_eq!(bytes, 12); // 5 + 7
+    }
+
+    #[test]
+    fn test_normalize_adds_leading_slash() {
+        let _g = setup();
+        write("foo", b"bar").expect("write");
+        let data = read("/foo").expect("read with slash");
+        assert_eq!(data, b"bar");
+    }
+
+    #[test]
+    fn test_normalize_strips_trailing_slash() {
+        let _g = setup();
+        mkdir("/dir").expect("mkdir");
+        // Access with trailing slash should find it
+        let mut found = false;
+        list("/dir/", |_, _, _| found = true).expect("list");
+        // No children, so `found` stays false, but list itself should succeed
+    }
+
+    #[test]
+    fn test_file_too_large() {
+        let _g = setup();
+        let big = [0u8; MAX_FILE_SIZE + 1];
+        match write("/big", &big) {
+            Err(FsError::FileTooLarge) => {}
+            other => panic!("expected FileTooLarge, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_no_space() {
+        let _g = setup();
+        // Fill all slots (slot 0 is root)
+        for i in 1..MAX_FILES {
+            let mut name = [0u8; 16];
+            let s = format!("/f{}", i);
+            name[..s.len()].copy_from_slice(s.as_bytes());
+            let path = core::str::from_utf8(&name[..s.len()]).expect("utf8");
+            write(path, b"x").expect("write");
+        }
+        match write("/overflow", b"y") {
+            Err(FsError::NoSpace) => {}
+            other => panic!("expected NoSpace, got {:?}", other.err()),
+        }
+    }
 }

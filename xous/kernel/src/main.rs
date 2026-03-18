@@ -29,7 +29,7 @@ mod server;
 mod services;
 mod syscall;
 
-#[cfg(beetos)]
+#[cfg(any(beetos, test))]
 mod shell;
 
 #[cfg(not(beetos))]

@@ -43,6 +43,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "beetos-api-console"
+version = "0.1.0"
+dependencies = [
+ "xous",
+ "xous-ipc",
+]
+
+[[package]]
+name = "beetos-api-keyboard"
+version = "0.1.0"
+dependencies = [
+ "xous",
+ "xous-ipc",
+]
+
+[[package]]
 name = "beetos-kernel"
 version = "0.1.0"
 dependencies = [

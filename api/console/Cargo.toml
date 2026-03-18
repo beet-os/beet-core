@@ -1,0 +1,10 @@
+[package]
+name = "beetos-api-console"
+version = "0.1.0"
+edition = "2021"
+description = "BeetOS console output API — types and client stubs for the console service"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+xous = { path = "../../xous/xous-rs" }
+xous-ipc = { path = "../../xous/ipc" }
