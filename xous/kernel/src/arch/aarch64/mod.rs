@@ -3,9 +3,12 @@
 
 //! AArch64 architecture backend for the Xous kernel.
 //!
-//! Runs at EL1 on Apple Silicon (T8103). Userspace runs at EL0.
-//! Uses 16KB pages (Apple Silicon granule) with 3-level page tables
-//! (L1→L2→L3) and TTBR0/TTBR1 split for user/kernel address spaces.
+//! Runs at EL1 on any AArch64 platform. Userspace runs at EL0.
+//! Uses 16KB pages with 4-level page tables and TTBR0/TTBR1 split
+//! for user/kernel address spaces.
+//!
+//! This module is PLATFORM-GENERIC — no hardware-specific code here.
+//! Platform-specific drivers (GIC, AIC, UART, etc.) live in platform/.
 
 pub mod backtrace;
 #[allow(dead_code)]
@@ -23,6 +26,14 @@ pub mod syscall;
 mod asm;
 
 use core::arch::asm;
+
+// Include assembly files via global_asm! (no cc crate needed).
+// Combined into a single global_asm! to avoid duplicate symbol issues
+// across codegen units.
+core::arch::global_asm!(
+    include_str!("start.S"),
+    include_str!("asm.S"),
+);
 
 /// Read the current hardware PID from CONTEXTIDR_EL1.
 /// The lower 32 bits hold our process context identifier.
@@ -54,7 +65,7 @@ pub fn init() {
 /// switches. Returns `true` to continue running, `false` to shut down.
 pub fn idle() -> bool {
     // Wait for interrupt (low-power idle)
-    unsafe { asm!("wfe", options(nomem, nostack)) };
-    // TODO(M2): Check for pending work, dispatch IRQs, schedule processes
+    unsafe { asm!("wfi", options(nomem, nostack)) };
+    // TODO: Check for pending work, dispatch IRQs, schedule processes
     true
 }

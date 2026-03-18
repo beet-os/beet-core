@@ -178,7 +178,7 @@ impl SystemServices {
         for arg in args.iter().filter(|arg| arg.name == u32::from_le_bytes(*b"BElf")) {
             // Restart the watchdog per process loaded.
             // This gives the entire watchdog time period for the process to load
-            crate::platform::apple_t8103::wdt::restart();
+            crate::platform::wdt::restart();
 
             let mut pname: [u8; MAX_PROCESS_NAME_LEN] = [0; MAX_PROCESS_NAME_LEN];
 
@@ -964,7 +964,7 @@ impl SystemServices {
     /// Calls the provided function with the current inner process state.
     pub fn shutdown(&mut self) -> Result<(), Error> {
         #[cfg(beetos)]
-        crate::platform::apple_t8103::shutdown();
+        crate::platform::shutdown();
 
         // Destroy all processes. This will cause them to immediately terminate.
         #[cfg(not(beetos))]

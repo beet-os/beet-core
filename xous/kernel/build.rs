@@ -5,15 +5,18 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
 
     if target.starts_with("aarch64") && target.contains("none") {
-        // Use our AArch64 linker script for bare-metal targets
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        println!("cargo:rustc-link-arg=-T{}/link-aarch64.x", manifest_dir);
+        // Select linker script based on platform feature.
+        // The xtask build system passes the linker script via RUSTFLAGS,
+        // so we only set the default here for direct cargo build invocations.
+        // Don't add a linker script from build.rs — xtask handles it via RUSTFLAGS.
+        // This avoids conflicts when xtask passes a platform-specific linker script.
 
         // Set the `beetos` cfg flag for bare-metal AArch64
         println!("cargo:rustc-cfg=beetos");
     }
 
-    // Rerun if linker script changes
+    // Rerun if linker scripts change
     println!("cargo:rerun-if-changed=link-aarch64.x");
+    println!("cargo:rerun-if-changed=link-qemu-virt.x");
     println!("cargo:rerun-if-changed=build.rs");
 }

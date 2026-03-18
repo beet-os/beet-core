@@ -6,7 +6,10 @@ pub fn get_u32() -> u32 {
     #[cfg(any(windows, unix))]
     let rand = crate::arch::rand::get_u32();
 
-    #[cfg(beetos)]
+    #[cfg(feature = "platform-qemu-virt")]
+    let rand = crate::platform::qemu_virt::rand::get_u32();
+
+    #[cfg(feature = "platform-apple-t8103")]
     let rand = crate::platform::apple_t8103::rand::get_u32();
 
     rand

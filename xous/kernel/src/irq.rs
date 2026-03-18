@@ -33,11 +33,7 @@ pub fn handle(irq_no: IrqNumber) -> Result<xous::Result, xous::Error> {
                 SystemServices::with_mut(|ss| {
                     klog!("Making a callback to PID{}: {:x?} ({:08x}, {:x?})", pid, pc, irq_no as usize, arg);
 
-                    #[cfg(feature = "trace-systemview")]
-                    {
-                        crate::platform::apple_t8103::systemview::set_current_isr(irq_no as u32);
-                        systemview_beetos::SystemView::isr_enter();
-                    }
+                    // TODO: systemview tracing (feature = "trace-systemview")
 
                     let process = ss.process_mut(*pid).unwrap();
                     process.set_thread_state(IRQ_TID, ThreadState::Ready);

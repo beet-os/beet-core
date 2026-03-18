@@ -34,32 +34,42 @@ use xous::*;
 
 #[cfg(beetos)]
 #[no_mangle]
-/// This function is called from the bootloader to initialize the kernel.
-/// On BeetOS, m1n1 passes the FDT pointer in x0.
+/// Rust entry point called from start.S after basic hardware setup.
+///
+/// On QEMU virt: x0 = FDT pointer from QEMU.
+/// On Apple M1: x0 = FDT pointer from m1n1.
 ///
 /// # Safety
 ///
-/// This is safe to call only to initialize the kernel.
-pub unsafe extern "C" fn init(arg_offset: *const u32) -> ! {
-    // TODO(M2): Initialize platform from FDT
-    // platform::apple_t8103::uart::init();
-    // platform::apple_t8103::rand::init();
-
-    args::KernelArguments::init(arg_offset);
-    let args = args::KernelArguments::get();
-
-    crate::mem::MemoryManager::with_mut(|mm| {
-        mm.init_from_memory(beetos::ALLOCATION_TRACKER_OFFSET as _, &args)
-            .expect("couldn't initialize memory manager");
-    });
-
-    SystemServices::with_mut(|system_services| system_services.init_from_memory(&args));
-
-    arch::init();
+/// This is safe to call only once, from the startup assembly.
+pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
+    // Initialize platform hardware first (UART for output, GIC, timer)
     platform::init();
 
+    // Store the boot arguments (FDT pointer) for later use
+    args::KernelArguments::init(arg_offset);
+
+    // At this point we have UART output, GIC, and timer running.
+    // The full Xous kernel init (memory manager, services) will be
+    // wired up when we integrate the loader and process infrastructure.
+    //
+    // For M2, we demonstrate: boot → platform init → UART output → timer ticks → idle.
+
+    arch::init();
+
+    // Initialize RNG (detects RNDR support, seeds from counter)
+    crate::arch::rand::init();
+
     platform::rand::get_u32();
     platform::rand::get_u32();
+
+    // Unmask IRQs so timer ticks are delivered
+    unsafe {
+        core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack)); // Clear IRQ mask
+    }
+
+    #[cfg(feature = "platform-qemu-virt")]
+    platform::qemu_virt::uart::puts("Kernel initialized. Entering idle loop.\n");
 
     kmain();
 
@@ -68,7 +78,10 @@ pub unsafe extern "C" fn init(arg_offset: *const u32) -> ! {
 
 /// Common main function for BeetOS and hosted environments.
 pub(crate) fn kmain() {
-    #[cfg(beetos)]
+    // On hosted mode, yield_slice() triggers the scheduler via IPC.
+    // On bare metal, the scheduler is driven by timer interrupts,
+    // so we skip this and go straight to the idle loop.
+    #[cfg(not(beetos))]
     yield_slice();
     // Special case for testing: idle can return `false` to indicate exit
     while arch::idle() {}

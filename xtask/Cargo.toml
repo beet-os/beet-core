@@ -6,3 +6,4 @@ description = "BeetOS build system"
 
 [dependencies]
 anyhow = "1"
+serde_json = "1"

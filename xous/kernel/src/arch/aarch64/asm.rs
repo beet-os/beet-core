@@ -3,10 +3,7 @@
 
 //! AArch64 assembly linkage — exception vectors, context save/restore.
 
-use core::arch::global_asm;
-
-// Include the assembly source for exception vectors and context switching.
-global_asm!(include_str!("asm.S"));
+// Assembly source (asm.S, start.S) is included via global_asm! in mod.rs.
 
 /// Flush a single TLB entry by virtual address (all ASIDs).
 #[inline]

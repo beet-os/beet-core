@@ -3,9 +3,9 @@
 
 //! AArch64 panic handler for the Xous kernel.
 //!
-//! On panic, prints the message to the debug console, captures a backtrace,
-//! and halts the system.
+//! On panic, prints the message to the debug console and halts.
 
+use core::fmt::Write;
 use core::panic::PanicInfo;
 
 /// Kernel panic handler. Prints diagnostic info and halts.
@@ -15,16 +15,16 @@ fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)) };
 
-    println!("!!! KERNEL PANIC !!!");
-    if let Some(location) = info.location() {
-        println!("  at {}:{}:{}", location.file(), location.line(), location.column());
+    // Write directly to platform UART (println! may not work on bare metal)
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        let mut w = crate::platform::qemu_virt::uart::UartWriter;
+        let _ = write!(w, "\n!!! KERNEL PANIC !!!\n");
+        if let Some(location) = info.location() {
+            let _ = write!(w, "  at {}:{}:{}\n", location.file(), location.line(), location.column());
+        }
+        let _ = write!(w, "  {}\n", info.message());
     }
-    if let Some(message) = info.message().as_str() {
-        println!("  {}", message);
-    }
-
-    // Print backtrace
-    super::backtrace::print_current_process_backtrace();
 
     // Halt: infinite WFE loop
     loop {
