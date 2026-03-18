@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAdd
 use std::thread_local;
 
 use crossbeam_channel::{unbounded, Receiver, RecvError, RecvTimeoutError, Sender};
-use xous::{AppId, ProcessInit, Result, SysCall, SysCallNumber, PID, TID};
+use xous::{AppId, ProcessInit, Result, SysCall, PID, TID};
 
 use crate::arch::process::Process;
 use crate::services::SystemServices;
@@ -326,7 +326,16 @@ pub fn idle() -> bool {
     // Allocate PID1 with the key we were passed.
     let pid1_key = PID1_KEY.with(|p1k| *p1k.borrow());
     let pid1_init = ProcessInit { app_id: AppId(pid1_key) };
-    let process_1 = SystemServices::with_mut(|ss| ss.create_process(pid1_init)).unwrap();
+    let process_1 = SystemServices::with_mut(|ss| {
+        let startup = ss.create_process(pid1_init)?;
+        // PID 1 is the kernel/init process — grant it all syscall permissions,
+        // matching what init_from_memory does on real hardware.
+        ss.process_mut(startup.pid())
+            .expect("PID 1 just created")
+            .set_syscall_permissions(u64::MAX);
+        Ok::<_, xous::Error>(startup)
+    })
+    .unwrap();
     assert_eq!(process_1.pid().get(), 1);
     crate::arch::process::set_current_pid(process_1.pid());
 
@@ -390,7 +399,7 @@ pub fn idle() -> bool {
                 SystemServices::with_mut(|ss| {
                     ss.process_mut(pid)
                         .unwrap()
-                        .set_syscall_permissions(1 << SysCallNumber::AllowMessagesCID as u64)
+                        .set_syscall_permissions(1 << xous::SysCallNumber::AllowMessagesCID as u64)
                 });
             }
         }

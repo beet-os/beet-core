@@ -96,6 +96,7 @@ impl Thread {
 
     /// Get the syscall arguments from registers X0-X5, X8-X9.
     /// This matches the AArch64 Xous syscall ABI.
+    #[allow(dead_code)]
     pub fn get_args(&self) -> [usize; 8] {
         [
             self.gpr[0] as usize,
@@ -123,11 +124,13 @@ impl Thread {
 
     /// Get the processor mode from SPSR. Returns the exception level bits.
     /// 0b0000 = EL0t (user), 0b0100 = EL1t, 0b0101 = EL1h
+    #[allow(dead_code)]
     pub fn processor_mode(&self) -> u32 {
         (self.spsr & 0xF) as u32
     }
 
     /// Disable interrupts by setting DAIF mask bits in SPSR.
+    #[allow(dead_code)]
     pub fn disable_interrupts(&mut self) {
         self.spsr |= 0x3C0; // Mask D, A, I, F
     }
@@ -135,6 +138,7 @@ impl Thread {
 
 /// Per-process architecture state.
 /// Contains all thread contexts and process-level state.
+#[allow(dead_code)]
 struct ProcessImpl {
     /// Thread contexts
     threads: [Thread; MAX_THREAD_COUNT],
@@ -163,6 +167,7 @@ pub fn set_current_pid(pid: PID) {
 }
 
 /// Parameters for setting up a new process.
+#[allow(dead_code)]
 pub struct ProcessSetup {
     pub pid: PID,
     pub entry_point: usize,
@@ -182,6 +187,7 @@ impl PartialEq for Process {
     }
 }
 
+#[allow(dead_code)]
 impl Process {
     /// Get a handle to the current process.
     pub fn current() -> Process {
@@ -192,7 +198,7 @@ impl Process {
     pub fn current_tid(&self) -> TID {
         let idx = self.pid.get() as usize - 1;
         unsafe {
-            PROCESS_TABLE
+            (&*core::ptr::addr_of!(PROCESS_TABLE))
                 .get(idx)
                 .and_then(|p| p.as_ref())
                 .map(|p| p.current_thread)

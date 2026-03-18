@@ -7,6 +7,7 @@ use crate::{arch, filled_array};
 
 static mut IRQ_HANDLERS: [IrqHandler; 32] = filled_array!(IrqHandler::Free; 32);
 
+#[allow(dead_code)]
 enum IrqHandler {
     Free,
     User {
@@ -14,13 +15,13 @@ enum IrqHandler {
         pc: MemoryAddress,
         arg: Option<MemoryAddress>,
     },
-    #[allow(dead_code)]
     Kernel {
         handler: fn(),
     },
 }
 
 #[cfg(beetos)]
+#[allow(dead_code)]
 pub fn handle(irq_no: IrqNumber) -> Result<xous::Result, xous::Error> {
     use crate::{
         process::{ArchProcess, ThreadState, IRQ_TID},
@@ -34,7 +35,7 @@ pub fn handle(irq_no: IrqNumber) -> Result<xous::Result, xous::Error> {
 
                     #[cfg(feature = "trace-systemview")]
                     {
-                        crate::platform::atsama5d2::systemview::set_current_isr(irq_no as u32);
+                        crate::platform::apple_t8103::systemview::set_current_isr(irq_no as u32);
                         systemview_beetos::SystemView::isr_enter();
                     }
 
@@ -44,7 +45,7 @@ pub fn handle(irq_no: IrqNumber) -> Result<xous::Result, xous::Error> {
 
                     ArchProcess::with_current_mut(|arch_process| {
                         // Activate the current context
-                        arch_process.set_tid(IRQ_TID);
+                        let _ = arch_process.set_tid(IRQ_TID);
                         arch_process.run_irq_handler(
                             pc.get(),
                             irq_no as usize,
@@ -91,6 +92,7 @@ pub fn for_kernel_each_irq(mut f: impl FnMut(usize)) {
 }
 
 #[cfg(beetos)]
+#[allow(dead_code)]
 pub fn interrupt_claim_kernel(irq: IrqNumber, handler: fn()) {
     unsafe {
         if !matches!(IRQ_HANDLERS[irq as usize], IrqHandler::Free) {
@@ -101,6 +103,7 @@ pub fn interrupt_claim_kernel(irq: IrqNumber, handler: fn()) {
     }
 }
 
+#[allow(dead_code)]
 pub fn interrupt_claim_user(
     irq: IrqNumber,
     pid: PID,
@@ -118,6 +121,7 @@ pub fn interrupt_claim_user(
     }
 }
 
+#[allow(dead_code)]
 pub fn interrupt_free(irq: IrqNumber, pid: PID) -> Result<(), xous::Error> {
     unsafe {
         match &IRQ_HANDLERS[irq as usize] {
@@ -133,6 +137,7 @@ pub fn interrupt_free(irq: IrqNumber, pid: PID) -> Result<(), xous::Error> {
 
 /// Iterate through the IRQ handlers and remove any handler that exists
 /// for the given PID.
+#[allow(dead_code)]
 pub fn release_interrupts_for_pid(pid: PID) {
     unsafe {
         for (_irq, handler) in (&mut *core::ptr::addr_of_mut!(IRQ_HANDLERS)).iter_mut().enumerate() {

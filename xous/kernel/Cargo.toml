@@ -39,4 +39,4 @@ xous = { path = "../xous-rs", features = [
 ] }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)', 'cfg(feature, values("trace-systemview"))'] }

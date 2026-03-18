@@ -38,8 +38,10 @@ const PTE_TABLE: u64 = 1 << 1; // For L1/L2: next-level table. For L3: page desc
 
 // Lower attributes
 const PTE_ATTR_IDX_SHIFT: u64 = 2;
+#[allow(dead_code)]
 const PTE_ATTR_DEVICE: u64 = 0 << PTE_ATTR_IDX_SHIFT; // MAIR index 0: Device-nGnRnE
 const PTE_ATTR_NORMAL: u64 = 1 << PTE_ATTR_IDX_SHIFT; // MAIR index 1: Normal WB cacheable
+#[allow(dead_code)]
 const PTE_ATTR_NORMAL_NC: u64 = 2 << PTE_ATTR_IDX_SHIFT; // MAIR index 2: Normal non-cacheable
 
 const PTE_AP_RW_EL1: u64 = 0b00 << 6; // Read/write at EL1 only
@@ -63,6 +65,7 @@ const PTE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_C000;
 ///   Attr0 = 0x00 (Device-nGnRnE)
 ///   Attr1 = 0xFF (Normal, Inner/Outer Write-Back, Read-Allocate, Write-Allocate)
 ///   Attr2 = 0x44 (Normal, Inner/Outer Non-Cacheable)
+#[allow(dead_code)]
 pub const MAIR_VALUE: u64 = 0x00_00_00_00_00_44_FF_00;
 
 /// TCR_EL1 value for 16KB granule, 47-bit VA, both halves.
@@ -73,6 +76,7 @@ pub const MAIR_VALUE: u64 = 0x00_00_00_00_00_44_FF_00;
 ///   IPS = 0b101 (48-bit PA) — Apple M1 supports 42-bit PA but we use 48 to be safe
 ///   SH0/SH1 = 0b11 (Inner Shareable)
 ///   ORGN0/IRGN0/ORGN1/IRGN1 = 0b01 (Write-Back, Read-Allocate, Write-Allocate)
+#[allow(dead_code)]
 pub const TCR_VALUE: u64 = {
     let t0sz: u64 = 17;
     let t1sz: u64 = 17 << 16;
@@ -229,6 +233,7 @@ impl MemoryMapping {
     }
 
     /// Destroy this mapping — free page tables and flush TLB.
+    #[allow(dead_code)]
     pub fn destroy(&self) {
         // Flush TLB entries for this ASID
         super::asm::flush_tlb_asid(self.pid as u16);
@@ -445,7 +450,9 @@ impl MemoryMapping {
     }
 
     /// Print the page table map for debugging.
+    #[allow(dead_code)]
     pub fn print_map(&self, output: &mut impl core::fmt::Write) {
+        #[allow(unused_imports)]
         use core::fmt::Write;
         let _ = writeln!(output, "  TTBR0: {:#018x} ASID: {}", self.ttbr0, self.pid);
         // TODO(M2): Walk and print page table entries
@@ -471,7 +478,9 @@ impl MemoryMapping {
     }
 
     /// Check page table consistency against the memory manager.
+    #[allow(dead_code)]
     pub fn check_consistency(&self, _mm: &MemoryManager, output: &mut impl core::fmt::Write) {
+        #[allow(unused_imports)]
         use core::fmt::Write;
         let _ = writeln!(output, "  Consistency check: OK (stub)");
         // TODO(M2): Verify all mapped pages are tracked by MemoryManager

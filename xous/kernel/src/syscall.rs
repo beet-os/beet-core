@@ -16,11 +16,13 @@ use crate::server::{SenderID, WaitingMessage};
 use crate::services::SystemServices;
 
 #[derive(PartialEq)]
+#[allow(dead_code)]
 enum ExecutionType {
     Blocking,
     NonBlocking,
 }
 
+#[allow(dead_code)]
 pub(crate) fn send_message(sender_tid: TID, cid: CID, message: Message) -> SysCallResult {
     SystemServices::with_mut(|ss| {
         let ConnectionSlot::Connected { sidx, permissions, .. } = ss.current_process().connection(cid)?
@@ -172,6 +174,7 @@ pub(crate) fn send_message_inner(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn return_memory(
     server_tid: TID,
     sender: MessageSender,
@@ -219,6 +222,7 @@ fn return_memory(
     })
 }
 
+#[allow(dead_code)]
 fn return_result(server_tid: TID, sender: MessageSender, return_value: Result) -> SysCallResult {
     SystemServices::with_mut(|ss| {
         let sender = SenderID::from(sender);
@@ -262,6 +266,7 @@ fn return_result(server_tid: TID, sender: MessageSender, return_value: Result) -
     })
 }
 
+#[allow(dead_code)]
 fn receive_message(tid: TID, sid: SID, blocking: ExecutionType) -> SysCallResult {
     SystemServices::with_mut(|ss| {
         // See if there is a pending message.  If so, return immediately.
@@ -299,6 +304,7 @@ fn receive_message(tid: TID, sid: SID, blocking: ExecutionType) -> SysCallResult
     })
 }
 
+#[allow(dead_code)]
 fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
     let is_permitted_by_mask = || {
         let permission_mask = SystemServices::with(|ss| ss.current_process().syscall_permissions());
@@ -400,6 +406,7 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
     }
 }
 
+#[allow(dead_code)]
 pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
     klog!("KERNEL({}:{}): Syscall {:x?}", crate::arch::process::current_pid(), tid, call);
     if tid == IRQ_TID && !call.can_call_from_interrupt() {

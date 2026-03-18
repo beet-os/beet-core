@@ -33,6 +33,7 @@ pub struct Process {
 
     /// The process that created this process, which tells who is allowed to
     /// manipulate this process.
+    #[allow(dead_code)]
     pub ppid: Option<PID>,
 
     /// Descriptive name
@@ -48,6 +49,7 @@ pub struct Process {
     event_handlers: [Option<EventHandler>; NUM_SYSTEM_EVENTS],
 
     /// Unique App identifier (different from `name`)
+    #[allow(dead_code)]
     app_id: AppId,
 
     /// Special permissions the process has
@@ -65,6 +67,7 @@ pub struct Process {
     /// ASLR slide applied when loading the ELF
     /// This is only used to make sense of a backtrace after a crash
     #[cfg(beetos)]
+    #[allow(dead_code)]
     pub(crate) aslr_slide: usize,
 }
 
@@ -76,6 +79,7 @@ struct ProcessPermissions {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub enum ConnectionSlot {
     #[default]
     Free,
@@ -90,6 +94,7 @@ pub enum ConnectionSlot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ThreadState {
     /// Unallocated
     Free,
@@ -102,7 +107,6 @@ pub enum ThreadState {
     /// Waiting on a receive()
     WaitReceive { sidx: usize },
     /// Waiting on futex_wait()
-    #[allow(dead_code)]
     WaitFutex { addr: usize },
     /// Retrying a connect() call because the server does not exist (yet). PC is on the SWI instruction, so
     /// once it's marked ready, the connect() syscall will be executed again.
@@ -118,6 +122,7 @@ pub struct EventHandler {
     pub message_id: MessageId,
 }
 
+#[allow(dead_code)]
 impl Process {
     pub fn new(mapping: MemoryMapping, pid: PID, ppid: PID, app_id: AppId) -> Process {
         Process {

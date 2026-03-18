@@ -9,6 +9,7 @@
 /// Clean all data caches (write back all dirty lines).
 ///
 /// Called after deallocating process memory to ensure coherency.
+#[allow(dead_code)]
 pub fn clean_cache() {
     // TODO(M2): implement full cache clean using AArch64 cache maintenance instructions
     clean_cache_l1();
@@ -26,11 +27,13 @@ pub fn clean_cache_l2() {
 }
 
 /// Print L2 cache statistics (debug command).
+#[allow(dead_code)]
 pub fn print_l2cache_stats() {
     // TODO(M2): implement cache statistics reporting
 }
 
 /// Print cache statistics (debug command).
+#[allow(dead_code)]
 pub fn print_cache_stats() {
     // TODO(M2): implement cache statistics reporting
     print_l2cache_stats();

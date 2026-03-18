@@ -19,6 +19,7 @@ const MESSAGE_PERMISSION_COUNT: usize = 4;
 
 /// A pointer to resolve a server ID to a particular process
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Server {
     /// A randomly-generated ID
     pub sid: SID,
@@ -92,6 +93,7 @@ impl From<SenderID> for MessageSender {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum WaitingMessage {
     /// There is no waiting message.
     None,
@@ -112,6 +114,7 @@ pub enum WaitingMessage {
 /// Internal representation of a queued message for a server.
 #[repr(usize)]
 #[derive(PartialEq, Debug)]
+#[allow(dead_code)]
 enum QueuedMessage {
     Empty,
     BlockingScalarMessage {
@@ -223,17 +226,32 @@ enum QueuedMessage {
 #[cfg(beetos)]
 const _: () = assert!(core::mem::size_of::<QueuedMessage>() == 8 * core::mem::size_of::<usize>());
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MessagePermissions {
+    /// When true, no explicit permissions have been configured — all messages are allowed.
+    allow_all: bool,
     mask: u64,
     list: [core::ops::Range<MessageId>; MESSAGE_PERMISSION_COUNT],
 }
 
+impl Default for MessagePermissions {
+    fn default() -> Self {
+        Self {
+            allow_all: true,
+            mask: 0,
+            list: Default::default(),
+        }
+    }
+}
+
+#[allow(dead_code)]
 impl MessagePermissions {
     pub fn add(&mut self, messages: core::ops::Range<MessageId>) -> Result<xous::Result, Error> {
         if messages.is_empty() {
             return Err(Error::InvalidArguments);
         }
+        self.allow_all = false;
         for message_id in messages.start..(messages.end.min(64)) {
             self.mask |= 1 << message_id;
         }
@@ -262,6 +280,9 @@ impl MessagePermissions {
     }
 
     pub fn is_permitted(&self, message_id: MessageId) -> bool {
+        if self.allow_all {
+            return true;
+        }
         if message_id < 64 {
             self.mask & (1 << message_id) != 0
         } else {
@@ -270,6 +291,7 @@ impl MessagePermissions {
     }
 }
 
+#[allow(dead_code)]
 impl Server {
     /// Initialize a server in the given option array. This function is
     /// designed to be called with `new` pointing to an entry in a vec.

@@ -12,6 +12,7 @@ pub fn init() { self::apple_t8103::init(); }
 
 /// Cancel any pending preemption timer and return the elapsed time.
 #[cfg(beetos)]
+#[allow(dead_code)]
 pub fn cancel_preemption() -> usize {
     // TODO(M2): implement using ARM Generic Timer
     0
@@ -19,18 +20,21 @@ pub fn cancel_preemption() -> usize {
 
 /// Set up a preemption timer to fire after `ms` milliseconds.
 #[cfg(beetos)]
+#[allow(dead_code)]
 pub fn setup_preemption(_ms: usize) {
     // TODO(M2): implement using ARM Generic Timer
 }
 
 /// Start measuring idle time (when PID 1 / idle process is scheduled).
 #[cfg(beetos)]
+#[allow(dead_code)]
 pub fn start_measuring_idle() {
     // TODO(M2): implement using ARM Generic Timer
 }
 
 /// Set DRAM idle / power management mode.
 #[cfg(beetos)]
+#[allow(dead_code)]
 pub fn set_dram_idle_mode(_dram: xous::DramIdleMode) {
     // TODO(M2): implement DRAM power management for Apple Silicon
 }

@@ -7,8 +7,10 @@ use xous::MemoryRange;
 mod macros;
 
 #[cfg(beetos)]
+#[allow(dead_code)]
 pub mod commands;
 #[cfg(beetos)]
+#[allow(dead_code)]
 pub mod serial;
 
 #[derive(Clone)]

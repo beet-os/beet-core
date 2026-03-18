@@ -74,6 +74,7 @@ pub(crate) fn kmain() {
     while arch::idle() {}
 }
 
+#[allow(dead_code)]
 fn main() {
     kmain();
 }

@@ -5,7 +5,7 @@ mod hosted;
 pub use hosted::*;
 
 #[cfg(beetos)]
-mod atsama5d2;
+mod apple_t8103;
 
 #[cfg(beetos)]
-pub use atsama5d2::*;
+pub use apple_t8103::*;

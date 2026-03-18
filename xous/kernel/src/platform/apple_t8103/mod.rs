@@ -32,6 +32,7 @@ pub fn init() {
 /// Shut down the platform.
 ///
 /// On real hardware this would power off or reboot via PMGR.
+#[allow(dead_code)]
 pub fn shutdown() {
     // TODO(M2): implement platform shutdown via Apple PMGR
     loop {

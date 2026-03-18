@@ -25,6 +25,7 @@ use crate::server::Server;
 const MAX_SERVER_COUNT: usize = 128;
 
 /// A big unifying struct containing all of the system state.
+#[allow(dead_code)]
 pub struct SystemServices {
     /// A table of all processes in the system
     pub processes: [Option<Process>; MAX_PROCESS_COUNT],
@@ -56,9 +57,9 @@ static mut SYSTEM_SERVICES: SystemServices = SystemServices {
     panic_message_pid: None,
 };
 
+#[allow(dead_code)]
 impl SystemServices {
     /// Calls the provided function with the current inner process state.
-    #[allow(dead_code)]
     pub fn with<F, R>(f: F) -> R
     where
         F: FnOnce(&SystemServices) -> R,

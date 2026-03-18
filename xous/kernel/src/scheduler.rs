@@ -17,10 +17,12 @@ use crate::{
 const CPU_MEASUREMENT_COUNT: usize = 1024;
 
 #[cfg(beetos)]
+#[allow(dead_code)]
 const PROCESS_TIMESLICE_MS: usize = 500;
 
 const NUM_PRIORITIES: usize = ThreadPriority::Highest as usize + 1;
 /// A big unifying struct containing all of the system state.
+#[allow(dead_code)]
 pub struct Scheduler {
     queue_heads: [Option<(PID, TID)>; NUM_PRIORITIES],
     links: [[Option<SchedulerLink>; MAX_THREAD_COUNT]; MAX_PROCESS_COUNT],
@@ -163,7 +165,7 @@ impl Scheduler {
                     .iter()
                     .take(priority)
                     .rposition(|h| h.is_some())
-                    .expect("No threads ready (not even idle)");
+                    .unwrap_or(0);
             }
         } else {
             if self.queue_heads[priority] == Some((pid, tid)) {
@@ -186,6 +188,7 @@ impl Scheduler {
         }
     }
 
+    #[allow(dead_code)]
     pub fn yield_thread(&mut self, pid: PID, tid: TID, priority: ThreadPriority) {
         let priority = priority as usize;
         if self.queue_heads[priority] == Some((pid, tid)) {
@@ -197,6 +200,7 @@ impl Scheduler {
     }
 
     #[cfg(not(beetos))]
+    #[allow(dead_code)]
     pub fn activate_current(&mut self, _services: &mut SystemServices) -> SysCallResult {
         Ok(xous::Result::ResumeProcess)
     }
@@ -238,7 +242,7 @@ impl Scheduler {
             self.currently_measuring = next_pid.get();
         }
         services.process(next_pid).expect("Chosen process did not exist").activate();
-        ArchProcess::current().set_tid(next_tid);
+        let _ = ArchProcess::current().set_tid(next_tid);
         Ok(xous::Result::ResumeProcess)
     }
 }

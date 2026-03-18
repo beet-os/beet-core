@@ -8,20 +8,25 @@
 //! (L1→L2→L3) and TTBR0/TTBR1 split for user/kernel address spaces.
 
 pub mod backtrace;
+#[allow(dead_code)]
 pub mod elf;
 pub mod irq;
 pub mod mem;
 pub mod panic;
 pub mod process;
+#[allow(dead_code)]
 pub mod rand;
+#[allow(dead_code)]
 pub mod syscall;
 
+#[allow(dead_code)]
 mod asm;
 
 use core::arch::asm;
 
 /// Read the current hardware PID from CONTEXTIDR_EL1.
 /// The lower 32 bits hold our process context identifier.
+#[allow(dead_code)]
 #[inline]
 fn current_hw_pid() -> u32 {
     let val: u64;

@@ -10,11 +10,13 @@
 use xous::arch::irq::IrqNumber;
 
 /// Enable a specific interrupt in the AIC.
+#[allow(dead_code)]
 pub fn enable_irq(_irq_no: IrqNumber) {
     // TODO(M2): Write to AIC mask set register
 }
 
 /// Disable a specific interrupt in the AIC.
+#[allow(dead_code)]
 pub fn disable_irq(_irq_no: IrqNumber) {
     // TODO(M2): Write to AIC mask clear register
 }

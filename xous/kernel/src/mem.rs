@@ -6,7 +6,10 @@ use core::ptr::{addr_of, addr_of_mut};
 
 #[cfg(beetos)]
 use bitvec::array::BitArray;
+#[cfg(beetos)]
 pub use beetos::PAGE_SIZE;
+#[cfg(not(beetos))]
+pub use crate::arch::mem::PAGE_SIZE;
 #[cfg(beetos)]
 use beetos::{
     to_plaintext_phys_addr, ENCRYPTED_DRAM_BASE, ENCRYPTED_DRAM_END, PLAINTEXT_DRAM_BASE, PLAINTEXT_DRAM_END,
