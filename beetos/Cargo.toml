@@ -1,0 +1,17 @@
+[package]
+name = "beetos"
+version = "0.1.0"
+edition = "2021"
+description = "Common constants for BeetOS (memory map, page size, addresses)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+core = { version = '1.0.0', optional = true, package = 'rustc-std-workspace-core' }
+
+[features]
+default = []
+# This is being built as part of libstd
+rustc-dep-of-std = ['core']
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }
