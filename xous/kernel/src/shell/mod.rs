@@ -66,6 +66,7 @@ impl Write for NullWriter {
 }
 
 /// Initialize the shell: set up ramfs, print welcome banner.
+#[allow(dead_code)]
 pub fn init() {
     ramfs::init();
 

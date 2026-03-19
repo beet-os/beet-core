@@ -97,12 +97,18 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     #[cfg(feature = "platform-qemu-virt")]
     platform::qemu_virt::uart::enable_rx_interrupt();
 
-    // Initialize the interactive shell
-    shell::init();
-
-    kmain();
-
-    unreachable!()
+    // Launch a minimal EL0 process to prove userspace works.
+    // This creates a separate address space (TTBR0) with:
+    //   - Kernel identity map (EL1-only, inaccessible from EL0)
+    //   - User code page (RX at EL0): infinite WFE loop
+    //   - User stack page (RW at EL0)
+    // Then ERETs to EL0. The timer IRQ proves the kernel can handle
+    // exceptions from userspace and return correctly.
+    //
+    // NOTE: This replaces the shell — the kernel enters EL0 and only
+    // runs IRQ handlers. A future scheduler will time-slice between
+    // user processes and the kernel shell.
+    arch::boot::launch_first_process(&boot_info);
 }
 
 /// Common main function for BeetOS and hosted environments.

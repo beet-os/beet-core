@@ -62,6 +62,15 @@ unsafe extern "C" fn _user_sync_handler_rust(context: *mut u8) {
 /// Called from asm.S when an IRQ occurs from EL0.
 #[no_mangle]
 unsafe extern "C" fn _user_irq_handler_rust(_context: *mut u8) {
+    // Report the first IRQ from EL0 as proof that userspace is running
+    static mut FIRST_EL0_IRQ: bool = true;
+    if FIRST_EL0_IRQ {
+        FIRST_EL0_IRQ = false;
+        #[cfg(feature = "platform-qemu-virt")]
+        crate::platform::qemu_virt::uart::puts(
+            "\n*** SUCCESS: first IRQ from EL0! User process is running in its own address space. ***\n"
+        );
+    }
     handle_irq();
 }
 

@@ -197,6 +197,11 @@ impl MemoryMapping {
         PID::new(self.pid as u8).unwrap_or(unsafe { PID::new_unchecked(1) })
     }
 
+    /// Get the physical address of the L1 page table.
+    pub fn ttbr0(&self) -> usize {
+        self.ttbr0
+    }
+
     /// Activate this mapping — switch TTBR0_EL1 and CONTEXTIDR_EL1.
     pub fn activate(self) {
         let ttbr0_val = self.ttbr0 as u64 | ((self.pid as u64) << 48); // ASID in upper bits

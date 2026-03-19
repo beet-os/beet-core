@@ -128,6 +128,7 @@ fn find_free() -> Option<usize> {
 }
 
 /// Initialize the filesystem with a root directory.
+#[allow(dead_code)]
 pub fn init() {
     unsafe {
         FS[0].set_name("/");

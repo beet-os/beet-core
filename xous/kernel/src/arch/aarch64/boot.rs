@@ -432,3 +432,134 @@ pub unsafe fn init_memory_manager(info: &BootInfo) {
         mm.init_from_bootstrap(allocations, num_pages);
     });
 }
+
+// ============================================================================
+// Minimal EL0 process launch
+// ============================================================================
+
+/// User process virtual addresses.
+/// Placed at 4 GiB mark to avoid conflicting with the kernel identity map (0..2 GiB).
+const USER_CODE_VA: usize = 0x0000_0001_0000_0000; // 4 GiB
+const USER_STACK_VA: usize = 0x0000_0001_0001_0000; // 4 GiB + 64KB
+
+/// Minimal AArch64 user program: infinite WFE loop.
+/// This is the raw machine code that will be mapped as the user's .text page.
+///
+/// ```asm
+///     mov x0, #0x42       // x0 = 0x42 (proof we got here)
+/// .loop:
+///     wfe
+///     b .loop
+/// ```
+static USER_PROGRAM: [u32; 3] = [
+    0xd280_0840, // mov x0, #0x42
+    0xd503_205f, // wfe
+    0x17ff_ffff, // b .-4 (branch back to wfe)
+];
+
+/// Launch a minimal user process in EL0.
+///
+/// This is a proof-of-concept: allocates one code page and one stack page,
+/// creates a new TTBR0 with the kernel identity-mapped (EL1-only) plus
+/// user code (RX) and stack (RW), then ERETs to EL0.
+///
+/// The process runs an infinite WFE loop. The kernel can observe it ran
+/// by checking that the first timer IRQ from EL0 is handled correctly.
+///
+/// # Safety
+///
+/// Must be called after MMU and MemoryManager are initialized.
+/// Does not return — enters EL0 via ERET.
+pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
+    use xous::{MemoryFlags, PID};
+
+    #[cfg(feature = "platform-qemu-virt")]
+    crate::platform::qemu_virt::uart::puts("EL0: setting up user process...\n");
+
+    let pid2 = PID::new(2).unwrap();
+
+    // 1. Allocate a new L1 page table for the user process
+    let mut user_mapping = super::mem::MemoryMapping::default();
+    crate::mem::MemoryManager::with_mut(|mm| {
+        user_mapping.allocate(pid2).expect("alloc user L1");
+
+        // 2. Copy kernel L2 table reference into user L1.
+        // The kernel's L1[0] points to an L2 table with identity-mapped RAM + MMIO.
+        // We copy this descriptor so the kernel is accessible at EL1 within the
+        // user's address space (user can't access it — AP bits are EL1-only).
+        let kernel_l1 = boot_info.ttbr0 as *const u64;
+        let user_l1 = user_mapping.ttbr0() as *mut u64;
+        let kernel_l1_entry0 = core::ptr::read_volatile(kernel_l1);
+        core::ptr::write_volatile(user_l1, kernel_l1_entry0);
+
+        // 3. Allocate a physical page for user code and copy the program into it
+        let (code_phys, _) = mm.alloc_range(1, pid2).expect("alloc code page");
+        core::ptr::write_bytes(code_phys as *mut u8, 0, PAGE_SIZE);
+        let code_src = USER_PROGRAM.as_ptr() as *const u8;
+        core::ptr::copy_nonoverlapping(
+            code_src,
+            code_phys as *mut u8,
+            USER_PROGRAM.len() * 4,
+        );
+
+        // Map user code page as RX at EL0
+        user_mapping.map_page(
+            mm,
+            code_phys,
+            USER_CODE_VA as *mut usize,
+            MemoryFlags::X,
+            true,  // user page
+        ).expect("map code page");
+
+        // 4. Allocate a physical page for user stack
+        let (stack_phys, _) = mm.alloc_range(1, pid2).expect("alloc stack page");
+        core::ptr::write_bytes(stack_phys as *mut u8, 0, PAGE_SIZE);
+
+        // Map user stack page as RW at EL0
+        user_mapping.map_page(
+            mm,
+            stack_phys,
+            USER_STACK_VA as *mut usize,
+            MemoryFlags::W,
+            true,  // user page
+        ).expect("map stack page");
+    });
+
+    // 5. Build a context frame for the user thread.
+    // Allocate a page for the thread's kernel stack / context save area.
+    let kstack_phys = crate::mem::MemoryManager::with_mut(|mm| {
+        mm.alloc_range(1, PID::new(1).unwrap()).expect("alloc kstack").0
+    });
+    core::ptr::write_bytes(kstack_phys as *mut u8, 0, PAGE_SIZE);
+
+    // Place the context frame at the bottom of the kernel stack page.
+    // After restore_context, SP_EL1 = context_ptr + 816.
+    // This leaves the rest of the page as kernel stack space for exception handlers.
+    let context_ptr = kstack_phys as *mut u64;
+
+    // Write context frame (matches asm.S save_context layout):
+    //   [0..248]    X0-X30 (all zero)
+    //   [248]       SP_EL0 = top of user stack page
+    //   [256]       ELR_EL1 = user code entry point
+    //   [264]       SPSR_EL1 = 0 (EL0t, interrupts enabled)
+    //   [272..816]  TPIDR, FPCR, FPSR, pad, V0-V31 (all zero)
+
+    // SP_EL0: stack grows downward, so SP = top of the stack page
+    let user_sp = USER_STACK_VA + PAGE_SIZE;
+    core::ptr::write_volatile(context_ptr.add(31), user_sp as u64);  // offset 248 = SP_EL0
+
+    // ELR_EL1: entry point = start of user code page
+    core::ptr::write_volatile(context_ptr.add(32), USER_CODE_VA as u64);  // offset 256
+
+    // SPSR_EL1: 0 = EL0t (user mode, AArch64, all interrupts enabled)
+    core::ptr::write_volatile(context_ptr.add(33), 0u64);  // offset 264
+
+    // 6. Switch to user address space
+    user_mapping.activate();
+
+    #[cfg(feature = "platform-qemu-virt")]
+    crate::platform::qemu_virt::uart::puts("EL0: launching user process (wfe loop)...\n");
+
+    // 7. ERET to EL0
+    super::asm::_resume_context(context_ptr as *const u8)
+}
