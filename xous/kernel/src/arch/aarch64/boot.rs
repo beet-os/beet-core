@@ -445,36 +445,22 @@ pub unsafe fn init_memory_manager(info: &BootInfo) {
 const USER_CODE_VA: usize = 0x0000_0010_0000_0000; // 64 GiB (L1[1])
 const USER_STACK_VA: usize = 0x0000_0010_0001_0000; // 64 GiB + 64KB
 
-/// IPC server program (PID 2): creates a server, then loops receiving messages.
+/// Server program (PID 2): creates a server, then enters an infinite WFE loop.
+/// No cooperation (no Yield) — only timer preemption can switch away.
 ///
 /// ```asm
-///     // CreateServerWithAddress(SID=[0xBEE70001, 0, 0, 0], range=0..0)
-///     mov x0, #14             // SysCallNumber::CreateServerWithAddress = 14
-///     movz x1, #0x0001        // SID word 0 low half
-///     movk x1, #0xBEE7, lsl #16  // SID word 0 = 0xBEE70001
-///     mov x2, #0              // SID word 1
-///     mov x3, #0              // SID word 2
-///     mov x4, #0              // SID word 3
-///     mov x5, #0              // range.start
-///     mov x8, #0              // range.end (arg6)
-///     svc #0
-/// .recv:
-///     // ReceiveMessage(SID)
-///     mov x0, #15             // SysCallNumber::ReceiveMessage = 15
+///     mov x0, #14             // CreateServerWithAddress
 ///     movz x1, #0x0001
-///     movk x1, #0xBEE7, lsl #16
-///     mov x2, #0
-///     mov x3, #0
-///     mov x4, #0
+///     movk x1, #0xBEE7, lsl #16  // SID = 0xBEE70001
+///     mov x2..x5, #0
+///     mov x8, #0
 ///     svc #0
-///     // Got a message! Yield then receive again.
-///     mov x0, #3              // Yield
-///     svc #0
-///     b .recv
+/// .loop:
+///     wfe
+///     b .loop
 /// ```
-static SERVER_PROGRAM: [u32; 19] = [
-    // CreateServerWithAddress
-    0xd280_01c0, // mov x0, #14
+static SERVER_PROGRAM: [u32; 11] = [
+    0xd280_01c0, // mov x0, #14 (CreateServerWithAddress)
     0xd280_0021, // movz x1, #0x0001
     0xf2b7_dce1, // movk x1, #0xBEE7, lsl #16
     0xd280_0002, // mov x2, #0
@@ -483,58 +469,25 @@ static SERVER_PROGRAM: [u32; 19] = [
     0xd280_0005, // mov x5, #0
     0xd280_0008, // mov x8, #0
     0xd400_0001, // svc #0
-    // .recv:
-    0xd280_01e0, // mov x0, #15 (ReceiveMessage)
-    0xd280_0021, // movz x1, #0x0001
-    0xf2b7_dce1, // movk x1, #0xBEE7, lsl #16
-    0xd280_0002, // mov x2, #0
-    0xd280_0003, // mov x3, #0
-    0xd280_0004, // mov x4, #0
-    0xd400_0001, // svc #0
-    0xd280_0060, // mov x0, #3 (Yield)
-    0xd400_0001, // svc #0
-    0x17ff_fff7, // b .recv (back 9 insns)
+    0xd503_205f, // wfe
+    0x17ff_ffff, // b .loop
 ];
 
-/// IPC client program (PID 3): yields, connects, then loops sending Scalar messages.
+/// Client program (PID 3): connects to the server, then enters an infinite WFE loop.
+/// No cooperation (no Yield) — only timer preemption can switch away.
 ///
 /// ```asm
-///     mov x0, #3              // Yield (let server register)
-///     svc #0
-///     mov x0, #3              // Yield again
-///     svc #0
-///     // Connect(SID=[0xBEE70001, 0, 0, 0])
-///     mov x0, #17             // SysCallNumber::Connect = 17
+///     mov x0, #17             // Connect(SID = 0xBEE70001)
 ///     movz x1, #0x0001
 ///     movk x1, #0xBEE7, lsl #16
-///     mov x2, #0
-///     mov x3, #0
-///     mov x4, #0
+///     mov x2..x4, #0
 ///     svc #0
-///     // X1 = CID. Save in x20.
-///     mov x20, x1
-/// .send:
-///     // SendMessage(CID, Scalar{id=42, arg1=0xCAFE, arg2=0xBEEF, arg3=0, arg4=0})
-///     mov x0, #16             // SysCallNumber::SendMessage = 16
-///     mov x1, x20             // CID
-///     mov x2, #4              // message_type = Scalar
-///     mov x3, #42             // message_id
-///     movz x4, #0xCAFE        // arg1
-///     movz x5, #0xBEEF        // arg2
-///     mov x8, #0              // arg3
-///     mov x9, #0              // arg4
-///     svc #0
-///     mov x0, #3              // Yield (give server time to process)
-///     svc #0
-///     b .send
+///     mov x20, x1             // save CID
+/// .loop:
+///     wfe
+///     b .loop
 /// ```
-static CLIENT_PROGRAM: [u32; 24] = [
-    // Yield twice
-    0xd280_0060, // mov x0, #3 (Yield)
-    0xd400_0001, // svc #0
-    0xd280_0060, // mov x0, #3 (Yield)
-    0xd400_0001, // svc #0
-    // Connect
+static CLIENT_PROGRAM: [u32; 10] = [
     0xd280_0220, // mov x0, #17 (Connect)
     0xd280_0021, // movz x1, #0x0001
     0xf2b7_dce1, // movk x1, #0xBEE7, lsl #16
@@ -543,19 +496,8 @@ static CLIENT_PROGRAM: [u32; 24] = [
     0xd280_0004, // mov x4, #0
     0xd400_0001, // svc #0
     0xaa01_03f4, // mov x20, x1 (save CID)
-    // .send: (offset 12)
-    0xd280_0200, // mov x0, #16 (SendMessage)
-    0xaa14_03e1, // mov x1, x20 (CID)
-    0xd280_0082, // mov x2, #4 (Scalar)
-    0xd280_0543, // mov x3, #42 (message_id)
-    0xd299_5fc4, // movz x4, #0xCAFE (arg1)
-    0xd297_dde5, // movz x5, #0xBEEF (arg2)
-    0xd280_0008, // mov x8, #0 (arg3)
-    0xd280_0009, // mov x9, #0 (arg4)
-    0xd400_0001, // svc #0
-    0xd280_0060, // mov x0, #3 (Yield)
-    0xd400_0001, // svc #0
-    0x17ff_fff4, // b .send (back 12 insns)
+    0xd503_205f, // wfe
+    0x17ff_ffff, // b .loop
 ];
 
 /// Create a user process: allocate address space, map code + stack, register in SystemServices.

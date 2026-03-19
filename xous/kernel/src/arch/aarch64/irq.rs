@@ -60,20 +60,58 @@ unsafe extern "C" fn _user_sync_handler_rust(context: *mut u8) {
 }
 
 /// Called from asm.S when an IRQ occurs from EL0.
+///
+/// This is the preemption entry point: if the timer fires while a user process
+/// is running, we save its context, handle the IRQ, then let the scheduler
+/// pick the next process to run (which may be a different one).
 #[no_mangle]
-unsafe extern "C" fn _user_irq_handler_rust(_context: *mut u8) {
-    // Report the first IRQ from EL0 as proof that userspace is running
+unsafe extern "C" fn _user_irq_handler_rust(context: *mut u8) {
+    use super::process::{Process, Thread};
+
+    let frame = context as *mut Thread;
+
+    // Save the interrupted process's register state into PROCESS_TABLE.
+    let interrupted_pid = crate::arch::process::current_pid();
+    let proc = Process::current();
+    let tid = proc.current_tid();
+    proc.save_context_to_table(tid, frame);
+
+    // Handle the hardware interrupt (timer, UART, etc.)
+    let was_timer = handle_irq();
+
+    // If the timer fired, rotate the scheduler and possibly switch processes.
+    if was_timer {
+        crate::services::SystemServices::with_mut(|ss| {
+            crate::scheduler::Scheduler::with_mut(|s| {
+                let prio = ss.current_process().thread_priority(tid);
+                s.yield_thread(interrupted_pid, tid, prio);
+                let _ = s.activate_current(ss);
+            });
+        });
+    }
+
+    // Load the (potentially new) process's context into the stack frame.
+    let resume_proc = Process::current();
+    let resume_tid = resume_proc.current_tid();
+    resume_proc.load_context_from_table(resume_tid, frame);
+
+    // Log the first preemptive switch
     #[cfg(feature = "platform-qemu-virt")]
-    {
-        use core::sync::atomic::{AtomicBool, Ordering};
-        static FIRST_EL0_IRQ: AtomicBool = AtomicBool::new(true);
-        if FIRST_EL0_IRQ.swap(false, Ordering::Relaxed) {
-            crate::platform::qemu_virt::uart::puts(
-                "\n*** SUCCESS: first IRQ from EL0! User process is running in its own address space. ***\n"
-            );
+    if was_timer {
+        let resume_pid = crate::arch::process::current_pid();
+        if resume_pid != interrupted_pid {
+            use core::sync::atomic::{AtomicBool, Ordering};
+            static FIRST_PREEMPT: AtomicBool = AtomicBool::new(true);
+            if FIRST_PREEMPT.swap(false, Ordering::Relaxed) {
+                use core::fmt::Write;
+                let _ = write!(
+                    crate::platform::qemu_virt::uart::UartWriter,
+                    "PREEMPT: timer switched PID {} -> {}\n",
+                    interrupted_pid, resume_pid,
+                );
+            }
         }
     }
-    handle_irq();
 }
 
 /// Called from asm.S for kernel-mode synchronous exceptions.
@@ -86,9 +124,10 @@ unsafe extern "C" fn _kernel_sync_handler_rust(_context: *mut u8) {
 }
 
 /// Called from asm.S for kernel-mode IRQs.
+/// No preemption — kernel mode always returns to the same context.
 #[no_mangle]
 unsafe extern "C" fn _kernel_irq_handler_rust(context: *mut u8) {
-    handle_irq();
+    let _ = handle_irq();
 
     // Clear PSTATE.I in saved SPSR so interrupts stay enabled after eret.
     // Without this, eret restores the SPSR with DAIF.I set (masked on entry).
@@ -97,16 +136,19 @@ unsafe extern "C" fn _kernel_irq_handler_rust(context: *mut u8) {
     core::ptr::write_volatile(spsr_ptr, spsr & !(1 << 7));
 }
 
-/// Platform-generic IRQ dispatch.
-fn handle_irq() {
+/// Platform-generic IRQ dispatch. Returns true if the IRQ was a timer tick
+/// (used by the caller to decide whether to invoke the scheduler).
+fn handle_irq() -> bool {
     #[cfg(feature = "platform-qemu-virt")]
     {
         use crate::platform::qemu_virt::{gic, timer, uart};
 
         let irq = gic::ack_irq();
         if irq == gic::IRQ_SPURIOUS {
-            return;
+            return false;
         }
+
+        let is_timer = irq == timer::TIMER_IRQ;
 
         match irq {
             timer::TIMER_IRQ => {
@@ -126,10 +168,11 @@ fn handle_irq() {
         }
 
         gic::eoi(irq);
+        return is_timer;
     }
 
     #[cfg(feature = "platform-apple-t8103")]
-    { /* TODO(M3): AIC dispatch */ }
+    { /* TODO(M3): AIC dispatch */ false }
 }
 
 /// Handle an SVC (syscall) from userspace.
