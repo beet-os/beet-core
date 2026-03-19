@@ -620,22 +620,177 @@ User types "hello":
 
 ---
 
-## Milestone 6 — NVMe Storage
+## Milestone 6 — Block Storage (virtio-blk on QEMU)
 
-**Goal:** Read the built-in SSD. Mount read-only filesystem. Verified boot.
+**Goal:** Read/write a virtual block device via virtio-blk on QEMU. Simple read-only filesystem. Foundation for persistent storage on any platform.
 
-### Tasks
+**Strategy:** Implement virtio MMIO transport + virtio-blk driver in the kernel (platform code), expose a block device API, add a simple tar-based read-only filesystem. The block API is platform-agnostic — future platforms (RPi5, Apple M1) add their own storage backends (SD card, NVMe) behind the same API.
 
-- [ ] `os/dart/` — Apple DART (IOMMU) driver
-- [ ] `os/nvme/` — Apple ANS NVMe driver (reference: Asahi `nvme-apple.c`)
-- [ ] `api/storage/` — block storage API
-- [ ] Read-only filesystem (tar or simple custom format)
-- [ ] Verified boot: ed25519 signature check on rootfs image
-- [ ] Shell commands: `ls`, `cat`
+### Architecture
+
+```
+bsh> cat /disk/hello.txt
+  ↓
+Shell → ramfs lookup fails → disk filesystem lookup
+  ↓
+DiskFs (tar reader) → BlockDev::read_sector(lba)
+  ↓
+virtio-blk driver → virtqueue request → QEMU virtio-blk backend
+  ↓
+QEMU reads from disk.img file on host
+```
+
+### virtio MMIO Transport (QEMU virt)
+
+QEMU virt exposes virtio devices at MMIO region `0x0A00_0000`, each transport occupying `0x200` bytes. IRQs start at SPI 16 (GIC IRQ 48). The kernel discovers virtio-blk by scanning transports for `DeviceID == 2` (block device).
+
+**Key virtio MMIO registers (spec v1.2, section 4.2):**
+
+| Offset | Name | R/W | Description |
+|--------|------|-----|-------------|
+| 0x000 | MagicValue | R | Must be `0x74726976` ("virt") |
+| 0x004 | Version | R | Must be `2` (modern) |
+| 0x008 | DeviceID | R | `2` = block device |
+| 0x010 | DeviceFeatures | R | Feature bits (selected by DeviceFeaturesSel) |
+| 0x020 | DriverFeatures | W | Feature bits accepted by driver |
+| 0x030 | QueueSel | W | Select virtqueue index |
+| 0x034 | QueueNumMax | R | Max queue size |
+| 0x038 | QueueNum | W | Queue size (power of 2) |
+| 0x044 | QueueReady | W | `1` to mark queue ready |
+| 0x050 | QueueNotify | W | Write queue index to notify device |
+| 0x060 | InterruptStatus | R | Bit 0 = used buffer, bit 1 = config change |
+| 0x064 | InterruptACK | W | Write to acknowledge interrupt |
+| 0x070 | Status | R/W | Device status (ACKNOWLEDGE, DRIVER, FEATURES_OK, DRIVER_OK) |
+| 0x080 | QueueDescLow/High | W | Physical address of descriptor table |
+| 0x090 | QueueDriverLow/High | W | Physical address of available ring |
+| 0x0A0 | QueueDeviceLow/High | W | Physical address of used ring |
+
+**Virtqueue layout (physically contiguous DMA memory):**
+- Descriptor table: 16 bytes × queue_size
+- Available ring: 6 + 2 × queue_size bytes
+- Used ring: 6 + 8 × queue_size bytes
+
+**Block request format:**
+```rust
+#[repr(C)]
+struct VirtioBlkReq {
+    type_: u32,      // 0 = read, 1 = write
+    reserved: u32,
+    sector: u64,     // LBA (512-byte sectors)
+}
+// Followed by data buffer (512+ bytes), then 1-byte status
+```
+
+### New Files
+
+#### 1. `xous/kernel/src/platform/qemu_virt/virtio.rs` — virtio MMIO transport
+
+Generic virtio MMIO transport: device discovery, feature negotiation, virtqueue setup.
+- `VirtioMmio` struct: base address, register read/write
+- `Virtqueue` struct: descriptor table, available ring, used ring, free list
+- Device init sequence (spec §3.1): reset → acknowledge → driver → features → features_ok → driver_ok
+- Queue notification and interrupt handling
+
+#### 2. `xous/kernel/src/platform/qemu_virt/blk.rs` — virtio-blk driver
+
+Block device driver on top of virtio MMIO transport.
+- `init()`: scan MMIO region for DeviceID=2, negotiate features, set up requestq (queue 0)
+- `read_sectors(lba: u64, count: u32, buf: &mut [u8])`: submit read request, wait for completion
+- `write_sectors(lba: u64, count: u32, buf: &[u8])`: submit write request (for future use)
+- `capacity() -> u64`: read device config for total sectors
+- Synchronous (polling) for now — IRQ-driven later
+
+#### 3. `api/storage/` — Block storage API crate
+
+```rust
+#![no_std]
+pub const BLOCK_SIZE: usize = 512;
+
+pub trait BlockDevice {
+    fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError>;
+    fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
+    fn capacity_sectors(&self) -> u64;
+}
+
+pub enum BlockError {
+    IoError,
+    OutOfRange,
+    NotReady,
+}
+```
+
+#### 4. Filesystem: tar-based read-only rootfs
+
+Simple tar reader (POSIX ustar format) that reads from the block device:
+- Parse 512-byte tar headers (filename, size, type)
+- `ls(path)` → list entries
+- `cat(path)` → read file contents
+- Mount at `/disk/` in the shell
+- No write support (read-only)
+
+The tar image is created on the host (`tar cf disk.tar hello.txt readme.txt`) and passed to QEMU via `-drive file=disk.tar,format=raw,if=virtio`.
+
+#### 5. Shell integration
+
+- New commands: `disk` (show block device info), update `ls`/`cat` to try `/disk/` paths
+- Or: `mount` command that registers the disk filesystem
+
+### QEMU Launch Update
+
+```bash
+qemu-system-aarch64 \
+    -machine virt,gic-version=3 \
+    -cpu neoverse-n1 \
+    -m 512M \
+    -nographic \
+    -kernel beetos-kernel \
+    -drive file=disk.tar,format=raw,if=virtio   # NEW
+```
+
+### Implementation Order
+
+1. **`virtio.rs`** — MMIO transport: register access, device discovery, virtqueue alloc/setup
+2. **`blk.rs`** — virtio-blk: init, synchronous read_sectors (polling mode)
+3. **`api/storage/`** — BlockDevice trait, BlockError
+4. **xtask** — update QEMU launch with `-drive` flag, add `disk.tar` generation
+5. **tar reader** — parse ustar headers, read file data from block device
+6. **Shell** — `disk` command, `/disk/` path support in ls/cat
+7. **Tests** — hosted mode unit tests for tar parser, QEMU integration test
+
+### Memory Allocation for Virtqueues
+
+Virtqueues need physically contiguous DMA-accessible memory. On BeetOS:
+- Allocate pages from `MemoryManager::alloc_range()` (PID 1 = kernel)
+- Convert to kernel VA via `beetos::phys_to_virt(pa)` for CPU access
+- Pass physical addresses to virtio device registers
+- Queue size = 16 entries (small, ~1 page total for desc + avail + used)
+
+### IRQ Handling
+
+virtio-blk uses SPI 16 (first virtio transport = GIC IRQ 48). For the initial implementation:
+- **Polling mode**: after submitting a request, spin-wait on the used ring
+- **Future**: add IRQ handler in `handle_irq()` match arm, wake blocked thread
+
+### Tests
+
+- [ ] Hosted mode: tar parser unit tests (header parsing, file listing, file reading)
+- [ ] Hosted mode: virtqueue data structure tests (descriptor chains, ring operations)
+- [ ] QEMU: `cargo xtask qemu` with disk.tar shows block device initialized
+- [ ] QEMU: `bsh> disk` shows capacity and device info
+- [ ] QEMU: `bsh> ls /disk/` lists files from tar image
+- [ ] QEMU: `bsh> cat /disk/hello.txt` reads file content
+
+### What this does NOT include (deferred)
+
+- No write filesystem (tar is read-only)
+- No verified boot / ed25519 (deferred to when we have real rootfs)
+- No partition table parsing (raw tar image, no GPT/MBR)
+- No DMA cache management (QEMU is cache-coherent)
+- No async/IRQ-driven I/O (polling only for now)
 
 ### Definition of Done
 
-Kernel reads the SSD. Rootfs mounted read-only with signature verification.
+`cargo xtask qemu` boots with a disk image. Shell can list and read files from the virtio-blk device. Block storage API is platform-agnostic.
 
 ---
 
