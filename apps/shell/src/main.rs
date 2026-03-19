@@ -253,7 +253,8 @@ fn cmd_ls(args: &[&str]) {
     }
 
     // Show disk in root listing.
-    if path == "/" {
+    let is_root = path == "/" || path.is_empty();
+    if is_root {
         if get_disk_archive().is_some() {
             puts("  disk/  (block device)\n");
         }
@@ -425,15 +426,17 @@ fn get_disk_archive() -> Option<tarfs::TarArchive<'static>> {
     }
 }
 
-/// Check if a path refers to the disk filesystem (/disk/...).
+/// Check if a path refers to the disk filesystem.
 fn is_disk_path(path: &str) -> bool {
-    path.starts_with("/disk/") || path == "/disk"
+    let p = path.strip_prefix('/').unwrap_or(path);
+    p == "disk" || p.starts_with("disk/")
 }
 
-/// Strip the /disk/ prefix from a path.
+/// Strip the disk prefix from a path.
 fn disk_subpath(path: &str) -> &str {
-    path.strip_prefix("/disk/").unwrap_or(
-        path.strip_prefix("/disk").unwrap_or(path)
+    let p = path.strip_prefix('/').unwrap_or(path);
+    p.strip_prefix("disk/").unwrap_or(
+        p.strip_prefix("disk").unwrap_or(p)
     )
 }
 
