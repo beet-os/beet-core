@@ -58,11 +58,13 @@ SECTIONS
         _ebss = .;
     } > RAM
 
-    /* Kernel stack — 64KB, grows downward */
+    /* Kernel stack — 256KB, grows downward.
+     * Needs to be large enough for debug-mode ProcessImpl construction
+     * (ProcessImpl = 32 × Thread × 840 bytes ≈ 26KB on stack). */
     .stack (NOLOAD) : ALIGN(16)
     {
         _stack_bottom = .;
-        . += 64K;
+        . += 256K;
         _stack_top = .;
     } > RAM
 

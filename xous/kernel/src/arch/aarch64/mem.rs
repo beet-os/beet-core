@@ -59,7 +59,7 @@ const PTE_UXN: u64 = 1 << 54; // User execute-never (EL0)
 
 /// Address mask for output address in page table entries (16KB granule).
 /// Bits [47:14] hold the physical address.
-const PTE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_C000;
+pub(crate) const PTE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_C000;
 
 /// MAIR_EL1 value:
 ///   Attr0 = 0x00 (Device-nGnRnE)

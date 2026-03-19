@@ -11,6 +11,7 @@
 //! Platform-specific drivers (GIC, AIC, UART, etc.) live in platform/.
 
 pub mod backtrace;
+pub mod boot;
 #[allow(dead_code)]
 pub mod elf;
 pub mod irq;

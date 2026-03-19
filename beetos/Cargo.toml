@@ -12,6 +12,9 @@ core = { version = '1.0.0', optional = true, package = 'rustc-std-workspace-core
 default = []
 # This is being built as part of libstd
 rustc-dep-of-std = ['core']
+# Platform selection — affects RAM base address and max RAM size
+platform-qemu-virt = []
+platform-apple-t8103 = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }

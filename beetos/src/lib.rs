@@ -98,15 +98,25 @@ pub const EXCEPTION_STACK_TOP_GUARD: usize =
 // All MMIO base addresses come from the Flattened Device Tree (FDT) passed by m1n1.
 // The constants below are for RAM layout only.
 
-/// Apple M1 MacBook Air has 8GB or 16GB of unified memory.
-/// Actual size is discovered from FDT at boot time.
-/// This is a conservative default for the allocation tracker.
-pub const RAM_SIZE_DEFAULT: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
+// ======================== RAM size and base — platform-specific ========================
+//
+// These constants define the physical RAM layout. The actual RAM size is
+// discovered from FDT at boot time, but the allocation tracker bitmaps
+// are sized at compile time, so we need a max-RAM-size constant.
 
-/// RAM size (alias for compatibility with kernel code).
-pub const RAM_SIZE: usize = RAM_SIZE_DEFAULT;
+/// Maximum RAM size for this platform.
+/// On QEMU virt: 1 GiB max (default -m 512M, max practical ~1G).
+/// On Apple M1: 8 GiB (MacBook Air) or 16 GiB.
+#[cfg(feature = "platform-qemu-virt")]
+pub const RAM_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
 
-/// Number of pages in default RAM configuration.
+#[cfg(feature = "platform-apple-t8103")]
+pub const RAM_SIZE: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
+
+#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
+pub const RAM_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB default
+
+/// Number of pages in max RAM configuration.
 pub const RAM_PAGES: usize = RAM_SIZE / PAGE_SIZE;
 
 // ======================== Physical RAM layout ========================
@@ -115,8 +125,17 @@ pub const RAM_PAGES: usize = RAM_SIZE / PAGE_SIZE;
 // We provide these constants as no-ops for compatibility with the copied
 // kernel code (mem.rs, process.rs). The actual RAM base comes from FDT.
 
-/// Physical RAM base (default, actual from FDT).
-pub const PLAINTEXT_DRAM_BASE: usize = 0x0_8000_0000; // 2 GiB (typical M1 DRAM start)
+/// Physical RAM base address.
+/// QEMU virt: 0x4000_0000 (1 GiB mark — from hw/arm/virt.c).
+/// Apple M1: 0x8_0000_0000 (34 GiB mark — above I/O MMIO aperture).
+#[cfg(feature = "platform-qemu-virt")]
+pub const PLAINTEXT_DRAM_BASE: usize = 0x4000_0000;
+
+#[cfg(feature = "platform-apple-t8103")]
+pub const PLAINTEXT_DRAM_BASE: usize = 0x8_0000_0000;
+
+#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
+pub const PLAINTEXT_DRAM_BASE: usize = 0x4000_0000; // default to QEMU
 
 /// End of physical RAM.
 pub const PLAINTEXT_DRAM_END: usize = PLAINTEXT_DRAM_BASE + RAM_SIZE;

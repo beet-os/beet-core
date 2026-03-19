@@ -15,8 +15,8 @@ debug-print = []
 log-serial = []
 production = []
 integration-test = []
-platform-qemu-virt = []
-platform-apple-t8103 = []
+platform-qemu-virt = ["beetos/platform-qemu-virt"]
+platform-apple-t8103 = ["beetos/platform-apple-t8103"]
 
 [dependencies]
 bitflags = "1.2.1"

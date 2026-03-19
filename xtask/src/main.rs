@@ -132,7 +132,7 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
     let status = Command::new("qemu-system-aarch64")
         .args([
             "-machine", "virt,gic-version=3",
-            "-cpu", "cortex-a72",
+            "-cpu", "neoverse-n1",  // Supports 16KB granule (required by BeetOS)
             "-m", "512M",
             "-nographic",
             "-kernel", kernel.to_str().expect("non-UTF8 path"),

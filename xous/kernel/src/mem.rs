@@ -180,6 +180,28 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// Initialize the MemoryManager from a pre-built page tracker.
+    ///
+    /// Used during bootstrap when the kernel self-initializes from FDT
+    /// (no loader). The page tracker was set up by `boot::init_memory_manager`.
+    #[cfg(beetos)]
+    pub fn init_from_bootstrap(
+        &mut self,
+        allocations: &'static mut [Option<PID>],
+        num_pages: usize,
+    ) {
+        self.allocations = allocations;
+        let scan_pages = num_pages.min(RAM_PAGES);
+        for (offset, allocation) in self.allocations[..scan_pages].iter().enumerate() {
+            if allocation.is_none() {
+                // Mark free pages as dirty (need zeroing before use).
+                // The page zeroer will clean them in the background.
+                self.free_pages_dirty.set(offset, true);
+                self.num_free_pages += 1;
+            }
+        }
+    }
+
     /// Print the number of RAM bytes used by the specified process.
     /// This does not include memory such as peripherals and CSRs.
     #[cfg(beetos)]
