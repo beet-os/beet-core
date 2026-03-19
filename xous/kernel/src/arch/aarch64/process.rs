@@ -415,8 +415,12 @@ impl Process {
         unsafe {
             let orig_ttbr0: u64;
             core::arch::asm!("mrs {}, ttbr0_el1", out(reg) orig_ttbr0, options(nomem, nostack));
+            // Use mapping.activate() instead of process.activate() to switch
+            // TTBR0 without changing CURRENT_PID. process.activate() would set
+            // CURRENT_PID to the new process, which is never restored and would
+            // corrupt the kernel's notion of which process is running.
             let process = services.process(pid)?;
-            process.activate();
+            process.mapping.activate();
             // Disable PAN (Privileged Access Never) so EL1 can write to user pages (AP_RW_ALL).
             // This instruction is encoded as .inst because `msr pan, #0` requires explicit CPU
             // feature flags in the assembler. Opcode: MSR PAN, #0 = 0xd500409f
