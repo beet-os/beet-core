@@ -181,6 +181,23 @@ These are C files. Reimplement the protocol in Rust — do not translate C line-
 - Squash merge to main when milestone passes all tests.
 - Tag releases: `v0.1.0` (M0), `v0.2.0` (M1), etc.
 
+## AArch64 Kernel Stack Rules
+
+**SP_EL1 must ALWAYS point into the kernel's `.stack` section (256KB).** This is non-negotiable.
+
+- **Never allocate a page from the user pool and use it as a kernel stack.** After `eret`, the CPU uses SP_EL1 for all EL1 exceptions (IRQ, SVC, data abort). If SP_EL1 points to a small allocated page (e.g. 16KB), the exception handler will overflow into adjacent physical pages — causing silent memory corruption that is nearly impossible to diagnose.
+- **Before `_resume_context` or any `eret`**, verify that SP_EL1 is within `[_stack_bottom, _stack_top]`. In debug builds, add an assertion:
+  ```rust
+  let sp_el1: usize;
+  unsafe { core::arch::asm!("mov {}, sp", out(reg) sp_el1) };
+  assert!(sp_el1 >= STACK_BOTTOM && sp_el1 <= STACK_TOP,
+      "SP_EL1 0x{:x} outside kernel stack!", sp_el1);
+  ```
+- **Context frames (816 bytes for `save_context`/`_resume_context`) go on the kernel stack**, not on a separately allocated page.
+- **When adding per-thread kernel stacks** (multi-process), each thread gets its own 256KB stack — never a single page.
+
+**Debugging rule of thumb:** when a memory corruption bug resists all logical hypotheses (TLB, cache, allocator, page tables), check where SP_EL1 actually points. Stack pointer misconfigurations are the first thing to verify, not the last.
+
 ## Things to Avoid
 
 - No `unwrap()` in library/kernel code. Use proper error propagation.
