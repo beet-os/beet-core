@@ -10,6 +10,7 @@
 #![no_main]
 
 mod ramfs;
+mod tarfs;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -169,6 +170,7 @@ fn execute_line(line: &[u8]) {
         "write" => cmd_write(cmd_args, line_str),
         "rm" => cmd_rm(cmd_args),
         "mkdir" => cmd_mkdir(cmd_args),
+        "blkinfo" => cmd_blkinfo(),
         _ => {
             // Try to spawn via procman
             try_spawn_via_procman(cmd);
@@ -187,11 +189,12 @@ fn cmd_help() {
     puts("  info              System information\n");
     puts("  mem               Memory/filesystem statistics\n");
     puts("  pid               Show current process ID\n");
-    puts("  ls [path]         List directory contents\n");
+    puts("  ls [path]         List directory (ramfs or /disk/)\n");
     puts("  cat <path>        Display file contents\n");
-    puts("  write <path> <text>  Write text to a file\n");
+    puts("  write <path> <text>  Write text to a file (ramfs only)\n");
     puts("  rm <path>         Remove a file or empty directory\n");
     puts("  mkdir <path>      Create a directory\n");
+    puts("  blkinfo           Block device info\n");
 }
 
 fn cmd_echo(args: &[&str]) {
@@ -231,6 +234,31 @@ fn cmd_mem() {
 
 fn cmd_ls(args: &[&str]) {
     let path = if args.is_empty() { "/" } else { args[0] };
+
+    // Handle /disk/ paths via tar filesystem.
+    if is_disk_path(path) {
+        if let Some(archive) = get_disk_archive() {
+            let subpath = disk_subpath(path);
+            archive.list(subpath, |name, is_dir, size| {
+                if is_dir {
+                    let _ = write!(UartWriter, "  {}/\n", name);
+                } else {
+                    let _ = write!(UartWriter, "  {} ({} bytes)\n", name, size);
+                }
+            });
+        } else {
+            puts("ls: no disk mounted\n");
+        }
+        return;
+    }
+
+    // Show disk in root listing.
+    if path == "/" {
+        if get_disk_archive().is_some() {
+            puts("  disk/  (block device)\n");
+        }
+    }
+
     match ramfs::list(path, |name, is_dir, size| {
         if is_dir {
             let _ = write!(UartWriter, "  {}/\n", name);
@@ -256,7 +284,33 @@ fn cmd_cat(args: &[&str]) {
         puts("usage: cat <path>\n");
         return;
     }
-    match ramfs::read(args[0]) {
+    let path = args[0];
+
+    // Handle /disk/ paths via tar filesystem.
+    if is_disk_path(path) {
+        if let Some(archive) = get_disk_archive() {
+            let subpath = disk_subpath(path);
+            match archive.find(subpath) {
+                Some(data) => match core::str::from_utf8(data) {
+                    Ok(text) => {
+                        puts(text);
+                        if !text.ends_with('\n') { putc(b'\n'); }
+                    }
+                    Err(_) => {
+                        let _ = write!(UartWriter, "<binary: {} bytes>\n", data.len());
+                    }
+                },
+                None => {
+                    let _ = write!(UartWriter, "cat: {}: not found\n", path);
+                }
+            }
+        } else {
+            puts("cat: no disk mounted\n");
+        }
+        return;
+    }
+
+    match ramfs::read(path) {
         Ok(data) => match core::str::from_utf8(data) {
             Ok(text) => {
                 puts(text);
@@ -267,10 +321,10 @@ fn cmd_cat(args: &[&str]) {
             }
         },
         Err(ramfs::FsError::NotFound) => {
-            let _ = write!(UartWriter, "cat: {}: not found\n", args[0]);
+            let _ = write!(UartWriter, "cat: {}: not found\n", path);
         }
         Err(ramfs::FsError::IsDirectory) => {
-            let _ = write!(UartWriter, "cat: {}: is a directory\n", args[0]);
+            let _ = write!(UartWriter, "cat: {}: is a directory\n", path);
         }
         Err(e) => {
             let _ = write!(UartWriter, "cat: error: {:?}\n", e);
@@ -336,6 +390,43 @@ fn cmd_mkdir(args: &[&str]) {
             let _ = write!(UartWriter, "mkdir: error: {:?}\n", e);
         }
     }
+}
+
+fn cmd_blkinfo() {
+    unsafe {
+        if DISK_SIZE == 0 {
+            puts("No block device\n");
+        } else {
+            let _ = write!(UartWriter, "Block device: {} bytes\n", DISK_SIZE);
+            let _ = write!(UartWriter, "Mounted at: /disk/ (read-only, tar)\n");
+            if let Some(archive) = get_disk_archive() {
+                let _ = write!(UartWriter, "Files: {}\n", archive.count());
+            }
+        }
+    }
+}
+
+/// Get the disk tar archive, if available.
+fn get_disk_archive() -> Option<tarfs::TarArchive<'static>> {
+    unsafe {
+        if DISK_SIZE == 0 || DISK_BASE == 0 {
+            return None;
+        }
+        let data = core::slice::from_raw_parts(DISK_BASE as *const u8, DISK_SIZE);
+        Some(tarfs::TarArchive::new(data))
+    }
+}
+
+/// Check if a path refers to the disk filesystem (/disk/...).
+fn is_disk_path(path: &str) -> bool {
+    path.starts_with("/disk/") || path == "/disk"
+}
+
+/// Strip the /disk/ prefix from a path.
+fn disk_subpath(path: &str) -> &str {
+    path.strip_prefix("/disk/").unwrap_or(
+        path.strip_prefix("/disk").unwrap_or(path)
+    )
 }
 
 // ============================================================================
@@ -409,14 +500,33 @@ fn try_spawn_via_procman(cmd: &str) {
 // Entry point
 // ============================================================================
 
-/// Entry point. The kernel passes the UART MMIO VA in x0.
+/// Disk data base VA and size (set by kernel via x1, x2).
+static mut DISK_BASE: usize = 0;
+static mut DISK_SIZE: usize = 0;
+
+/// Entry point. The kernel passes boot parameters in x0-x2.
+///   x0 = UART MMIO VA
+///   x1 = disk data VA (0 if no disk)
+///   x2 = disk data size in bytes (0 if no disk)
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // x0 = UART MMIO base VA (set by kernel before ERET)
+    // Read boot parameters from registers.
     let uart_base: usize;
+    let disk_base: usize;
+    let disk_size: usize;
     unsafe {
-        core::arch::asm!("mov {}, x0", out(reg) uart_base, options(nomem, nostack));
+        core::arch::asm!(
+            "mov {0}, x0",
+            "mov {1}, x1",
+            "mov {2}, x2",
+            out(reg) uart_base,
+            out(reg) disk_base,
+            out(reg) disk_size,
+            options(nomem, nostack),
+        );
         UART_BASE = uart_base;
+        DISK_BASE = disk_base;
+        DISK_SIZE = disk_size;
     }
 
     // Initialize ramfs
@@ -435,6 +545,11 @@ pub extern "C" fn _start() -> ! {
     puts("\n");
     puts("BeetOS v0.1.0 — Type 'help' for commands.\n");
     puts("Shell running as userspace process (EL0)\n");
+    unsafe {
+        if DISK_SIZE > 0 {
+            let _ = write!(UartWriter, "Disk: {} bytes mounted at /disk/\n", DISK_SIZE);
+        }
+    }
     puts("\n");
     prompt();
 

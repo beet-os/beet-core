@@ -14,9 +14,11 @@
 //!   0x0A00_0000  RTC (PL031)
 //!   0x4000_0000  RAM base
 
+pub mod blk;
 pub mod gic;
 pub mod timer;
 pub mod uart;
+pub mod virtio;
 
 /// Default MMIO physical addresses for QEMU virt (from hw/arm/virt.c).
 /// Converted to kernel VA (TTBR1 linear map) at init time via `phys_to_virt`.
@@ -41,6 +43,8 @@ pub fn init() {
 
     timer::init();
     uart::puts("Timer: initialized\n");
+
+    blk::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
 }
 
 /// Halt the system.

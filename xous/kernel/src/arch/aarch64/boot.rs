@@ -343,6 +343,10 @@ const UART_PHYS: usize = 0x0900_0000;
 /// Must be in L1[1]+ (same as user code) to avoid conflict with kernel L1[0].
 pub const SHELL_UART_VA: usize = 0x0000_0010_0100_0000; // L1[1], well after code
 
+/// Virtual address where disk data is mapped read-only in user processes.
+/// Placed well after UART VA to avoid collisions.
+pub const DISK_DATA_VA: usize = 0x0000_0010_0200_0000;
+
 /// Create a user process from an ELF binary using the kernel's standard
 /// load_elf → allocate stack → setup_process pipeline.
 ///
@@ -441,14 +445,107 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         });
     }
 
-    // Pass the UART VA to procman and shell via x0 register.
+    // Read disk data from virtio-blk (if available) and map into shell.
+    #[cfg(feature = "platform-qemu-virt")]
+    let (disk_va, disk_size) = {
+        use crate::platform::qemu_virt::blk;
+        if blk::is_available() {
+            let capacity = blk::capacity();
+            let disk_bytes = (capacity as usize) * blk::SECTOR_SIZE;
+            let disk_pages = (disk_bytes + beetos::PAGE_SIZE - 1) / beetos::PAGE_SIZE;
+
+            if disk_pages > 0 && disk_pages <= 256 {
+                // Allocate pages for disk data (owned by kernel PID 1).
+                let kernel_pid = xous::PID::new(1).unwrap();
+                let mut disk_phys_pages = [0usize; 256];
+                let mut ok = true;
+
+                crate::mem::MemoryManager::with_mut(|mm| {
+                    for i in 0..disk_pages {
+                        match mm.alloc_range(1, kernel_pid) {
+                            Ok((pa, _)) => {
+                                // Zero the page
+                                let kva = beetos::phys_to_virt(pa);
+                                core::ptr::write_bytes(kva as *mut u8, 0, beetos::PAGE_SIZE);
+                                disk_phys_pages[i] = pa;
+                            }
+                            Err(_) => {
+                                ok = false;
+                            }
+                        }
+                    }
+                });
+
+                if ok {
+                    // Read disk data into allocated pages, page by page.
+                    let sectors_per_page = beetos::PAGE_SIZE / blk::SECTOR_SIZE;
+                    let mut read_ok = true;
+
+                    for i in 0..disk_pages {
+                        let pa = disk_phys_pages[i];
+                        let kva = beetos::phys_to_virt(pa);
+                        let lba = (i * sectors_per_page) as u64;
+                        let remaining = disk_bytes - i * beetos::PAGE_SIZE;
+                        let read_len = core::cmp::min(remaining, beetos::PAGE_SIZE);
+                        // Round up to sector boundary for the read.
+                        let read_sectors = (read_len + blk::SECTOR_SIZE - 1) / blk::SECTOR_SIZE;
+                        let buf = core::slice::from_raw_parts_mut(
+                            kva as *mut u8,
+                            read_sectors * blk::SECTOR_SIZE,
+                        );
+                        if blk::read_sectors(lba, buf).is_err() {
+                            read_ok = false;
+                            break;
+                        }
+                    }
+
+                    if read_ok {
+                        // Map disk pages read-only into shell's address space.
+                        crate::services::SystemServices::with_mut(|ss| {
+                            crate::mem::MemoryManager::with_mut(|mm| {
+                                let process = ss.process_mut(shell_pid).expect("shell process");
+                                for i in 0..disk_pages {
+                                    let va = DISK_DATA_VA + i * beetos::PAGE_SIZE;
+                                    process.mapping.map_page(
+                                        mm,
+                                        disk_phys_pages[i],
+                                        va as *mut usize,
+                                        xous::MemoryFlags::empty(), // read-only (no W, no X)
+                                        true,
+                                    ).ok();
+                                }
+                            });
+                        });
+
+                        crate::platform::qemu_virt::uart::puts("Disk: mapped into shell\n");
+                        (DISK_DATA_VA, disk_bytes)
+                    } else {
+                        crate::platform::qemu_virt::uart::puts("Disk: read failed\n");
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        }
+    };
+
+    #[cfg(not(feature = "platform-qemu-virt"))]
+    let (disk_va, disk_size) = (0usize, 0usize);
+
+    // Pass boot parameters via registers:
+    //   x0 = UART VA, x1 = disk data VA, x2 = disk size in bytes
     {
         let idx = procman_pid.get() as usize - 1;
-        super::process::set_thread_arg0(idx, SHELL_UART_VA);
+        super::process::set_thread_args(idx, SHELL_UART_VA, 0, 0);
     }
     {
         let idx = shell_pid.get() as usize - 1;
-        super::process::set_thread_arg0(idx, SHELL_UART_VA);
+        super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
     }
 
     #[cfg(feature = "platform-qemu-virt")]

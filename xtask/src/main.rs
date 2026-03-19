@@ -212,6 +212,30 @@ fn rpi5() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a test disk image (tar archive) for virtio-blk testing.
+fn create_test_disk(root: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let disk_dir = root.join("target/disk");
+    let disk_img = root.join("target/disk.img");
+
+    // Create test files
+    std::fs::create_dir_all(&disk_dir)?;
+    std::fs::write(disk_dir.join("hello.txt"), "Hello from virtio-blk!\n")?;
+    std::fs::write(disk_dir.join("readme.txt"), "BeetOS test disk image.\nThis file is stored on a virtual block device.\n")?;
+    std::fs::write(disk_dir.join("numbers.txt"), "1\n2\n3\n4\n5\n")?;
+
+    // Create tar archive
+    let status = Command::new("tar")
+        .args(["cf", disk_img.to_str().expect("non-UTF8 path"),
+               "-C", disk_dir.to_str().expect("non-UTF8 path"),
+               "hello.txt", "readme.txt", "numbers.txt"])
+        .status()?;
+    anyhow::ensure!(status.success(), "tar creation failed");
+
+    let size = std::fs::metadata(&disk_img)?.len();
+    println!("Disk image: {} ({} bytes)", disk_img.display(), size);
+    Ok(disk_img)
+}
+
 fn qemu(args: &[String]) -> anyhow::Result<()> {
     // Build for qemu-virt first
     build(&{
@@ -229,19 +253,34 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
         kernel.display()
     );
 
+    // Create test disk image
+    let disk_img = create_test_disk(&root)?;
+
     println!();
     println!("Launching QEMU...");
     println!("  Press Ctrl-A X to exit QEMU");
     println!();
 
+    let mut qemu_args = vec![
+        "-machine".to_string(), "virt,gic-version=3".to_string(),
+        "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-m".to_string(), "512M".to_string(),
+        "-nographic".to_string(),
+        "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
+    ];
+
+    // Add virtio-blk disk if image exists
+    if disk_img.exists() {
+        qemu_args.extend_from_slice(&[
+            "-drive".to_string(),
+            format!("file={},format=raw,if=none,id=disk0", disk_img.display()),
+            "-device".to_string(),
+            "virtio-blk-device,drive=disk0".to_string(),
+        ]);
+    }
+
     let status = Command::new("qemu-system-aarch64")
-        .args([
-            "-machine", "virt,gic-version=3",
-            "-cpu", "neoverse-n1",  // Supports 16KB granule (required by BeetOS)
-            "-m", "512M",
-            "-nographic",
-            "-kernel", kernel.to_str().expect("non-UTF8 path"),
-        ])
+        .args(&qemu_args)
         .status()?;
 
     if !status.success() {

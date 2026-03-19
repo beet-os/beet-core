@@ -173,6 +173,20 @@ pub unsafe fn set_thread_arg0(proc_idx: usize, value: usize) {
     }
 }
 
+/// Set x0, x1, x2 (first three arguments) for the initial thread of a process.
+/// Used to pass boot parameters before first ERET.
+///
+/// # Safety
+///
+/// `proc_idx` must be a valid process index (PID - 1).
+pub unsafe fn set_thread_args(proc_idx: usize, x0: usize, x1: usize, x2: usize) {
+    if let Some(proc) = PROCESS_TABLE[proc_idx].as_mut() {
+        proc.threads[INITIAL_TID - 1].gpr[0] = x0 as u64;
+        proc.threads[INITIAL_TID - 1].gpr[1] = x1 as u64;
+        proc.threads[INITIAL_TID - 1].gpr[2] = x2 as u64;
+    }
+}
+
 /// Get the current process ID.
 pub fn current_pid() -> PID {
     unsafe { PID::new_unchecked(CURRENT_PID) }
