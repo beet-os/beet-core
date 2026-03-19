@@ -155,9 +155,9 @@ fn handle_irq() -> bool {
                 timer::handle_tick();
             }
             uart::UART_IRQ => {
-                // Read all pending characters and feed to shell
+                // Read all pending characters and send to the shell process via IPC
                 while let Some(c) = uart::try_getc() {
-                    crate::shell::process_char(c);
+                    send_char_to_console(c);
                 }
                 uart::clear_rx_interrupt();
             }
@@ -173,6 +173,61 @@ fn handle_irq() -> bool {
 
     #[cfg(feature = "platform-apple-t8103")]
     { /* TODO(M3): AIC dispatch */ false }
+}
+
+/// Send a received UART character to the console/shell server via IPC.
+///
+/// Called from IRQ context. Finds the console server by its well-known SID,
+/// and delivers a Scalar message containing the character. If the server
+/// thread is blocked in ReceiveMessage, it is woken up.
+#[cfg(feature = "platform-qemu-virt")]
+fn send_char_to_console(c: u8) {
+    use crate::services::SystemServices;
+    use xous::{Message, ScalarMessage, SID};
+
+    let console_sid = SID::from_array(beetos_api_console::CONSOLE_SID);
+
+    SystemServices::with_mut(|ss| {
+        // Find the console server. It may not exist yet during early boot.
+        let sidx = match ss.servers.iter().position(|s| {
+            s.as_ref().is_some_and(|s| s.sid == console_sid)
+        }) {
+            Some(idx) => idx,
+            None => return, // Console server not registered yet
+        };
+
+        let server = match ss.server_from_sidx_mut(sidx) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let server_pid = server.pid;
+
+        // Create a Scalar message with the char
+        let msg = Message::Scalar(ScalarMessage {
+            id: beetos_api_console::ConsoleOp::Char as usize,
+            arg1: c as usize,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+        });
+
+        // If the server has a thread parked in ReceiveMessage, deliver directly
+        if let Some(server_tid) = server.take_available_thread() {
+            let sender = xous::MessageSender::from_usize(0); // kernel sender
+            let envelope = xous::MessageEnvelope { sender, body: msg };
+
+            ss.process_mut(server_pid)
+                .map(|p| p.set_thread_state(server_tid, crate::process::ThreadState::Ready))
+                .ok();
+            ss.set_thread_result(server_pid, server_tid, xous::Result::MessageEnvelope(envelope))
+                .ok();
+        } else {
+            // Queue the message for later pickup
+            let kernel_pid = xous::PID::new(1).unwrap();
+            ss.queue_server_message(sidx, kernel_pid, 1, msg, None).ok();
+        }
+    });
 }
 
 /// Handle an SVC (syscall) from userspace.

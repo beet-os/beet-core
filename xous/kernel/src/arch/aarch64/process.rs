@@ -161,6 +161,18 @@ static mut PROCESS_TABLE: [Option<ProcessImpl>; MAX_PROCESS_COUNT] =
 /// The currently active PID.
 static mut CURRENT_PID: u8 = 1;
 
+/// Set x0 (first argument) for the initial thread of a process.
+/// Used to pass boot parameters (e.g., UART VA) before first ERET.
+///
+/// # Safety
+///
+/// `proc_idx` must be a valid process index (PID - 1).
+pub unsafe fn set_thread_arg0(proc_idx: usize, value: usize) {
+    if let Some(proc) = PROCESS_TABLE[proc_idx].as_mut() {
+        proc.threads[INITIAL_TID - 1].gpr[0] = value as u64;
+    }
+}
+
 /// Get the current process ID.
 pub fn current_pid() -> PID {
     unsafe { PID::new_unchecked(CURRENT_PID) }

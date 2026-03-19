@@ -20,14 +20,20 @@
 
 #![no_std]
 
+/// Well-known Server ID for the console/shell service.
+/// The kernel's UART IRQ handler sends received characters to this SID.
+pub const CONSOLE_SID: [u32; 4] = [0x434F_4E53, 0x4F4C_4500, 0, 0]; // "CONSOLE\0"
+
 /// Opcodes for console service IPC messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum ConsoleOp {
+    /// A character received from UART (Scalar: arg1 = char as usize).
+    Char = 0,
     /// Write a string to the console (uses Borrow with UTF-8 data).
-    Write = 0,
+    Write = 1,
     /// Write a single character.
-    Putc = 1,
+    Putc = 2,
     /// Clear the console screen.
-    Clear = 2,
+    Clear = 3,
 }

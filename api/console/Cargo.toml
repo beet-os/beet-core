@@ -7,4 +7,4 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 xous = { path = "../../xous/xous-rs" }
-xous-ipc = { path = "../../xous/ipc" }
+# xous-ipc requires std (thread_local), only add when needed

@@ -69,16 +69,20 @@ fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
     let user_linker = root.join("apps/link-user.x");
     let linker_arg = format!("-Clink-arg=-T{}", user_linker.display());
 
-    let target_dir = root.join("target/aarch64-unknown-none/debug");
+    let ws_target = root.join("target");
+    let target_dir = ws_target.join("aarch64-unknown-none/debug");
 
-    // Build all app crates
-    for app in &["hello"] {
+    // Build all app crates (excluded from workspace, so use --manifest-path)
+    for app in &["hello", "shell"] {
         println!("Building app: {app}");
+        let manifest = root.join(format!("apps/{app}/Cargo.toml"));
         let status = Command::new("cargo")
             .args([
                 "build",
-                "--package",
-                app,
+                "--manifest-path",
+                manifest.to_str().expect("non-UTF8 path"),
+                "--target-dir",
+                ws_target.to_str().expect("non-UTF8 path"),
                 "--target",
                 "aarch64-unknown-none",
             ])

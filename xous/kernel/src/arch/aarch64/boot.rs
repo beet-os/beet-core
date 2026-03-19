@@ -437,12 +437,23 @@ pub unsafe fn init_memory_manager(info: &BootInfo) {
 // ELF-based process launch
 // ============================================================================
 
-/// Embedded userspace ELF binary (built by `cargo xtask build`).
-/// The hello program creates a server and yields in a loop, proving the full
-/// pipeline: Rust source → ELF → load_elf → MMU-isolated process → syscalls.
+/// Embedded userspace ELF binaries (built by `cargo xtask build`).
+#[allow(dead_code)]
 static HELLO_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/hello.stripped")
 );
+static SHELL_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/shell.stripped")
+);
+
+/// UART MMIO physical address on QEMU virt.
+/// The shell process gets this mapped into its address space for direct output.
+#[cfg(feature = "platform-qemu-virt")]
+const UART_PHYS: usize = 0x0900_0000;
+
+/// Virtual address where UART is mapped in the shell process.
+/// Must be in L1[1]+ (same as user code) to avoid conflict with kernel L1[0].
+const SHELL_UART_VA: usize = 0x0000_0010_0100_0000; // L1[1], well after code
 
 /// Create a user process from an ELF binary using the kernel's standard
 /// load_elf → allocate stack → setup_process pipeline.
@@ -481,8 +492,8 @@ unsafe fn create_elf_process(
 
 /// Launch user processes in EL0.
 ///
-/// Creates a process from the embedded hello ELF binary, registers it in
-/// SystemServices with the Scheduler, then ERets into it.
+/// Creates the shell process from the embedded ELF binary, maps UART MMIO
+/// into its address space for direct output, and ERets into it.
 ///
 /// # Safety
 ///
@@ -496,28 +507,58 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         use core::fmt::Write;
         let _ = write!(
             crate::platform::qemu_virt::uart::UartWriter,
-            "EL0: loading hello ELF ({} bytes)...\n",
-            HELLO_ELF.len(),
+            "EL0: loading shell ELF ({} bytes)...\n",
+            SHELL_ELF.len(),
         );
     }
 
-    let pid2 = PID::new(2).unwrap();
-    create_elf_process(pid2, HELLO_ELF, b"hello");
+    // Create the idle process first (PID 2) — just WFE loops, absorbs CPU
+    // when no other process is ready.
+    let idle_pid = PID::new(2).unwrap();
+    create_elf_process(idle_pid, HELLO_ELF, b"idle");
+
+    // Create the shell process (PID 3)
+    let shell_pid = PID::new(3).unwrap();
+    create_elf_process(shell_pid, SHELL_ELF, b"shell");
+
+    // Map UART MMIO into the shell's address space for direct output.
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        crate::services::SystemServices::with_mut(|ss| {
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let process = ss.process_mut(shell_pid).expect("shell process");
+                process.mapping.map_page(
+                    mm,
+                    UART_PHYS,
+                    SHELL_UART_VA as *mut usize,
+                    xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                    true,
+                ).expect("map UART into shell");
+            });
+        });
+    }
+
+    // Pass the UART VA to the shell via x0 register.
+    {
+        let idx = shell_pid.get() as usize - 1;
+        super::process::set_thread_arg0(idx, SHELL_UART_VA);
+    }
 
     #[cfg(feature = "platform-qemu-virt")]
-    crate::platform::qemu_virt::uart::puts("EL0: process created, launching...\n");
+    crate::platform::qemu_virt::uart::puts("EL0: launching shell...\n");
 
     // Build a context frame for the initial ERET.
-    // Load PID 2's register state from PROCESS_TABLE.
+    // Start with the shell process (PID 3). The idle process (PID 2)
+    // is in the scheduler queue and will run when the shell blocks.
     let kstack_phys = crate::mem::MemoryManager::with_mut(|mm| {
         mm.alloc_range(1, PID::new(1).unwrap()).expect("alloc kstack").0
     });
     core::ptr::write_bytes(kstack_phys as *mut u8, 0, PAGE_SIZE);
 
-    // Set PID 2 as current and activate its address space
-    super::process::set_current_pid(pid2);
+    // Set shell as current and activate its address space
+    super::process::set_current_pid(shell_pid);
     crate::services::SystemServices::with_mut(|ss| {
-        ss.process(pid2).expect("pid2 not registered").activate();
+        ss.process(shell_pid).expect("shell not registered").activate();
     });
 
     // Load the process's saved context (PC, SP, SPSR set by setup_process)
@@ -526,6 +567,6 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let tid = proc.current_tid();
     proc.load_context_from_table(tid, frame);
 
-    // ERET to EL0 — hello process runs
+    // ERET to EL0 — shell process runs
     super::asm::_resume_context(kstack_phys as *const u8)
 }

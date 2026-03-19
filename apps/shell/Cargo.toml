@@ -1,0 +1,16 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+
+[dependencies]
+xous = { path = "../../xous/xous-rs" }
+beetos-api-console = { path = "../../api/console" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }

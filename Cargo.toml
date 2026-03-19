@@ -21,6 +21,7 @@ members = [
 exclude = [
     "loader",
     "apps/hello",
+    "apps/shell",
 ]
 
 [workspace.dependencies]

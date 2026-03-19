@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: 2024 BeetOS contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! BeetOS interactive shell (bsh).
+//! BeetOS interactive shell (bsh) — kernel-side module.
 //!
-//! Currently runs in kernel context (no separate process) using UART
-//! for I/O. Will be extracted into a proper Xous userspace service
-//! when the full kernel init path is operational.
-//!
-//! Supports basic builtins: help, echo, info, mem, reboot, ls, cat,
-//! write, rm, mkdir, uptime.
+//! The shell now runs as a userspace process (`apps/shell/`). This module
+//! is kept for hosted-mode unit tests only. All runtime shell functionality
+//! has moved to the userspace binary.
+#![allow(dead_code)]
 
 pub mod ramfs;
 

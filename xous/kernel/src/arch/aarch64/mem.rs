@@ -114,8 +114,12 @@ const fn l3_index(va: usize) -> usize {
 fn flags_to_pte(flags: MemoryFlags, user: bool) -> u64 {
     let mut pte: u64 = PTE_VALID | PTE_TABLE | PTE_AF | PTE_SH_ISH;
 
-    // Normal memory by default (not device)
-    pte |= PTE_ATTR_NORMAL;
+    // Device memory: uncacheable, strongly-ordered MMIO accesses
+    if flags.is_set(MemoryFlags::DEV) {
+        pte |= PTE_ATTR_DEVICE;
+    } else {
+        pte |= PTE_ATTR_NORMAL;
+    }
 
     if user {
         pte |= PTE_NG; // Per-ASID for user pages
