@@ -223,8 +223,9 @@ fn create_test_disk(root: &std::path::Path) -> anyhow::Result<PathBuf> {
     std::fs::write(disk_dir.join("readme.txt"), "BeetOS test disk image.\nThis file is stored on a virtual block device.\n")?;
     std::fs::write(disk_dir.join("numbers.txt"), "1\n2\n3\n4\n5\n")?;
 
-    // Create tar archive
+    // Create tar archive (COPYFILE_DISABLE prevents macOS ._ resource fork files)
     let status = Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
         .args(["cf", disk_img.to_str().expect("non-UTF8 path"),
                "-C", disk_dir.to_str().expect("non-UTF8 path"),
                "hello.txt", "readme.txt", "numbers.txt"])

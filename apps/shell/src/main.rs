@@ -338,6 +338,10 @@ fn cmd_write(args: &[&str], full_line: &str) {
         return;
     }
     let path = args[0];
+    if is_disk_path(path) {
+        puts("write: /disk/ is read-only\n");
+        return;
+    }
     let content = if let Some(pos) = full_line.find(path) {
         let after_path = pos + path.len();
         full_line[after_path..].trim_start()
@@ -360,6 +364,10 @@ fn cmd_write(args: &[&str], full_line: &str) {
 fn cmd_rm(args: &[&str]) {
     if args.is_empty() {
         puts("usage: rm <path>\n");
+        return;
+    }
+    if is_disk_path(args[0]) {
+        puts("rm: /disk/ is read-only\n");
         return;
     }
     match ramfs::remove(args[0]) {
