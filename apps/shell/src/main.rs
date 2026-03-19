@@ -50,6 +50,24 @@ fn puts(s: &str) {
     }
 }
 
+fn put_usize(mut n: usize) {
+    if n == 0 {
+        putc(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        putc(buf[i]);
+    }
+}
+
 /// Writer for `core::fmt::Write`.
 struct UartWriter;
 
@@ -374,25 +392,26 @@ fn try_spawn_via_procman(cmd: &str) {
     ));
 
     match result {
-        Ok(xous::Result::Scalar1(exit_code)) => {
+        Ok(xous::Result::Scalar1(exit_code)) | Ok(xous::Result::Scalar2(exit_code, _)) => {
             if exit_code == usize::MAX {
-                let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
+                puts("bsh: ");
+                puts(cmd);
+                puts(": not found\n");
             } else {
-                let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
-            }
-        }
-        Ok(xous::Result::Scalar2(exit_code, _)) => {
-            if exit_code == usize::MAX {
-                let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
-            } else {
-                let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
+                puts("[exited: ");
+                put_usize(exit_code);
+                puts("]\n");
             }
         }
         Err(_) => {
-            let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd);
+            puts("bsh: ");
+            puts(cmd);
+            puts(": spawn failed\n");
         }
         _ => {
-            let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd);
+            puts("bsh: ");
+            puts(cmd);
+            puts(": unexpected result\n");
         }
     }
 }
