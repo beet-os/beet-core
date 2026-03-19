@@ -93,6 +93,14 @@ fn process_char(c: u8) {
                 }
             }
             b'\r' | b'\n' => {
+                // Coalesce CR+LF: if we just processed a CR, ignore the following LF.
+                static mut LAST_WAS_CR: bool = false;
+                if c == b'\n' && LAST_WAS_CR {
+                    LAST_WAS_CR = false;
+                    return;
+                }
+                LAST_WAS_CR = c == b'\r';
+
                 putc(b'\n');
                 let line_len = SHELL.pos;
                 SHELL.pos = 0;

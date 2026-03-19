@@ -293,22 +293,6 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
         }
     };
 
-    // Log the first N syscalls for debugging, then go quiet.
-    #[cfg(feature = "platform-qemu-virt")]
-    {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static SVC_COUNT: AtomicU32 = AtomicU32::new(0);
-        let n = SVC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 30 {
-            use core::fmt::Write;
-            let _ = write!(
-                crate::platform::qemu_virt::uart::UartWriter,
-                "SVC[{}]: PID {} TID {} {:?}\n",
-                n, caller_pid, caller_tid, call,
-            );
-        }
-    }
-
     // Step 2: Dispatch the syscall through the Xous kernel.
     // This may change CURRENT_PID and TTBR0 via activate_current().
     let response = crate::syscall::handle(caller_tid, call)
@@ -328,30 +312,6 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
     let resume_tid = resume_proc.current_tid();
     resume_proc.load_context_from_table(resume_tid, frame);
 
-    #[cfg(feature = "platform-qemu-virt")]
-    {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static SVC_RESULT_COUNT: AtomicU32 = AtomicU32::new(0);
-        let n = SVC_RESULT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 30 {
-            use core::fmt::Write;
-            let resume_pid = crate::arch::process::current_pid();
-            if resume_pid != caller_pid {
-                let _ = write!(
-                    crate::platform::qemu_virt::uart::UartWriter,
-                    "  => {} (switched PID {} -> {})\n",
-                    if is_resume { "ResumeProcess" } else { "result" },
-                    caller_pid, resume_pid,
-                );
-            } else {
-                let _ = write!(
-                    crate::platform::qemu_virt::uart::UartWriter,
-                    "  => {}\n",
-                    if is_resume { "ResumeProcess" } else { "ok" },
-                );
-            }
-        }
-    }
 }
 
 /// Handle a data or instruction abort.

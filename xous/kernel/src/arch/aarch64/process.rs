@@ -380,14 +380,6 @@ impl Process {
                 for i in 0..stack_pages {
                     let va = stack_base + i * beetos::PAGE_SIZE;
                     let (phys, _) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
-                    #[cfg(feature = "platform-qemu-virt")]
-                    if pid.get() >= 5 {
-                        use core::fmt::Write;
-                        let _ = write!(
-                            crate::platform::qemu_virt::uart::UartWriter,
-                            "ZERO_PAGE: PA={:#x} PID {} (stack {})\n", phys, pid, i,
-                        );
-                    }
                     core::ptr::write_bytes(beetos::phys_to_virt(phys) as *mut u8, 0, beetos::PAGE_SIZE);
                     process.mapping.map_page(
                         mm, phys, va as *mut usize,
