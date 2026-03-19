@@ -1163,21 +1163,7 @@ impl SystemServices {
         };
 
         let startup = self.create_process(init)?;
-        let _ = startup; // We don't need the startup info
-
-        // Find the newly created process (it's the last one)
-        let pid = self.processes.iter().enumerate().rev()
-            .find_map(|(idx, p)| {
-                if let Some(proc) = p {
-                    #[cfg(beetos)]
-                    if proc.name().map(|n| n == name).unwrap_or(false) {
-                        return Some(proc.pid);
-                    }
-                    let _ = idx;
-                }
-                None
-            })
-            .ok_or(Error::InternalError)?;
+        let pid = startup.pid();
 
         // Grant all syscall permissions
         self.process_mut(pid)?.set_syscall_permissions(u64::MAX);

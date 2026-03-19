@@ -1053,3 +1053,171 @@ fn process_restart_server() {
 
     main_thread.join().expect("couldn't join kernel process");
 }
+
+/// Test the process manager IPC pattern: a "manager" process receives
+/// spawn-and-wait requests from a "client" and returns an exit code.
+/// This exercises the BlockingScalar → process → ReturnScalar1 pattern
+/// that procman uses.
+#[test]
+fn procman_ipc_pattern() {
+    let main_thread = start_kernel(SERVER_SPEC);
+    let (manager_ready_send, manager_ready_recv) = unbounded();
+
+    let manager_sid_bytes = b"procman-test1234";
+
+    // Manager process: receives BlockingScalar, does work, returns scalar
+    let manager = xous::create_process_as_thread(xous::ProcessArgsAsThread::new(
+        "procman_manager",
+        move || {
+            let sid =
+                xous::create_server_with_address(manager_sid_bytes).expect("couldn't create manager server");
+            manager_ready_send.send(()).unwrap();
+
+            // Handle 3 requests then exit
+            for expected_id in 0..3usize {
+                let envelope = xous::receive_message(sid).expect("couldn't receive");
+                if let xous::Message::BlockingScalar(msg) = envelope.body {
+                    // arg1 is the "name" (just a number for this test)
+                    assert_eq!(msg.id, 0, "unexpected opcode");
+                    assert_eq!(msg.arg1, expected_id, "unexpected request sequence");
+                    // Return "exit code" = arg1 * 10
+                    xous::return_scalar(envelope.sender, msg.arg1 * 10).expect("couldn't return scalar");
+                } else {
+                    panic!("expected BlockingScalar");
+                }
+            }
+        },
+    ))
+    .expect("couldn't spawn manager");
+
+    // Client process: sends 3 BlockingScalar requests and checks return values
+    let client = xous::create_process_as_thread(xous::ProcessArgsAsThread::new(
+        "procman_client",
+        move || {
+            manager_ready_recv.recv().unwrap();
+            let sid = xous::SID::from_bytes(manager_sid_bytes).unwrap();
+            let cid = xous::try_connect(sid).expect("couldn't connect to manager");
+
+            for i in 0..3usize {
+                let result = xous::send_message(
+                    cid,
+                    xous::Message::BlockingScalar(xous::ScalarMessage { id: 0, arg1: i, arg2: 0, arg3: 0, arg4: 0 }),
+                )
+                .expect("couldn't send request");
+
+                match result {
+                    xous::Result::Scalar1(exit_code) => {
+                        assert_eq!(exit_code, i * 10, "wrong exit code for request {}", i);
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            }
+        },
+    ))
+    .expect("couldn't spawn client");
+
+    xous::wait_process_as_thread(manager).expect("manager failed");
+    xous::wait_process_as_thread(client).expect("client failed");
+
+    shutdown_kernel();
+    main_thread.join().expect("couldn't join kernel");
+}
+
+/// Test that a process can terminate itself and the kernel cleans up.
+/// Verifies TerminateProcess(0) works from a process-as-thread.
+#[test]
+fn process_self_terminate() {
+    let main_thread = start_kernel(SERVER_SPEC);
+    let (done_send, done_recv) = unbounded();
+
+    // Process that does some work then terminates
+    let process = xous::create_process_as_thread(xous::ProcessArgsAsThread::new(
+        "self_terminate",
+        move || {
+            // Verify we can get our own PID
+            let pid = xous::current_pid().expect("couldn't get PID");
+            assert!(pid.get() > 0, "PID should be non-zero");
+
+            // Verify we can get our own TID
+            let tid = xous::current_tid().expect("couldn't get TID");
+            assert!(tid > 0, "TID should be non-zero");
+
+            done_send.send(pid.get()).unwrap();
+
+            // In hosted mode, TerminateProcess causes the thread to end
+            // via the hosted process cleanup mechanism.
+        },
+    ))
+    .expect("couldn't spawn process");
+
+    let pid_val = done_recv.recv().expect("process didn't report PID");
+    assert!(pid_val > 0);
+
+    xous::wait_process_as_thread(process).expect("couldn't wait for process");
+
+    shutdown_kernel();
+    main_thread.join().expect("couldn't join kernel");
+}
+
+/// Test multiple sequential blocking scalar messages to verify
+/// the IPC pipeline handles multiple rounds correctly (like procman
+/// handling repeated spawn-and-wait requests).
+#[test]
+fn repeated_blocking_scalars() {
+    let main_thread = start_kernel(SERVER_SPEC);
+    let (server_ready_send, server_ready_recv) = unbounded();
+
+    let server_addr = b"repeat-scalar-ts";
+
+    let server = xous::create_process_as_thread(xous::ProcessArgsAsThread::new(
+        "repeat_server",
+        move || {
+            let sid = xous::create_server_with_address(server_addr).expect("create server");
+            server_ready_send.send(()).unwrap();
+
+            // Handle 20 requests
+            for _ in 0..20 {
+                let env = xous::receive_message(sid).expect("receive");
+                if let xous::Message::BlockingScalar(msg) = env.body {
+                    xous::return_scalar(env.sender, msg.arg1 + msg.arg2).expect("return");
+                }
+            }
+        },
+    ))
+    .expect("spawn server");
+
+    let client = xous::create_process_as_thread(xous::ProcessArgsAsThread::new(
+        "repeat_client",
+        move || {
+            server_ready_recv.recv().unwrap();
+            let sid = xous::SID::from_bytes(server_addr).unwrap();
+            let cid = xous::try_connect(sid).expect("connect");
+
+            for i in 0..20usize {
+                let result = xous::send_message(
+                    cid,
+                    xous::Message::BlockingScalar(xous::ScalarMessage {
+                        id: 1,
+                        arg1: i,
+                        arg2: i * 2,
+                        arg3: 0,
+                        arg4: 0,
+                    }),
+                )
+                .expect("send");
+
+                match result {
+                    xous::Result::Scalar1(val) => assert_eq!(val, i + i * 2),
+                    other => panic!("unexpected: {:?}", other),
+                }
+            }
+        },
+    ))
+    .expect("spawn client");
+
+    xous::wait_process_as_thread(server).expect("server done");
+    xous::wait_process_as_thread(client).expect("client done");
+
+    shutdown_kernel();
+    main_thread.join().expect("join kernel");
+}

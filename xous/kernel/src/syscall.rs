@@ -767,14 +767,18 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         }
         #[cfg(beetos)]
         SysCall::WaitProcess(target_pid) => SystemServices::with_mut(|ss| {
-            // Check if the target process exists
-            if ss.process(target_pid).is_err() {
-                // Process already exited — return immediately with exit code 0
-                return Ok(Result::Scalar1(0));
-            }
-            // Block the calling thread until the target process terminates
+            // Park the thread FIRST, then check if process still exists.
+            // This avoids a race where the process exits between our check
+            // and the park — which would leave us blocked forever.
             ss.set_thread_result(current_pid(), tid, Result::Ok)?;
             ss.current_process_mut().set_thread_state(tid, ThreadState::WaitProcess { pid: target_pid });
+
+            // Now check: if the process already exited, wake immediately.
+            if ss.process(target_pid).is_err() {
+                ss.current_process_mut().set_thread_state(tid, ThreadState::Ready);
+                ss.set_thread_result(current_pid(), tid, Result::Scalar1(0))?;
+            }
+
             Scheduler::with_mut(|s| s.activate_current(ss))
         }),
 

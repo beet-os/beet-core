@@ -384,3 +384,54 @@ impl core::fmt::Debug for Process {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_state_wait_process_equality() {
+        let pid3 = PID::new(3).unwrap();
+        let pid4 = PID::new(4).unwrap();
+        let state_a = ThreadState::WaitProcess { pid: pid3 };
+        let state_b = ThreadState::WaitProcess { pid: pid3 };
+        let state_c = ThreadState::WaitProcess { pid: pid4 };
+
+        assert_eq!(state_a, state_b, "same PID should match");
+        assert_ne!(state_a, state_c, "different PID should not match");
+        assert_ne!(state_a, ThreadState::Ready);
+        assert_ne!(state_a, ThreadState::Free);
+    }
+
+    #[test]
+    fn thread_state_variants_are_distinct() {
+        let pid = PID::new(2).unwrap();
+        let states = [
+            ThreadState::Free,
+            ThreadState::Ready,
+            ThreadState::WaitJoin { tid: 1 },
+            ThreadState::WaitBlocking { sidx: 0 },
+            ThreadState::WaitReceive { sidx: 0 },
+            ThreadState::WaitFutex { addr: 0x1000 },
+            ThreadState::WaitProcess { pid },
+            ThreadState::RetryConnect { sid_hash: 42 },
+            ThreadState::RetryQueueFull { sidx: 0 },
+        ];
+        // Each variant should be unique
+        for (i, a) in states.iter().enumerate() {
+            for (j, b) in states.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "states[{}] and states[{}] should differ", i, j);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn thread_state_copy_semantics() {
+        let pid = PID::new(5).unwrap();
+        let state = ThreadState::WaitProcess { pid };
+        let copied = state; // Copy
+        assert_eq!(state, copied);
+    }
+}

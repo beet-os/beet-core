@@ -2110,7 +2110,7 @@ pub fn pack_name_to_usize(name: &str) -> [usize; 4] {
         if i >= 4 {
             break;
         }
-        let mut buf = [0u8; 8]; // max usize size
+        let mut buf = [0u8; core::mem::size_of::<usize>()];
         buf[..chunk.len()].copy_from_slice(chunk);
         result[i] = usize::from_le_bytes(buf);
     }

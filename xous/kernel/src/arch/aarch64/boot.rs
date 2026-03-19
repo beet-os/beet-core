@@ -445,6 +445,9 @@ static HELLO_ELF: &[u8] = include_bytes!(
 static SHELL_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/shell.stripped")
 );
+static PROCMAN_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/procman.stripped")
+);
 
 /// Embedded binary table: name → ELF bytes.
 /// The kernel holds these via include_bytes! — no filesystem needed.
@@ -455,11 +458,6 @@ static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("shell", SHELL_ELF),
     ("procman", PROCMAN_ELF),
 ];
-
-/// Embedded procman ELF binary.
-static PROCMAN_ELF: &[u8] = include_bytes!(
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/procman.stripped")
-);
 
 /// Look up a binary by name in the embedded binary table.
 pub fn lookup_binary(name: &str) -> Option<&'static [u8]> {
