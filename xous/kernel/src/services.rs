@@ -1165,6 +1165,24 @@ impl SystemServices {
         let startup = self.create_process(init)?;
         let pid = startup.pid();
 
+        // Debug: check if the shell's stack was corrupted during process creation
+        #[cfg(feature = "platform-qemu-virt")]
+        {
+            // The shell (PID 4) has a value at user VA SP+0x1b8 that gets zeroed.
+            // Check by translating the shell's stack VA to PA and reading through phys_to_virt.
+            if let Ok(shell_proc) = self.process(xous::PID::new(4).unwrap()) {
+                // Check the top stack page (VA near USER_STACK_BOTTOM)
+                let stack_va = beetos::USER_STACK_BOTTOM - beetos::PAGE_SIZE; // top page
+                if let Ok(pa) = shell_proc.mapping.virt_to_phys(stack_va as *mut usize) {
+                    let kern_va = beetos::phys_to_virt(pa) as *const u64;
+                    // Read a few values from the page to check for zeroing
+                    let sample = unsafe { core::ptr::read_volatile(kern_va.add(16)) }; // random offset
+                    println!("[*] After spawn '{}' as PID {}: shell stack page PA={:#x} sample={:#x}",
+                        name, pid, pa, sample);
+                }
+            }
+        }
+
         // Grant all syscall permissions
         self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
 

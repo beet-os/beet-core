@@ -354,6 +354,12 @@ impl MemoryManager {
         let phys = ENCRYPTED_DRAM_BASE + idx * PAGE_SIZE;
         klog!("Claiming 0x{phys:08x} for PID {pid} (zeroed: {zeroed})");
 
+        // Debug: detect double allocation
+        if let Some(old_pid) = self.allocations[idx] {
+            panic!("BUG: DOUBLE ALLOC page idx={} PA={:#x} already owned by PID {}, now requested by PID {}",
+                idx, phys, old_pid, pid);
+        }
+
         self.subtract_free_pages(1);
         self.allocations[idx] = Some(pid);
         self.next_zeroed_page_hint = idx + 1;

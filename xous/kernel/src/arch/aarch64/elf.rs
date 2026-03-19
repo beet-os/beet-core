@@ -180,6 +180,14 @@ pub unsafe fn load_elf(
             let page_kern_va = beetos::phys_to_virt(page_phys);
 
             // Zero the page first
+            #[cfg(feature = "platform-qemu-virt")]
+            {
+                use core::fmt::Write;
+                let _ = write!(
+                    crate::platform::qemu_virt::uart::UartWriter,
+                    "ZERO_PAGE: PA={:#x} for PID {} (elf)\n", page_phys, pid,
+                );
+            }
             core::ptr::write_bytes(page_kern_va as *mut u8, 0, beetos::PAGE_SIZE);
 
             // Copy file data if this page overlaps with filesz

@@ -454,14 +454,32 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     #[cfg(feature = "platform-qemu-virt")]
     crate::platform::qemu_virt::uart::puts("EL0: launching shell...\n");
 
-    // Build a context frame for the initial ERET.
-    // Start with the shell process (PID 4). Idle (PID 2) and procman (PID 3)
-    // are in the scheduler queue and will run when the shell blocks.
-    let kstack_phys = crate::mem::MemoryManager::with_mut(|mm| {
-        mm.alloc_range(1, PID::new(1).unwrap()).expect("alloc kstack").0
-    });
-    let kstack_va = beetos::phys_to_virt(kstack_phys);
-    core::ptr::write_bytes(kstack_va as *mut u8, 0, PAGE_SIZE);
+    // Build a context frame on the real kernel stack for the initial ERET.
+    //
+    // _resume_context sets SP = frame_ptr, then restore_context does
+    // `add sp, sp, #816; eret`. After eret, SP_EL1 = frame_ptr + 816.
+    // All subsequent exception handlers (SVC, IRQ) use SP_EL1 as their stack.
+    //
+    // CRITICAL: We must use the real kernel stack (_stack_top), NOT a small
+    // allocated page. The SVC/IRQ handlers need substantial stack space for
+    // nested function calls (SpawnByName → create_process → load_elf → etc.).
+    // Using a 16KB page would cause stack overflow into adjacent physical
+    // pages, corrupting user process memory.
+    //
+    // Place the context frame at _stack_top - 816 so that after eret,
+    // SP_EL1 = _stack_top. This gives the full 256KB .stack section.
+    // kernel_end() = _end = _stack_top (linker script places _end right after .stack).
+    // This is the top of the 256KB kernel stack at high VA.
+    // Place the context frame BELOW the current SP to avoid overlapping
+    // with live stack data. After _resume_context does `add sp, sp, #816; eret`,
+    // SP_EL1 = frame_ptr + 816. Subsequent SVC/IRQ handlers grow down from there.
+    //
+    // We leave 4KB of headroom below current SP for load_context_from_table's
+    // own stack usage, then place our 816-byte context frame.
+    const FRAME_SIZE: usize = 816;
+    let current_sp: usize;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) current_sp, options(nomem, nostack)) };
+    let frame_ptr = (current_sp - 4096 - FRAME_SIZE) & !0xF; // 16-byte aligned
 
     // Set shell as current and activate its address space
     super::process::set_current_pid(shell_pid);
@@ -470,11 +488,12 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     });
 
     // Load the process's saved context (PC, SP, SPSR set by setup_process)
-    let frame = kstack_va as *mut super::process::Thread;
+    let frame = frame_ptr as *mut super::process::Thread;
     let proc = super::process::Process::current();
     let tid = proc.current_tid();
-    proc.load_context_from_table(tid, frame);
+    unsafe { proc.load_context_from_table(tid, frame) };
 
-    // ERET to EL0 — shell process runs
-    super::asm::_resume_context(kstack_va as *const u8)
+    // ERET to EL0 — shell process runs.
+    // After restore_context: SP_EL1 = frame_ptr + 816 = _stack_top
+    unsafe { super::asm::_resume_context(frame_ptr as *const u8) }
 }
