@@ -136,17 +136,30 @@ fn handle_irq() {
 ///
 /// The context pointer points to the saved register frame on the kernel stack
 /// (matches the Thread register layout from asm.S's save_context).
-/// We extract syscall args, dispatch through the Xous kernel, and write
-/// the result directly into the saved frame so ERET returns it to userspace.
+///
+/// Flow for context switches:
+///   1. Save stack frame → PROCESS_TABLE[old_pid][old_tid]
+///   2. Dispatch syscall (may call activate_current → switch CURRENT_PID + TTBR0)
+///   3. Load PROCESS_TABLE[new_pid][new_tid] → stack frame
+///   4. restore_context → ERET to the correct process
 unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
     use super::process::{Process, Thread};
     use xous::{Result as XousResult, SysCall};
 
-    let frame = &mut *(context as *mut Thread);
-    let args = frame.get_args();
+    let frame = context as *mut Thread;
+
+    // Capture the calling process before any context switch.
+    let caller_pid = crate::arch::process::current_pid();
+    let mut caller_proc = Process::current();
+    let caller_tid = caller_proc.current_tid();
+
+    // Step 1: Save the stack frame into PROCESS_TABLE so the kernel has
+    // the caller's full register state if a context switch happens.
+    caller_proc.save_context_to_table(caller_tid, frame);
+
+    let args = (*frame).get_args();
 
     // Parse the raw register values into a typed SysCall enum.
-    // args[0] = syscall number, args[1..7] = arguments
     let call = match SysCall::from_args(
         args[0], args[1], args[2], args[3],
         args[4], args[5], args[6], args[7],
@@ -154,13 +167,10 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
         Ok(call) => call,
         Err(_e) => {
             let result = XousResult::Error(xous::Error::InvalidSyscall);
-            frame.set_args(&result.to_args());
+            (*frame).set_args(&result.to_args());
             return;
         }
     };
-
-    let proc = Process::current();
-    let tid = proc.current_tid();
 
     // Log the first N syscalls for debugging, then go quiet.
     #[cfg(feature = "platform-qemu-virt")]
@@ -168,46 +178,57 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
         use core::sync::atomic::{AtomicU32, Ordering};
         static SVC_COUNT: AtomicU32 = AtomicU32::new(0);
         let n = SVC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 10 {
+        if n <= 20 {
             use core::fmt::Write;
             let _ = write!(
                 crate::platform::qemu_virt::uart::UartWriter,
                 "SVC[{}]: PID {} TID {} {:?}\n",
-                n, crate::arch::process::current_pid(), tid, call,
+                n, caller_pid, caller_tid, call,
             );
         }
     }
 
-    // Dispatch the syscall through the Xous kernel.
-    //
-    // Syscalls like Yield and SendMessage set the thread result via
-    // SystemServices::set_thread_result() (writes to PROCESS_TABLE) and
-    // return ResumeProcess. Other syscalls (GetProcessId, etc.) return
-    // the result directly.
-    let response = crate::syscall::handle(tid, call)
+    // Step 2: Dispatch the syscall through the Xous kernel.
+    // This may change CURRENT_PID and TTBR0 via activate_current().
+    let response = crate::syscall::handle(caller_tid, call)
         .unwrap_or_else(XousResult::Error);
 
-    if response == XousResult::ResumeProcess {
-        // The kernel wrote the result to PROCESS_TABLE.threads[tid].
-        // Copy it to the stack frame so restore_context picks it up.
-        let result_args = proc.thread(tid).get_args();
-        frame.set_args(&result_args);
-    } else {
-        // Simple syscall — write the result directly to the stack frame.
-        frame.set_args(&response.to_args());
+    // For simple syscalls that return a value directly (not ResumeProcess),
+    // write the result into the caller's PROCESS_TABLE entry.
+    let is_resume = response == XousResult::ResumeProcess;
+    if !is_resume {
+        caller_proc.set_thread_result(caller_tid, response);
     }
+
+    // Step 3: Load the *current* process's context into the stack frame.
+    // After a context switch, CURRENT_PID may differ from caller_pid.
+    // This loads the correct process's registers for ERET.
+    let resume_proc = Process::current();
+    let resume_tid = resume_proc.current_tid();
+    resume_proc.load_context_from_table(resume_tid, frame);
 
     #[cfg(feature = "platform-qemu-virt")]
     {
         use core::sync::atomic::{AtomicU32, Ordering};
         static SVC_RESULT_COUNT: AtomicU32 = AtomicU32::new(0);
         let n = SVC_RESULT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 10 {
+        if n <= 20 {
             use core::fmt::Write;
-            let _ = write!(
-                crate::platform::qemu_virt::uart::UartWriter,
-                "  => {:?}\n", response,
-            );
+            let resume_pid = crate::arch::process::current_pid();
+            if resume_pid != caller_pid {
+                let _ = write!(
+                    crate::platform::qemu_virt::uart::UartWriter,
+                    "  => {} (switched PID {} -> {})\n",
+                    if is_resume { "ResumeProcess" } else { "result" },
+                    caller_pid, resume_pid,
+                );
+            } else {
+                let _ = write!(
+                    crate::platform::qemu_virt::uart::UartWriter,
+                    "  => {}\n",
+                    if is_resume { "ResumeProcess" } else { "ok" },
+                );
+            }
         }
     }
 }

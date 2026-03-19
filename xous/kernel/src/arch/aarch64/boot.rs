@@ -462,46 +462,39 @@ static USER_PROGRAM: [u32; 5] = [
     0x17ff_fffe, // b .-8 (branch back to mov x0, #3)
 ];
 
-/// Launch a minimal user process in EL0, registered in SystemServices.
+/// Create a user process: allocate address space, map code + stack, register in SystemServices.
 ///
-/// Creates PID 2 as a proper Xous process:
-/// - Registered in SystemServices with MemoryMapping, thread state, scheduler
-/// - Has its own address space (TTBR0) with kernel identity-mapped at EL1-only
-/// - User code page (RX at EL0) and stack page (RW at EL0)
-/// - Can make syscalls (Yield, GetProcessId, etc.) through the normal dispatch
+/// Returns the PID of the created process.
 ///
 /// # Safety
 ///
-/// Must be called after MMU, MemoryManager, and SystemServices (init_pid1) are initialized.
-/// Does not return — enters EL0 via ERET.
-pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
+/// Must be called after MMU, MemoryManager, and SystemServices are initialized.
+unsafe fn create_user_process(
+    boot_info: &BootInfo,
+    pid: xous::PID,
+    program: &[u32],
+    name: &[u8],
+) {
     use xous::{MemoryFlags, PID};
-
-    #[cfg(feature = "platform-qemu-virt")]
-    crate::platform::qemu_virt::uart::puts("EL0: setting up user process...\n");
-
-    let pid2 = PID::new(2).unwrap();
 
     // 1. Set up the process's address space with user code and stack
     let mut user_mapping = super::mem::MemoryMapping::default();
     crate::mem::MemoryManager::with_mut(|mm| {
-        user_mapping.allocate(pid2).expect("alloc user L1");
+        user_mapping.allocate(pid).expect("alloc user L1");
 
         // Copy kernel L2 table reference into user L1.
-        // The kernel's L1[0] points to an L2 table with identity-mapped RAM + MMIO.
-        // User can't access it — AP bits are EL1-only.
         let kernel_l1 = boot_info.ttbr0 as *const u64;
         let user_l1 = user_mapping.ttbr0() as *mut u64;
         let kernel_l1_entry0 = core::ptr::read_volatile(kernel_l1);
         core::ptr::write_volatile(user_l1, kernel_l1_entry0);
 
         // Allocate and map user code page (RX at EL0)
-        let (code_phys, _) = mm.alloc_range(1, pid2).expect("alloc code page");
+        let (code_phys, _) = mm.alloc_range(1, pid).expect("alloc code page");
         core::ptr::write_bytes(code_phys as *mut u8, 0, PAGE_SIZE);
         core::ptr::copy_nonoverlapping(
-            USER_PROGRAM.as_ptr() as *const u8,
+            program.as_ptr() as *const u8,
             code_phys as *mut u8,
-            USER_PROGRAM.len() * 4,
+            program.len() * 4,
         );
         user_mapping.map_page(
             mm, code_phys, USER_CODE_VA as *mut usize,
@@ -509,7 +502,7 @@ pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
         ).expect("map code page");
 
         // Allocate and map user stack page (RW at EL0)
-        let (stack_phys, _) = mm.alloc_range(1, pid2).expect("alloc stack page");
+        let (stack_phys, _) = mm.alloc_range(1, pid).expect("alloc stack page");
         core::ptr::write_bytes(stack_phys as *mut u8, 0, PAGE_SIZE);
         user_mapping.map_page(
             mm, stack_phys, USER_STACK_VA as *mut usize,
@@ -517,35 +510,30 @@ pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
         ).expect("map stack page");
     });
 
-    // 2. Register PID 2 in SystemServices and set up arch-level thread context.
-    //
-    // This makes the process visible to the Xous kernel: the Scheduler
-    // knows about it, Yield can park/ready the thread, and IPC can
-    // route messages to it.
+    // 2. Register in SystemServices and set up arch-level thread context
     crate::services::SystemServices::with_mut(|ss| {
         use crate::process::{Process, INITIAL_TID, ThreadState};
         use super::process::{Process as ArchProcess, ProcessSetup};
 
-        // Register in SystemServices (kernel-level process table)
         let mut process = Process::new(
             user_mapping,
-            pid2,
+            pid,
             PID::new(1).unwrap(),  // parent = kernel
-            [0x32444950u32, 0, 0, 0].into(),  // AppId = 'PID2'
+            [pid.get() as u32, 0, 0, 0].into(),
         );
-        process.set_name(b"init").expect("set process name");
-        process.set_syscall_permissions(u64::MAX);  // full permissions for now
+        process.set_name(name).expect("set process name");
+        process.set_syscall_permissions(u64::MAX);
         process.set_thread_state(INITIAL_TID, ThreadState::Ready);
-        ss.insert_process(1, process);  // slot index 1 = PID 2
+        let slot = pid.get() as usize - 1;
+        ss.insert_process(slot, process);
 
-        // Set up arch-level thread context in PROCESS_TABLE
         let stack = xous::MemoryRange::new(USER_STACK_VA, PAGE_SIZE)
             .expect("stack range");
         let irq_stack = xous::MemoryRange::new(USER_STACK_VA, PAGE_SIZE)
             .expect("irq stack range");
         ArchProcess::setup_process(
             ProcessSetup {
-                pid: pid2,
+                pid,
                 entry_point: USER_CODE_VA,
                 stack,
                 irq_stack,
@@ -554,8 +542,35 @@ pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
             ss,
         ).expect("setup process");
     });
+}
 
-    // 4. Build a context frame for the initial ERET to EL0.
+/// Launch user processes in EL0.
+///
+/// Creates PID 2 and PID 3, both registered in SystemServices with the Scheduler.
+/// Starts execution at PID 2 — when it Yields, the scheduler switches to PID 3
+/// (context switch: save PID 2's regs, load PID 3's regs, switch TTBR0, ERET).
+///
+/// # Safety
+///
+/// Must be called after MMU, MemoryManager, and SystemServices (init_pid1) are initialized.
+/// Does not return — enters EL0 via ERET.
+pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
+    use xous::PID;
+
+    #[cfg(feature = "platform-qemu-virt")]
+    crate::platform::qemu_virt::uart::puts("EL0: creating user processes...\n");
+
+    let pid2 = PID::new(2).unwrap();
+    let pid3 = PID::new(3).unwrap();
+
+    // Create two user processes, both running the same Yield-loop program.
+    // They have separate address spaces (different TTBR0/ASID).
+    create_user_process(boot_info, pid2, &USER_PROGRAM, b"server");
+    create_user_process(boot_info, pid3, &USER_PROGRAM, b"client");
+
+    // Build a context frame for the initial ERET to PID 2.
+    // After PID 2 Yields, the scheduler picks PID 3 (next in queue),
+    // and the SVC handler loads PID 3's context from PROCESS_TABLE.
     let kstack_phys = crate::mem::MemoryManager::with_mut(|mm| {
         mm.alloc_range(1, PID::new(1).unwrap()).expect("alloc kstack").0
     });
@@ -567,15 +582,15 @@ pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
     core::ptr::write_volatile(context_ptr.add(32), USER_CODE_VA as u64);  // ELR_EL1
     core::ptr::write_volatile(context_ptr.add(33), 0u64);             // SPSR_EL1 = EL0t
 
-    // 5. Switch to user address space and set current PID
+    // Start with PID 2
     super::process::set_current_pid(pid2);
     crate::services::SystemServices::with_mut(|ss| {
         ss.process(pid2).expect("pid2 not registered").activate();
     });
 
     #[cfg(feature = "platform-qemu-virt")]
-    crate::platform::qemu_virt::uart::puts("EL0: launching user process...\n");
+    crate::platform::qemu_virt::uart::puts("EL0: launching (PID 2 first, PID 3 in scheduler queue)...\n");
 
-    // 6. ERET to EL0
+    // ERET to EL0 — PID 2 runs first
     super::asm::_resume_context(context_ptr as *const u8)
 }

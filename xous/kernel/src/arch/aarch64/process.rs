@@ -47,12 +47,17 @@ pub struct Thread {
     pub stack: Option<MemoryRange>,
 }
 
+/// Number of u64s in the context frame (816 bytes / 8 = 102).
+/// This is the register-only portion of Thread that matches the asm.S layout.
+const CONTEXT_FRAME_U64S: usize = 102;
+
 const _: () = {
     // Verify that the Thread struct's register area matches the asm.S layout.
     // asm.S uses 816 bytes for the context frame:
     //   248 (GPR) + 8 (SP) + 8 (ELR) + 8 (SPSR) + 8 (TPIDR) + 8 (FPCR) + 8 (FPSR) + 8 (pad) + 512 (V0-V31)
-    // = 816 bytes.
+    // = 816 bytes = 102 u64s.
     // The additional `allocated` and `stack` fields are Rust-only metadata.
+    assert!(CONTEXT_FRAME_U64S * 8 == 816);
 };
 
 impl Default for Thread {
@@ -478,6 +483,46 @@ impl Process {
         unsafe {
             let proc = PROCESS_TABLE[idx].as_ref().expect("process not found");
             &proc.threads[tid.saturating_sub(1).min(MAX_THREAD_COUNT - 1)]
+        }
+    }
+
+    /// Save the exception frame (from the kernel stack) into PROCESS_TABLE.
+    ///
+    /// The frame pointer must point to a save_context layout (816 bytes).
+    /// This is called on SVC/IRQ entry so that the current thread's register
+    /// state is captured in PROCESS_TABLE before any context switch.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must point to a valid 816-byte context frame.
+    pub unsafe fn save_context_to_table(&self, tid: TID, frame: *const Thread) {
+        let idx = self.pid.get() as usize - 1;
+        if let Some(proc) = PROCESS_TABLE[idx].as_mut() {
+            let thread = &mut proc.threads[tid.saturating_sub(1)];
+            // Copy only the register area (816 bytes = first 102 u64s).
+            // Preserve the `allocated` and `stack` fields.
+            let src = frame as *const u64;
+            let dst = thread as *mut Thread as *mut u64;
+            core::ptr::copy_nonoverlapping(src, dst, CONTEXT_FRAME_U64S);
+        }
+    }
+
+    /// Load the thread context from PROCESS_TABLE into the exception frame.
+    ///
+    /// Called before returning to userspace (ERET) so the stack frame
+    /// contains the correct thread's registers — especially after a
+    /// context switch.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must point to a writable 816-byte context frame.
+    pub unsafe fn load_context_from_table(&self, tid: TID, frame: *mut Thread) {
+        let idx = self.pid.get() as usize - 1;
+        if let Some(proc) = PROCESS_TABLE[idx].as_ref() {
+            let thread = &proc.threads[tid.saturating_sub(1)];
+            let src = thread as *const Thread as *const u64;
+            let dst = frame as *mut u64;
+            core::ptr::copy_nonoverlapping(src, dst, CONTEXT_FRAME_U64S);
         }
     }
 
