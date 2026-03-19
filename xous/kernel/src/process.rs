@@ -108,6 +108,8 @@ pub enum ThreadState {
     WaitReceive { sidx: usize },
     /// Waiting on futex_wait()
     WaitFutex { addr: usize },
+    /// Waiting for a process to exit via WaitProcess syscall
+    WaitProcess { pid: PID },
     /// Retrying a connect() call because the server does not exist (yet). PC is on the SWI instruction, so
     /// once it's marked ready, the connect() syscall will be executed again.
     RetryConnect { sid_hash: u32 },

@@ -14,6 +14,7 @@ members = [
     "xous/trng",
     "api/keyboard",
     "api/console",
+    "api/procman",
     "os/app-manifest",
     "xtask",
     # apps/ and loader are no_std + aarch64 only, excluded from default workspace
@@ -22,6 +23,7 @@ exclude = [
     "loader",
     "apps/hello",
     "apps/shell",
+    "os/procman",
 ]
 
 [workspace.dependencies]

@@ -162,7 +162,8 @@ fn execute_line(line: &[u8]) {
         "rm" => cmd_rm(cmd_args),
         "mkdir" => cmd_mkdir(cmd_args),
         _ => {
-            let _ = write!(UartWriter, "bsh: command not found: {}\n", cmd);
+            // Try to spawn via procman
+            try_spawn_via_procman(cmd);
         }
     }
 }
@@ -325,6 +326,73 @@ fn cmd_mkdir(args: &[&str]) {
         }
         Err(e) => {
             let _ = write!(UartWriter, "mkdir: error: {:?}\n", e);
+        }
+    }
+}
+
+// ============================================================================
+// Process spawning via procman
+// ============================================================================
+
+/// Connection ID to the procman service (lazily initialized).
+static mut PROCMAN_CID: u32 = 0;
+
+fn get_procman_cid() -> u32 {
+    unsafe {
+        if PROCMAN_CID != 0 {
+            return PROCMAN_CID;
+        }
+        // Connect to procman (blocks until procman creates its server)
+        let sid = xous::SID::from_array(beetos_api_procman::PROCMAN_SID);
+        match xous::rsyscall(xous::SysCall::Connect(sid)) {
+            Ok(xous::Result::ConnectionID(cid)) => {
+                PROCMAN_CID = cid;
+                cid
+            }
+            _ => 0,
+        }
+    }
+}
+
+fn try_spawn_via_procman(cmd: &str) {
+    let cid = get_procman_cid();
+    if cid == 0 {
+        let _ = write!(UartWriter, "bsh: {}: procman not available\n", cmd);
+        return;
+    }
+
+    let name_packed = beetos_api_procman::pack_name(cmd);
+    let result = xous::rsyscall(xous::SysCall::SendMessage(
+        cid,
+        xous::Message::BlockingScalar(xous::ScalarMessage {
+            id: beetos_api_procman::ProcManOp::SpawnAndWait as usize,
+            arg1: name_packed[0],
+            arg2: name_packed[1],
+            arg3: name_packed[2],
+            arg4: name_packed[3],
+        }),
+    ));
+
+    match result {
+        Ok(xous::Result::Scalar1(exit_code)) => {
+            if exit_code == usize::MAX {
+                let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
+            } else {
+                let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
+            }
+        }
+        Ok(xous::Result::Scalar2(exit_code, _)) => {
+            if exit_code == usize::MAX {
+                let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
+            } else {
+                let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
+            }
+        }
+        Err(_) => {
+            let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd);
+        }
+        _ => {
+            let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd);
         }
     }
 }

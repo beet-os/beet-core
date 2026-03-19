@@ -951,6 +951,42 @@ impl SystemServices {
             self.send_event(ppid, SystemEvent::ChildTerminated, [ret as _, 0, 0, 0]).ok();
         }
 
+        // Wake all threads waiting on this process via WaitProcess syscall.
+        // Collect waiters first to avoid borrow conflicts.
+        {
+            let dying_pid = pid;
+            let exit_code = ret as usize;
+            // Stack-allocated buffer for waiters (pid, tid pairs).
+            // 64 entries should be more than enough — typical case is 1 waiter.
+            let mut waiters = [(xous::PID::new(1).unwrap(), 0usize); 64];
+            let mut waiter_count = 0;
+
+            for pidx in 0..self.processes.len() {
+                let Some(process) = &self.processes[pidx] else { continue };
+                let waiter_pid = process.pid;
+                for tid in 1..crate::arch::process::MAX_THREAD_COUNT {
+                    if process.thread_state(tid)
+                        == (ThreadState::WaitProcess { pid: dying_pid })
+                    {
+                        if waiter_count < waiters.len() {
+                            waiters[waiter_count] = (waiter_pid, tid);
+                            waiter_count += 1;
+                        }
+                    }
+                }
+            }
+
+            // Now wake all collected waiters
+            for i in 0..waiter_count {
+                let (waiter_pid, tid) = waiters[i];
+                self.set_thread_result(waiter_pid, tid, xous::Result::Scalar1(exit_code))
+                    .ok();
+                self.process_mut(waiter_pid)
+                    .map(|p| p.set_thread_state(tid, ThreadState::Ready))
+                    .ok();
+            }
+        }
+
         #[cfg(beetos)]
         if ret != 0 {
             #[cfg(not(feature = "production"))]
@@ -1090,12 +1126,86 @@ impl SystemServices {
                         }
                     }
                     ThreadState::WaitFutex { addr: _addr } => writeln!(output, "WaitFutex({_addr:08x})").ok(),
+                    ThreadState::WaitProcess { pid: _pid } => writeln!(output, "WaitProcess({})", _pid).ok(),
                 };
                 write!(output, "{:?}", arch_process.thread(tid)).ok();
             }
         });
         writeln!(output,).ok();
         Ok(())
+    }
+
+    /// Spawn a new process by name from the embedded binary table.
+    /// Creates the process with full syscall permissions and UART mapping.
+    /// Returns the PID of the new process.
+    #[cfg(beetos)]
+    pub fn spawn_by_name(&mut self, name: &str) -> Result<xous::PID, Error> {
+        use xous::MemoryAddress;
+
+        let elf_bytes = crate::arch::boot::lookup_binary(name).ok_or_else(|| {
+            println!("[!] spawn_by_name: binary '{}' not found", name);
+            Error::ProcessNotFound
+        })?;
+
+        let elf_range = unsafe {
+            MemoryRange::new(elf_bytes.as_ptr() as usize, elf_bytes.len())
+        }.map_err(|_| Error::InternalError)?;
+
+        // Use a stack-allocated name buffer
+        let mut name_buf = [0u8; xous::arch::MAX_PROCESS_NAME_LEN];
+        let copy_len = name.len().min(name_buf.len());
+        name_buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
+
+        let init = ProcessInit {
+            elf: elf_range,
+            name_addr: MemoryAddress::new(name_buf.as_ptr() as usize).ok_or(Error::InternalError)?,
+            app_id: AppId::from([0u32; 4]),
+        };
+
+        let startup = self.create_process(init)?;
+        let _ = startup; // We don't need the startup info
+
+        // Find the newly created process (it's the last one)
+        let pid = self.processes.iter().enumerate().rev()
+            .find_map(|(idx, p)| {
+                if let Some(proc) = p {
+                    #[cfg(beetos)]
+                    if proc.name().map(|n| n == name).unwrap_or(false) {
+                        return Some(proc.pid);
+                    }
+                    let _ = idx;
+                }
+                None
+            })
+            .ok_or(Error::InternalError)?;
+
+        // Grant all syscall permissions
+        self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
+
+        // Map UART MMIO into the new process
+        #[cfg(feature = "platform-qemu-virt")]
+        {
+            const UART_PHYS: usize = 0x0900_0000;
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let process = self.process_mut(pid).expect("spawned process");
+                process.mapping.map_page(
+                    mm,
+                    UART_PHYS,
+                    crate::arch::boot::SHELL_UART_VA as *mut usize,
+                    xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                    true,
+                ).ok(); // May fail if already mapped, that's fine
+            });
+        }
+
+        // Pass UART VA via x0
+        {
+            let idx = pid.get() as usize - 1;
+            crate::arch::process::set_thread_arg0(idx, crate::arch::boot::SHELL_UART_VA);
+        }
+
+        println!("[*] spawn_by_name: created '{}' as PID {}", name, pid);
+        Ok(pid)
     }
 
     pub fn pid_from_app_id(&self, app_id: AppId) -> Option<PID> {

@@ -402,6 +402,10 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
             is_permitted_by_mask()
         }
 
+        // SpawnByName and WaitProcess are privileged (require permission mask)
+        #[cfg(beetos)]
+        SysCall::SpawnByName(..) | SysCall::WaitProcess(..) => is_permitted_by_mask(),
+
         SysCall::Invalid(..) => Err(Error::UnhandledSyscall),
     }
 }
@@ -750,6 +754,28 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
 
                 Ok(Result::Scalar2(pid_val, copy_len))
             })
+        }),
+
+        #[cfg(beetos)]
+        SysCall::SpawnByName(a0, a1, a2, a3) => {
+            let args = [a0, a1, a2, a3];
+            let name_bytes = xous::unpack_name_from_usize(&args);
+            let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidString)?;
+            SystemServices::with_mut(|ss| {
+                ss.spawn_by_name(name).map(Result::ProcessID)
+            })
+        }
+        #[cfg(beetos)]
+        SysCall::WaitProcess(target_pid) => SystemServices::with_mut(|ss| {
+            // Check if the target process exists
+            if ss.process(target_pid).is_err() {
+                // Process already exited — return immediately with exit code 0
+                return Ok(Result::Scalar1(0));
+            }
+            // Block the calling thread until the target process terminates
+            ss.set_thread_result(current_pid(), tid, Result::Ok)?;
+            ss.current_process_mut().set_thread_state(tid, ThreadState::WaitProcess { pid: target_pid });
+            Scheduler::with_mut(|s| s.activate_current(ss))
         }),
 
         _ => Err(Error::UnhandledSyscall),

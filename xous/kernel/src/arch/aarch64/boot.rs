@@ -446,14 +446,39 @@ static SHELL_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/shell.stripped")
 );
 
+/// Embedded binary table: name → ELF bytes.
+/// The kernel holds these via include_bytes! — no filesystem needed.
+/// Used by SpawnByName syscall to create processes by name.
+static BINARY_TABLE: &[(&str, &[u8])] = &[
+    ("idle", HELLO_ELF),
+    ("hello", HELLO_ELF),
+    ("shell", SHELL_ELF),
+    ("procman", PROCMAN_ELF),
+];
+
+/// Embedded procman ELF binary.
+static PROCMAN_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/procman.stripped")
+);
+
+/// Look up a binary by name in the embedded binary table.
+pub fn lookup_binary(name: &str) -> Option<&'static [u8]> {
+    for &(entry_name, elf_bytes) in BINARY_TABLE {
+        if entry_name == name {
+            return Some(elf_bytes);
+        }
+    }
+    None
+}
+
 /// UART MMIO physical address on QEMU virt.
 /// The shell process gets this mapped into its address space for direct output.
 #[cfg(feature = "platform-qemu-virt")]
 const UART_PHYS: usize = 0x0900_0000;
 
-/// Virtual address where UART is mapped in the shell process.
+/// Virtual address where UART is mapped in user processes.
 /// Must be in L1[1]+ (same as user code) to avoid conflict with kernel L1[0].
-const SHELL_UART_VA: usize = 0x0000_0010_0100_0000; // L1[1], well after code
+pub const SHELL_UART_VA: usize = 0x0000_0010_0100_0000; // L1[1], well after code
 
 /// Create a user process from an ELF binary using the kernel's standard
 /// load_elf → allocate stack → setup_process pipeline.
@@ -517,15 +542,30 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let idle_pid = PID::new(2).unwrap();
     create_elf_process(idle_pid, HELLO_ELF, b"idle");
 
-    // Create the shell process (PID 3)
-    let shell_pid = PID::new(3).unwrap();
+    // Create the procman process (PID 3) — process lifecycle manager.
+    let procman_pid = PID::new(3).unwrap();
+    create_elf_process(procman_pid, PROCMAN_ELF, b"procman");
+
+    // Create the shell process (PID 4)
+    let shell_pid = PID::new(4).unwrap();
     create_elf_process(shell_pid, SHELL_ELF, b"shell");
 
-    // Map UART MMIO into the shell's address space for direct output.
+    // Map UART MMIO into procman and shell address spaces for direct output.
     #[cfg(feature = "platform-qemu-virt")]
     {
         crate::services::SystemServices::with_mut(|ss| {
             crate::mem::MemoryManager::with_mut(|mm| {
+                // Map UART into procman
+                let process = ss.process_mut(procman_pid).expect("procman process");
+                process.mapping.map_page(
+                    mm,
+                    UART_PHYS,
+                    SHELL_UART_VA as *mut usize,
+                    xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                    true,
+                ).expect("map UART into procman");
+
+                // Map UART into shell
                 let process = ss.process_mut(shell_pid).expect("shell process");
                 process.mapping.map_page(
                     mm,
@@ -538,7 +578,11 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         });
     }
 
-    // Pass the UART VA to the shell via x0 register.
+    // Pass the UART VA to procman and shell via x0 register.
+    {
+        let idx = procman_pid.get() as usize - 1;
+        super::process::set_thread_arg0(idx, SHELL_UART_VA);
+    }
     {
         let idx = shell_pid.get() as usize - 1;
         super::process::set_thread_arg0(idx, SHELL_UART_VA);
@@ -548,8 +592,8 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     crate::platform::qemu_virt::uart::puts("EL0: launching shell...\n");
 
     // Build a context frame for the initial ERET.
-    // Start with the shell process (PID 3). The idle process (PID 2)
-    // is in the scheduler queue and will run when the shell blocks.
+    // Start with the shell process (PID 4). Idle (PID 2) and procman (PID 3)
+    // are in the scheduler queue and will run when the shell blocks.
     let kstack_phys = crate::mem::MemoryManager::with_mut(|mm| {
         mm.alloc_range(1, PID::new(1).unwrap()).expect("alloc kstack").0
     });

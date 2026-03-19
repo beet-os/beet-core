@@ -399,6 +399,33 @@ pub enum SysCall {
     /// Gets the last panic message (including backtrace) from the kernel
     GetPanicMessage(MemoryRange),
 
+    /// Spawn a new process by name from the kernel's embedded binary table.
+    /// The name is packed as up to 4 usize values (max 32 bytes).
+    ///
+    /// # Returns
+    ///
+    /// * **ProcessID(pid)**: The PID of the newly created process
+    ///
+    /// # Errors
+    ///
+    /// * **ProcessNotFound**: No binary with that name was found
+    /// * **OutOfMemory**: Could not allocate resources for the new process
+    #[cfg(beetos)]
+    SpawnByName(usize /* name arg0 */, usize /* name arg1 */, usize /* name arg2 */, usize /* name arg3 */),
+
+    /// Wait for a process to exit. Blocks the calling thread until the
+    /// target process calls TerminateProcess.
+    ///
+    /// # Returns
+    ///
+    /// * **Scalar1(exit_code)**: The exit code of the terminated process
+    ///
+    /// # Errors
+    ///
+    /// * **ProcessNotFound**: The target PID does not exist
+    #[cfg(beetos)]
+    WaitProcess(PID),
+
     /// This syscall does not exist. It captures all possible
     /// arguments so detailed analysis can be performed.
     Invalid(usize, usize, usize, usize, usize, usize, usize),
@@ -461,6 +488,8 @@ pub enum SysCallNumber {
     RegisterEventHandler = 54,
     AppendPanicMessage = 55,
     GetPanicMessage = 56,
+    SpawnByName = 57,
+    WaitProcess = 58,
 
     Invalid,
 }
@@ -524,6 +553,8 @@ impl SysCallNumber {
             54 => RegisterEventHandler,
             55 => AppendPanicMessage,
             56 => GetPanicMessage,
+            57 => SpawnByName,
+            58 => WaitProcess,
             _ => Invalid,
         }
     }
@@ -839,6 +870,15 @@ impl SysCall {
                 [SysCallNumber::TerminatePid as usize, pid.get() as usize, *exit_code as usize, 0, 0, 0, 0, 0]
             }
 
+            #[cfg(beetos)]
+            SysCall::SpawnByName(a0, a1, a2, a3) => {
+                [SysCallNumber::SpawnByName as usize, *a0, *a1, *a2, *a3, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::WaitProcess(pid) => {
+                [SysCallNumber::WaitProcess as usize, pid.get() as usize, 0, 0, 0, 0, 0, 0]
+            }
+
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
             }
@@ -1012,13 +1052,22 @@ impl SysCall {
                 SysCall::TerminatePid(PID::new(a1 as _).ok_or(Error::InvalidSyscall)?, a2 as u32)
             }
 
+            #[cfg(beetos)]
+            SysCallNumber::SpawnByName => SysCall::SpawnByName(a1, a2, a3, a4),
+            #[cfg(beetos)]
+            SysCallNumber::WaitProcess => {
+                SysCall::WaitProcess(PID::new(a1 as _).ok_or(Error::InvalidSyscall)?)
+            }
+
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
             | SysCallNumber::FutexWake
             | SysCallNumber::DebugCommand
             | SysCallNumber::VirtToPhys
             | SysCallNumber::VirtToPhysPid
-            | SysCallNumber::InvalidateCache => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::InvalidateCache
+            | SysCallNumber::SpawnByName
+            | SysCallNumber::WaitProcess => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }
@@ -2013,6 +2062,71 @@ pub fn get_panic_message(buffer: MemoryRange) -> core::result::Result<(u8, usize
         Result::Error(e) => Err(e),
         _ => Err(Error::InternalError),
     })
+}
+
+/// Spawn a new process by name from the kernel's embedded binary table.
+/// The name is packed as up to 32 bytes across 4 usize values.
+///
+/// Returns the PID of the newly created process.
+#[cfg(beetos)]
+#[inline]
+pub fn spawn_by_name(name: &str) -> core::result::Result<PID, Error> {
+    let packed = pack_name_to_usize(name);
+    rsyscall(SysCall::SpawnByName(packed[0], packed[1], packed[2], packed[3])).and_then(|result| {
+        if let Result::ProcessID(pid) = result {
+            Ok(pid)
+        } else if let Result::Error(e) = result {
+            Err(e)
+        } else {
+            Err(Error::InternalError)
+        }
+    })
+}
+
+/// Wait for a process to exit. Blocks until the target process calls TerminateProcess.
+///
+/// Returns the exit code of the terminated process.
+#[cfg(beetos)]
+#[inline]
+pub fn wait_process_exit(pid: PID) -> core::result::Result<usize, Error> {
+    rsyscall(SysCall::WaitProcess(pid)).and_then(|result| {
+        if let Result::Scalar1(exit_code) = result {
+            Ok(exit_code)
+        } else if let Result::Error(e) = result {
+            Err(e)
+        } else {
+            Err(Error::InternalError)
+        }
+    })
+}
+
+/// Pack a process name (up to 32 bytes) into 4 usize values for syscall arguments.
+#[cfg(beetos)]
+pub fn pack_name_to_usize(name: &str) -> [usize; 4] {
+    let bytes = name.as_bytes();
+    let mut result = [0usize; 4];
+    let word_size = core::mem::size_of::<usize>();
+    for (i, chunk) in bytes.chunks(word_size).enumerate() {
+        if i >= 4 {
+            break;
+        }
+        let mut buf = [0u8; 8]; // max usize size
+        buf[..chunk.len()].copy_from_slice(chunk);
+        result[i] = usize::from_le_bytes(buf);
+    }
+    result
+}
+
+/// Unpack a process name from 4 usize values.
+/// Returns the name as a byte slice (up to 32 bytes, trimmed to first null).
+#[cfg(beetos)]
+pub fn unpack_name_from_usize(args: &[usize; 4]) -> &[u8] {
+    let word_size = core::mem::size_of::<usize>();
+    let ptr = args.as_ptr() as *const u8;
+    let max_len = 4 * word_size;
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, max_len) };
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(max_len);
+    &bytes[..len]
 }
 
 /// Perform a raw syscall and return the result. This will transform
