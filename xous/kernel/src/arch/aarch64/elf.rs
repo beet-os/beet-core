@@ -174,12 +174,12 @@ pub unsafe fn load_elf(
         while page_start + offset < page_end {
             let (page_phys, _zeroed) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
             let page_virt = (page_start + offset) as *mut usize;
-            let page_va = page_start + offset;
 
-            // Zero the page via identity map (PA = VA for kernel blocks).
+            // Zero the page first
             core::ptr::write_bytes(page_phys as *mut u8, 0, beetos::PAGE_SIZE);
 
             // Copy file data if this page overlaps with filesz
+            let page_va = page_start + offset;
             if page_va < vaddr + filesz {
                 let src_start = if page_va >= vaddr {
                     phdr.p_offset as usize + (page_va - vaddr)
@@ -202,7 +202,6 @@ pub unsafe fn load_elf(
             }
 
             mapping.map_page(mm, page_phys, page_virt, flags, true)?;
-
             offset += beetos::PAGE_SIZE;
         }
     }

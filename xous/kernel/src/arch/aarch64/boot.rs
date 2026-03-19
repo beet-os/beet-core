@@ -385,7 +385,6 @@ pub unsafe fn enable_mmu(fdt_ptr: *const u8) -> BootInfo {
                     | (1 << 2)   // C: enable data cache
                     | (1 << 3)   // SA: SP alignment check
                     | (1 << 12)  // I: enable instruction cache
-                    | (1 << 23)  // SPAN: PAN not set on exception entry (disables PAN)
                     | (1 << 26)  // UCI: allow EL0 cache maintenance
                     ; // WXN (bit 19) = 0: don't enforce W→XN for EL1
                       // EE (bit 25) = 0: little-endian at EL1

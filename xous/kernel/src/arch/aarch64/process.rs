@@ -373,19 +373,22 @@ impl Process {
         // Stack overflow → translation fault instead of silent corruption.
         // (The guard page is simply never mapped — no allocation needed.)
 
-        crate::mem::MemoryManager::with_mut(|mm| {
-            let process = services.process_mut(pid)?;
-            // Map each stack page. Pages will be zeroed via user VA below.
-            for i in 0..stack_pages {
-                let va = stack_base + i * beetos::PAGE_SIZE;
-                let (phys, _) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
-                process.mapping.map_page(
-                    mm, phys, va as *mut usize,
-                    xous::MemoryFlags::W, true,
-                )?;
-            }
-            Ok::<(), Error>(())
-        })?;
+        unsafe {
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let process = services.process_mut(pid)?;
+                // Map each stack page
+                for i in 0..stack_pages {
+                    let va = stack_base + i * beetos::PAGE_SIZE;
+                    let (phys, _) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
+                    core::ptr::write_bytes(phys as *mut u8, 0, beetos::PAGE_SIZE);
+                    process.mapping.map_page(
+                        mm, phys, va as *mut usize,
+                        xous::MemoryFlags::W, true,
+                    )?;
+                }
+                Ok::<(), Error>(())
+            })?;
+        }
 
         // Allocate and map IRQ stack pages (3 pages).
         let irq_stack_pages = beetos::USER_IRQ_STACK_PAGE_COUNT;
@@ -393,57 +396,20 @@ impl Process {
         let irq_stack_base = beetos::USER_IRQ_STACK_BOTTOM - irq_stack_size;
         let irq_stack = unsafe { MemoryRange::new(irq_stack_base, irq_stack_size).map_err(|_| Error::BadAddress)? };
 
-        crate::mem::MemoryManager::with_mut(|mm| {
-            let process = services.process_mut(pid)?;
-            // Map each IRQ stack page. Pages will be zeroed via user VA below.
-            for i in 0..irq_stack_pages {
-                let va = irq_stack_base + i * beetos::PAGE_SIZE;
-                let (phys, _) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
-                process.mapping.map_page(
-                    mm, phys, va as *mut usize,
-                    xous::MemoryFlags::W, true,
-                )?;
-            }
-            Ok::<(), Error>(())
-        })?;
-
-        // Zero all stack pages via the user mapping.
-        // We temporarily activate the process's TTBR0 so that writes go through
-        // the L3 page descriptors (not the L2 block identity map), avoiding the
-        // QEMU coherence issue where block-descriptor writes are invisible to
-        // page-descriptor reads of the same physical address.
         unsafe {
-            let orig_ttbr0: u64;
-            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) orig_ttbr0, options(nomem, nostack));
-            // Use mapping.activate() instead of process.activate() to switch
-            // TTBR0 without changing CURRENT_PID. process.activate() would set
-            // CURRENT_PID to the new process, which is never restored and would
-            // corrupt the kernel's notion of which process is running.
-            let process = services.process(pid)?;
-            process.mapping.activate();
-            // Disable PAN (Privileged Access Never) so EL1 can write to user pages (AP_RW_ALL).
-            // This instruction is encoded as .inst because `msr pan, #0` requires explicit CPU
-            // feature flags in the assembler. Opcode: MSR PAN, #0 = 0xd500409f
-            core::arch::asm!(".inst 0xd500409f", options(nomem, nostack)); // MSR PAN, #0
-
-            for i in 0..stack_pages {
-                let va = stack_base + i * beetos::PAGE_SIZE;
-                core::ptr::write_bytes(va as *mut u8, 0, beetos::PAGE_SIZE);
-            }
-            for i in 0..irq_stack_pages {
-                let va = irq_stack_base + i * beetos::PAGE_SIZE;
-                core::ptr::write_bytes(va as *mut u8, 0, beetos::PAGE_SIZE);
-            }
-
-            // Re-enable PAN and restore the original TTBR0 (kernel/parent process mapping).
-            // Opcode: MSR PAN, #1 = 0xd500419f
-            core::arch::asm!(".inst 0xd500419f", options(nomem, nostack)); // MSR PAN, #1
-            core::arch::asm!(
-                "msr ttbr0_el1, {ttbr}",
-                "isb",
-                ttbr = in(reg) orig_ttbr0,
-                options(nomem, nostack),
-            );
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let process = services.process_mut(pid)?;
+                for i in 0..irq_stack_pages {
+                    let va = irq_stack_base + i * beetos::PAGE_SIZE;
+                    let (phys, _) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
+                    core::ptr::write_bytes(phys as *mut u8, 0, beetos::PAGE_SIZE);
+                    process.mapping.map_page(
+                        mm, phys, va as *mut usize,
+                        xous::MemoryFlags::W, true,
+                    )?;
+                }
+                Ok::<(), Error>(())
+            })?;
         }
 
         // Set up the initial thread context with the ELF entry point.

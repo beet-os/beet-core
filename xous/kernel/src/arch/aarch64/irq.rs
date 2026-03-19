@@ -9,7 +9,6 @@
 
 use xous::arch::irq::IrqNumber;
 
-
 /// Enable a specific interrupt via the platform's interrupt controller.
 #[allow(dead_code)]
 pub fn enable_irq(_irq_no: IrqNumber) {
@@ -95,6 +94,24 @@ unsafe extern "C" fn _user_irq_handler_rust(context: *mut u8) {
     let resume_proc = Process::current();
     let resume_tid = resume_proc.current_tid();
     resume_proc.load_context_from_table(resume_tid, frame);
+
+    // Log the first preemptive switch
+    #[cfg(feature = "platform-qemu-virt")]
+    if was_timer {
+        let resume_pid = crate::arch::process::current_pid();
+        if resume_pid != interrupted_pid {
+            use core::sync::atomic::{AtomicBool, Ordering};
+            static FIRST_PREEMPT: AtomicBool = AtomicBool::new(true);
+            if FIRST_PREEMPT.swap(false, Ordering::Relaxed) {
+                use core::fmt::Write;
+                let _ = write!(
+                    crate::platform::qemu_virt::uart::UartWriter,
+                    "PREEMPT: timer switched PID {} -> {}\n",
+                    interrupted_pid, resume_pid,
+                );
+            }
+        }
+    }
 }
 
 /// Called from asm.S for kernel-mode synchronous exceptions.
