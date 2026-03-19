@@ -355,6 +355,12 @@ impl MemoryManager {
         klog!("Claiming 0x{phys:08x} for PID {pid} (zeroed: {zeroed})");
 
         self.subtract_free_pages(1);
+        if let Some(existing_pid) = self.allocations[idx] {
+            panic!(
+                "BUG: double alloc! page idx={} phys={:#x} already owned by PID {}, tried to alloc for PID {}",
+                idx, phys, existing_pid, pid
+            );
+        }
         self.allocations[idx] = Some(pid);
         self.next_zeroed_page_hint = idx + 1;
         if self.next_zeroed_page_hint > FRAGMENTED_AREA_PAGES {

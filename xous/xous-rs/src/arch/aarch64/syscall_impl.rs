@@ -37,7 +37,13 @@ pub fn syscall(call: SysCall) -> SysCallResult {
             inout("x5") args[5] => r5,
             inout("x8") args[6] => r8,
             inout("x9") args[7] => r9,
-            // Clobber caller-saved registers not used for args/results
+            // Clobber ALL caller-saved registers not used for args/results.
+            // The SVC transitions to EL1 where the kernel may use any register.
+            // Even though the kernel saves/restores the full context via
+            // PROCESS_TABLE, a blocking syscall (SendMessage with BlockingScalar)
+            // may not return until much later — after other processes have run.
+            // The kernel restores registers from PROCESS_TABLE, but x18 and
+            // NEON/FP state could differ if not listed as clobbers.
             lateout("x6") _,
             lateout("x7") _,
             lateout("x10") _,
@@ -48,6 +54,7 @@ pub fn syscall(call: SysCall) -> SysCallResult {
             lateout("x15") _,
             lateout("x16") _,
             lateout("x17") _,
+            lateout("x18") _,
         );
     }
 
