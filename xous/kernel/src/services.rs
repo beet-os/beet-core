@@ -1187,7 +1187,7 @@ impl SystemServices {
         // Pass UART VA via x0
         {
             let idx = pid.get() as usize - 1;
-            crate::arch::process::set_thread_arg0(idx, crate::arch::boot::SHELL_UART_VA);
+            unsafe { crate::arch::process::set_thread_arg0(idx, crate::arch::boot::SHELL_UART_VA); }
         }
 
         println!("[*] spawn_by_name: created '{}' as PID {}", name, pid);

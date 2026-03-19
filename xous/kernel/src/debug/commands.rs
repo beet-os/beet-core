@@ -246,6 +246,7 @@ fn for_each_process_debug_row(mut on_row: impl FnMut(ProcessDebugRow<'_>)) -> Pr
                     ThreadState::WaitBlocking { .. } => 'b',
                     ThreadState::WaitReceive { .. } => 'w',
                     ThreadState::WaitFutex { .. } => 'f',
+                    ThreadState::WaitProcess { .. } => 'p',
                 };
             }
 
