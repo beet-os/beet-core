@@ -110,10 +110,13 @@ pub const EXCEPTION_STACK_TOP_GUARD: usize =
 #[cfg(feature = "platform-qemu-virt")]
 pub const RAM_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
 
+#[cfg(feature = "platform-bcm2712")]
+pub const RAM_SIZE: usize = 8 * 1024 * 1024 * 1024; // 8 GiB (RPi5 max)
+
 #[cfg(feature = "platform-apple-t8103")]
 pub const RAM_SIZE: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
 
-#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
+#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-bcm2712", feature = "platform-apple-t8103")))]
 pub const RAM_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB default
 
 /// Number of pages in max RAM configuration.
@@ -131,10 +134,16 @@ pub const RAM_PAGES: usize = RAM_SIZE / PAGE_SIZE;
 #[cfg(feature = "platform-qemu-virt")]
 pub const PLAINTEXT_DRAM_BASE: usize = 0x4000_0000;
 
+// RPi5 (BCM2712): RAM starts at physical 0x0.
+// The firmware reserves the first ~512KB for its own use; the kernel loads
+// at 0x80000 (RPi convention). FDT describes the usable ranges at runtime.
+#[cfg(feature = "platform-bcm2712")]
+pub const PLAINTEXT_DRAM_BASE: usize = 0x0000_0000;
+
 #[cfg(feature = "platform-apple-t8103")]
 pub const PLAINTEXT_DRAM_BASE: usize = 0x8_0000_0000;
 
-#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
+#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-bcm2712", feature = "platform-apple-t8103")))]
 pub const PLAINTEXT_DRAM_BASE: usize = 0x4000_0000; // default to QEMU
 
 /// End of physical RAM.

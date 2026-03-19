@@ -11,6 +11,28 @@
 .section .text.boot, "ax"
 .globl _start
 _start:
+    // If we are at EL2 (e.g. RPi5 firmware drops us here), drop to EL1.
+    // At EL1 (QEMU default) this block is skipped entirely.
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2         // CurrentEL[3:2] → x1
+    cmp     x1, #2
+    b.ne    .Lat_el1
+
+    // Configure EL1 as AArch64 (HCR_EL2.RW = 1)
+    mov     x1, #(1 << 31)
+    msr     hcr_el2, x1
+
+    // SPSR_EL2: return to EL1h, all exceptions masked (DAIF = 0b1111)
+    mov     x1, #0x3c5
+    msr     spsr_el2, x1
+
+    // ELR_EL2: return to .Lat_el1 label
+    adr     x1, .Lat_el1
+    msr     elr_el2, x1
+
+    eret                        // → EL1, PC = .Lat_el1, DAIF masked
+
+.Lat_el1:
     // Mask all exceptions (DAIF)
     msr     daifset, #0xf
 

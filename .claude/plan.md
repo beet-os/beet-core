@@ -4,7 +4,7 @@
 
 A secure, minimal OS for AArch64, built on the Xous microkernel (cherry-picked from KeyOS). Multi-platform: runs on QEMU virt, Apple Silicon, and any AArch64 board. Microkernel architecture with all drivers in userspace. Early milestones run entirely from RAM (no disk needed).
 
-**Primary target:** QEMU `virt` machine (development & CI), then MacBook Air M1 (j313, Apple SoC T8103)
+**Primary target:** QEMU `virt` machine (development & CI), then Raspberry Pi 5 (BCM2712) and MacBook Air M1 (j313, Apple SoC T8103)
 **Language:** 100% Rust — no_std + alloc (no custom toolchain needed). Full std via custom Rust toolchain is a future milestone.
 **Rust target:** `aarch64-unknown-none` (standard, no fork required)
 **License:** MIT OR Apache-2.0 (Xous kernel code) + GPL-3.0 (KeyOS-derived code) — check per-file
@@ -24,16 +24,25 @@ All hardware-specific code lives in `platform/`. Adding a new platform = new pla
 ```
 xous/kernel/src/platform/
 ├── qemu_virt/       ← QEMU virt machine (GIC, PL011 UART, virtio) — FIRST target
-├── apple_t8103/     ← Apple M1 (AIC, m1n1, SPI keyboard, ANS NVMe) — SECOND target
+├── bcm2712/         ← Raspberry Pi 5 (GICv3, RP1 UART, ARM timer) — SECOND target
+├── apple_t8103/     ← Apple M1 (AIC, m1n1, SPI keyboard, ANS NVMe) — THIRD target
 └── rpi4/            ← Raspberry Pi 4 (future)
 ```
 
 QEMU virt is the **first hardware platform** because:
-- Any contributor can test AArch64 code without owning a Mac
-- QEMU virt has well-documented, standard hardware (GIC, PL011 UART, virtio) — much simpler than Apple's custom controllers
-- Faster iteration than m1n1 USB proxy
+- Any contributor can test AArch64 code without owning specific hardware
+- QEMU virt has well-documented, standard hardware (GIC, PL011 UART, virtio) — much simpler than proprietary controllers
+- Faster iteration, ideal for CI
 - `cargo xtask qemu` is the dream command for CI and contributors
-- The Apple M1 platform becomes the second target, after QEMU proves the arch layer works
+
+**Raspberry Pi 5 is the second hardware platform** because:
+- BCM2712 (Cortex-A76) supports 16KB pages natively — same as Apple M1, no special casing needed
+- GICv3 is the same interrupt controller architecture as QEMU virt — driver is largely reusable
+- ARM generic timer: identical ISA to QEMU virt and Apple M1 — zero new work
+- Real hardware is available (owned)
+- Hardware is documented; Linux kernel has BCM2712 and RP1 drivers as reference
+
+The Apple M1 platform becomes the third target, after RPi5 proves the arch layer works on real silicon.
 
 ### What we COPY from KeyOS (platform-agnostic, ~7500 LOC):
 
@@ -252,9 +261,58 @@ BeetOS boots on QEMU `virt`. Xous microkernel operational. Any developer can run
 
 ---
 
-## Milestone 3 — Apple M1 Platform & Hardware Boot
+## Milestone 3 — Raspberry Pi 5 Platform & Hardware Boot
 
-**Goal:** `platform/apple_t8103/`, boot via m1n1, "BeetOS v0.1.0" on screen. The `arch/aarch64/` layer is already proven on QEMU — this milestone only adds the Apple-specific platform code.
+**Goal:** `platform/bcm2712/`, boot on real Raspberry Pi 5, "BeetOS v0.1.0" on UART. First real silicon. The `arch/aarch64/` layer is proven on QEMU — this milestone adds the BCM2712 platform code.
+
+**Why RPi5 before Apple M1:**
+- GICv3 already implemented in `platform/qemu_virt/gic.rs` — largely reusable
+- ARM generic timer: identical ISA, zero new work
+- BCM2712 supports 16KB pages natively — no special casing, same as the rest of BeetOS
+- Hardware available; no proprietary boot chain (no m1n1 needed)
+
+### What's shared with QEMU virt (zero new code)
+
+- `arch/aarch64/` entirely — page tables, exception vectors, context switch
+- ARM generic timer driver — same CNTP registers, same IRQ routing through GIC
+- GICv3 distributor + CPU interface — same architecture, different MMIO base from FDT
+
+### What's new
+
+- **`platform/bcm2712/mod.rs`**: Platform init, FDT parsing (RAM base/size, GIC base, UART base, timer IRQ)
+- **`platform/bcm2712/gic.rs`**: Thin wrapper around the QEMU virt GIC driver with BCM2712-specific redistributor layout (GIC-600 topology may differ slightly)
+- **`platform/bcm2712/uart.rs`**: RP1 UART driver
+  - RP1 is a separate I/O chip (PCIe-attached); UART is PL011-compatible at the register level but at a different address and requires RP1 PCIe init first
+  - Reference: Linux `drivers/tty/serial/amba-pl011.c` + RPi5 device tree
+- **`platform/bcm2712/timer.rs`**: ARM generic timer (reuse QEMU virt timer, different IRQ number from FDT)
+- **Boot chain**: RPi5 bootloader (start.elf / config.txt) loads kernel8.img at 0x8_0000. `start.S` already handles this. Add `cargo xtask rpi5` to produce `kernel8.img`.
+
+### Tasks
+
+- [ ] **`platform/bcm2712/mod.rs`**: FDT parsing, call GIC/UART/timer init
+- [ ] **`platform/bcm2712/gic.rs`**: GICv3 init adapted for BCM2712 redistributor count
+- [ ] **`platform/bcm2712/uart.rs`**: RP1 UART (PL011-compatible registers, new base address)
+- [ ] **`platform/bcm2712/timer.rs`**: ARM generic timer, IRQ number from FDT
+- [ ] **`cargo xtask rpi5`**: Build `kernel8.img`, copy to SD card (or TFTP)
+- [ ] **Linker script** for BCM2712 memory layout (RAM at 0x0, kernel loaded at 0x8_0000)
+- [ ] Boot on real Raspberry Pi 5
+
+### Tests
+
+- [ ] UART shows "BeetOS v0.1.0" on RPi5 serial console
+- [ ] Timer ticks (periodic IRQ via GICv3)
+- [ ] GICv3 handles interrupts correctly
+- [ ] Shell prompt appears
+
+### Definition of Done
+
+BeetOS boots on real Raspberry Pi 5. `cargo xtask rpi5` produces a bootable image. Same arch layer as QEMU — only `platform/bcm2712/` is new.
+
+---
+
+## Milestone 3b — Apple M1 Platform & Hardware Boot
+
+**Goal:** `platform/apple_t8103/`, boot via m1n1, "BeetOS v0.1.0" on screen. After RPi5 proves the multi-platform architecture on open silicon, this milestone adds Apple-specific platform code.
 
 ### Tasks
 
@@ -277,11 +335,10 @@ BeetOS boots on QEMU `virt`. Xous microkernel operational. Any developer can run
 - [ ] Screen shows "BeetOS v0.1.0"
 - [ ] Timer ticks
 - [ ] AIC handles interrupts correctly
-- [ ] Name server and ticktimer server running
 
 ### Definition of Done
 
-BeetOS boots on real Apple M1 hardware. Same kernel binary (modulo platform selection), same arch layer that was proven on QEMU.
+BeetOS boots on real Apple M1 hardware. Same kernel binary (modulo platform selection), same arch layer proven on QEMU and RPi5.
 
 ---
 

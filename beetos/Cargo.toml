@@ -14,6 +14,7 @@ default = []
 rustc-dep-of-std = ['core']
 # Platform selection — affects RAM base address and max RAM size
 platform-qemu-virt = []
+platform-bcm2712 = []
 platform-apple-t8103 = []
 
 [lints.rust]

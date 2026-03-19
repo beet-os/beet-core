@@ -292,12 +292,11 @@ pub unsafe fn enable_mmu(fdt_ptr: *const u8) -> BootInfo {
     let l1_page = bump.alloc_page();
     let l1_table = l1_page as *mut u64;
 
-    // We need L2 tables for: MMIO region (0x0000_0000..0x4000_0000) and RAM.
-    // Each L1 entry covers 64 GiB. Both MMIO and RAM on QEMU virt are within
-    // the first 64 GiB (L1 index 0), so we need just one L2 table.
+    // We need L2 tables for MMIO and RAM. Each L1 entry covers 64 GiB.
     //
-    // For Apple M1, RAM starts at 0x8_0000_0000 which is in L1 index 0 as well
-    // (covers 0..64GiB). So one L2 table suffices for now.
+    // QEMU virt: MMIO (0..0x4000_0000) + RAM (0x4000_0000+) — both in L1[0].
+    // Apple M1: RAM at 0x8_0000_0000 — still in L1[0] (0..64GiB).
+    // BCM2712 (RPi5): RAM at 0x0, peripherals at ~66GiB → needs L1[0] + L1[1].
     let l2_page = bump.alloc_page();
     let l2_table = l2_page as *mut u64;
 
@@ -305,28 +304,52 @@ pub unsafe fn enable_mmu(fdt_ptr: *const u8) -> BootInfo {
     let l1_desc = (l2_page as u64 & super::mem::PTE_ADDR_MASK) | DESC_VALID | DESC_TABLE;
     core::ptr::write_volatile(l1_table.add(0), l1_desc);
 
-    // 5. Map MMIO region as device memory (L2 blocks)
-    // QEMU virt: GIC at 0x0800_0000, UART at 0x0900_0000, RTC at 0x0A00_0000
-    // Map 0x0000_0000..0x4000_0000 as device memory (32 × 32MB = 1GiB)
-    // This is overly broad but safe — unmapped regions just won't be accessed.
-    let mmio_start = 0x0000_0000_usize;
-    let mmio_end = ram_base; // MMIO space ends where RAM begins
-    let mmio_blocks = (mmio_end - mmio_start) / L2_BLOCK_SIZE;
-    for i in 0..mmio_blocks {
-        let phys = mmio_start + i * L2_BLOCK_SIZE;
-        let l2_idx = phys / L2_BLOCK_SIZE;
-        let desc = (phys as u64 & L2_BLOCK_ADDR_MASK) | BLOCK_DEVICE_RW;
-        core::ptr::write_volatile(l2_table.add(l2_idx), desc);
+    // 5. Map MMIO region below RAM as device memory (L2 blocks).
+    // QEMU virt: 0..0x4000_0000 (GIC + UART below RAM).
+    // BCM2712: RAM starts at 0x0, so this range is empty (no-op).
+    if ram_base > 0 {
+        let mmio_blocks = ram_base / L2_BLOCK_SIZE;
+
+        for i in 0..mmio_blocks {
+            let phys = i * L2_BLOCK_SIZE;
+            let l2_idx = phys / L2_BLOCK_SIZE;
+            let desc = (phys as u64 & L2_BLOCK_ADDR_MASK) | BLOCK_DEVICE_RW;
+            core::ptr::write_volatile(l2_table.add(l2_idx), desc);
+        }
     }
 
-    // 6. Map RAM as normal memory (L2 blocks)
+    // 6. Map RAM as normal memory (L2 blocks).
     let ram_blocks = (ram_size + L2_BLOCK_SIZE - 1) / L2_BLOCK_SIZE;
+
     for i in 0..ram_blocks {
         let phys = ram_base + i * L2_BLOCK_SIZE;
         let l2_idx = phys / L2_BLOCK_SIZE;
+
         if l2_idx < TABLE_ENTRIES {
             let desc = (phys as u64 & L2_BLOCK_ADDR_MASK) | BLOCK_NORMAL_RWX;
             core::ptr::write_volatile(l2_table.add(l2_idx), desc);
+        }
+    }
+
+    // 6b. BCM2712: map high peripherals (>64GiB) in L1[1].
+    // UART0 at 0x107D001000 and GIC at 0x107FFF9000 are both above 64GiB,
+    // in L1[1] (covers 64GiB..128GiB). We map two 32MB blocks covering them.
+    #[cfg(feature = "platform-bcm2712")]
+    {
+        // L1[1] covers physical 0x10_0000_0000..0x20_0000_0000 (64GiB..128GiB).
+        const L1_1_BASE: usize = 64 * 1024 * 1024 * 1024; // 64GiB
+        let l2_hi_page = bump.alloc_page();
+        let l2_hi_table = l2_hi_page as *mut u64;
+        let l1_hi_desc = (l2_hi_page as u64 & super::mem::PTE_ADDR_MASK) | DESC_VALID | DESC_TABLE;
+        core::ptr::write_volatile(l1_table.add(1), l1_hi_desc);
+
+        // Map blocks 62..=63 within L1[1]'s L2 table:
+        //   block 62: 0x107C000000..0x107DFFFFFF (covers UART at 0x107D001000)
+        //   block 63: 0x107E000000..0x107FFFFFFF (covers GIC  at 0x107FFF9000)
+        for block in 62usize..=63 {
+            let phys = L1_1_BASE + block * L2_BLOCK_SIZE;
+            let desc = (phys as u64 & L2_BLOCK_ADDR_MASK) | BLOCK_DEVICE_RW;
+            core::ptr::write_volatile(l2_hi_table.add(block), desc);
         }
     }
 
