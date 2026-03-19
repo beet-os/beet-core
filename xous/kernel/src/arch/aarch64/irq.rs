@@ -178,7 +178,7 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
         use core::sync::atomic::{AtomicU32, Ordering};
         static SVC_COUNT: AtomicU32 = AtomicU32::new(0);
         let n = SVC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 20 {
+        if n <= 30 {
             use core::fmt::Write;
             let _ = write!(
                 crate::platform::qemu_virt::uart::UartWriter,
@@ -212,7 +212,7 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
         use core::sync::atomic::{AtomicU32, Ordering};
         static SVC_RESULT_COUNT: AtomicU32 = AtomicU32::new(0);
         let n = SVC_RESULT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 20 {
+        if n <= 30 {
             use core::fmt::Write;
             let resume_pid = crate::arch::process::current_pid();
             if resume_pid != caller_pid {

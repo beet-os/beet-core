@@ -438,28 +438,124 @@ pub unsafe fn init_memory_manager(info: &BootInfo) {
 // ============================================================================
 
 /// User process virtual addresses.
-/// Placed at 4 GiB mark to avoid conflicting with the kernel identity map (0..2 GiB).
-const USER_CODE_VA: usize = 0x0000_0001_0000_0000; // 4 GiB
-const USER_STACK_VA: usize = 0x0000_0001_0001_0000; // 4 GiB + 64KB
+/// Must be in a different L1 index than the kernel identity map (L1[0]).
+/// With 16KB granule, L1 entries cover 64 GiB each:
+///   L1[0] = 0x0_0000_0000..0xF_FFFF_FFFF  (kernel identity map)
+///   L1[1] = 0x10_0000_0000..0x1F_FFFF_FFFF (user space)
+const USER_CODE_VA: usize = 0x0000_0010_0000_0000; // 64 GiB (L1[1])
+const USER_STACK_VA: usize = 0x0000_0010_0001_0000; // 64 GiB + 64KB
 
-/// Minimal AArch64 user program: GetProcessId syscall, then Yield in a loop.
-/// This is the raw machine code that will be mapped as the user's .text page.
+/// IPC server program (PID 2): creates a server, then loops receiving messages.
 ///
 /// ```asm
-///     mov x0, #33          // SysCallNumber::GetProcessId = 33
-///     svc #0               // trap to EL1
-///     // On return: X0 = result tag (8 = ProcessID), X1 = PID value
-/// .loop:
-///     mov x0, #3           // SysCallNumber::Yield = 3
+///     // CreateServerWithAddress(SID=[0xBEE70001, 0, 0, 0], range=0..0)
+///     mov x0, #14             // SysCallNumber::CreateServerWithAddress = 14
+///     movz x1, #0x0001        // SID word 0 low half
+///     movk x1, #0xBEE7, lsl #16  // SID word 0 = 0xBEE70001
+///     mov x2, #0              // SID word 1
+///     mov x3, #0              // SID word 2
+///     mov x4, #0              // SID word 3
+///     mov x5, #0              // range.start
+///     mov x8, #0              // range.end (arg6)
 ///     svc #0
-///     b .loop
+/// .recv:
+///     // ReceiveMessage(SID)
+///     mov x0, #15             // SysCallNumber::ReceiveMessage = 15
+///     movz x1, #0x0001
+///     movk x1, #0xBEE7, lsl #16
+///     mov x2, #0
+///     mov x3, #0
+///     mov x4, #0
+///     svc #0
+///     // Got a message! Yield then receive again.
+///     mov x0, #3              // Yield
+///     svc #0
+///     b .recv
 /// ```
-static USER_PROGRAM: [u32; 5] = [
-    0xd280_0420, // mov x0, #33 (GetProcessId)
+static SERVER_PROGRAM: [u32; 19] = [
+    // CreateServerWithAddress
+    0xd280_01c0, // mov x0, #14
+    0xd280_0021, // movz x1, #0x0001
+    0xf2b7_dce1, // movk x1, #0xBEE7, lsl #16
+    0xd280_0002, // mov x2, #0
+    0xd280_0003, // mov x3, #0
+    0xd280_0004, // mov x4, #0
+    0xd280_0005, // mov x5, #0
+    0xd280_0008, // mov x8, #0
+    0xd400_0001, // svc #0
+    // .recv:
+    0xd280_01e0, // mov x0, #15 (ReceiveMessage)
+    0xd280_0021, // movz x1, #0x0001
+    0xf2b7_dce1, // movk x1, #0xBEE7, lsl #16
+    0xd280_0002, // mov x2, #0
+    0xd280_0003, // mov x3, #0
+    0xd280_0004, // mov x4, #0
     0xd400_0001, // svc #0
     0xd280_0060, // mov x0, #3 (Yield)
     0xd400_0001, // svc #0
-    0x17ff_fffe, // b .-8 (branch back to mov x0, #3)
+    0x17ff_fff7, // b .recv (back 9 insns)
+];
+
+/// IPC client program (PID 3): yields, connects, then loops sending Scalar messages.
+///
+/// ```asm
+///     mov x0, #3              // Yield (let server register)
+///     svc #0
+///     mov x0, #3              // Yield again
+///     svc #0
+///     // Connect(SID=[0xBEE70001, 0, 0, 0])
+///     mov x0, #17             // SysCallNumber::Connect = 17
+///     movz x1, #0x0001
+///     movk x1, #0xBEE7, lsl #16
+///     mov x2, #0
+///     mov x3, #0
+///     mov x4, #0
+///     svc #0
+///     // X1 = CID. Save in x20.
+///     mov x20, x1
+/// .send:
+///     // SendMessage(CID, Scalar{id=42, arg1=0xCAFE, arg2=0xBEEF, arg3=0, arg4=0})
+///     mov x0, #16             // SysCallNumber::SendMessage = 16
+///     mov x1, x20             // CID
+///     mov x2, #4              // message_type = Scalar
+///     mov x3, #42             // message_id
+///     movz x4, #0xCAFE        // arg1
+///     movz x5, #0xBEEF        // arg2
+///     mov x8, #0              // arg3
+///     mov x9, #0              // arg4
+///     svc #0
+///     mov x0, #3              // Yield (give server time to process)
+///     svc #0
+///     b .send
+/// ```
+static CLIENT_PROGRAM: [u32; 24] = [
+    // Yield twice
+    0xd280_0060, // mov x0, #3 (Yield)
+    0xd400_0001, // svc #0
+    0xd280_0060, // mov x0, #3 (Yield)
+    0xd400_0001, // svc #0
+    // Connect
+    0xd280_0220, // mov x0, #17 (Connect)
+    0xd280_0021, // movz x1, #0x0001
+    0xf2b7_dce1, // movk x1, #0xBEE7, lsl #16
+    0xd280_0002, // mov x2, #0
+    0xd280_0003, // mov x3, #0
+    0xd280_0004, // mov x4, #0
+    0xd400_0001, // svc #0
+    0xaa01_03f4, // mov x20, x1 (save CID)
+    // .send: (offset 12)
+    0xd280_0200, // mov x0, #16 (SendMessage)
+    0xaa14_03e1, // mov x1, x20 (CID)
+    0xd280_0082, // mov x2, #4 (Scalar)
+    0xd280_0543, // mov x3, #42 (message_id)
+    0xd299_5fc4, // movz x4, #0xCAFE (arg1)
+    0xd297_dde5, // movz x5, #0xBEEF (arg2)
+    0xd280_0008, // mov x8, #0 (arg3)
+    0xd280_0009, // mov x9, #0 (arg4)
+    0xd400_0001, // svc #0
+    0xd280_0060, // mov x0, #3 (Yield)
+    0xd400_0001, // svc #0
+    0x17ff_fff4, // b .send (back 12 insns)
 ];
 
 /// Create a user process: allocate address space, map code + stack, register in SystemServices.
@@ -500,6 +596,7 @@ unsafe fn create_user_process(
             mm, code_phys, USER_CODE_VA as *mut usize,
             MemoryFlags::X, true,
         ).expect("map code page");
+
 
         // Allocate and map user stack page (RW at EL0)
         let (stack_phys, _) = mm.alloc_range(1, pid).expect("alloc stack page");
@@ -563,10 +660,11 @@ pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
     let pid2 = PID::new(2).unwrap();
     let pid3 = PID::new(3).unwrap();
 
-    // Create two user processes, both running the same Yield-loop program.
-    // They have separate address spaces (different TTBR0/ASID).
-    create_user_process(boot_info, pid2, &USER_PROGRAM, b"server");
-    create_user_process(boot_info, pid3, &USER_PROGRAM, b"client");
+    // Create two user processes with separate address spaces.
+    // PID 2 = IPC server (creates server, receives messages)
+    // PID 3 = IPC client (connects, sends Scalar messages)
+    create_user_process(boot_info, pid2, &SERVER_PROGRAM, b"server");
+    create_user_process(boot_info, pid3, &CLIENT_PROGRAM, b"client");
 
     // Build a context frame for the initial ERET to PID 2.
     // After PID 2 Yields, the scheduler picks PID 3 (next in queue),
