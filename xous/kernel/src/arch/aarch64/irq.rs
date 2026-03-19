@@ -355,7 +355,9 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
 }
 
 /// Handle a data or instruction abort.
-unsafe fn _handle_abort(_context: *mut u8, esr: u64, is_instruction: bool) {
+unsafe fn _handle_abort(context: *mut u8, esr: u64, is_instruction: bool) {
+    use super::process::Thread;
+
     let far: u64;
     core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
 
@@ -366,29 +368,52 @@ unsafe fn _handle_abort(_context: *mut u8, esr: u64, is_instruction: bool) {
     let abort_type = if is_instruction { "IABT" } else { "DABT" };
     let iss = esr & 0x01FF_FFFF;
     let dfsc = iss & 0x3F; // Data/Instruction Fault Status Code
+    let wnr = (iss >> 6) & 1; // Write-not-Read
 
     #[cfg(feature = "platform-qemu-virt")]
     {
         use core::fmt::Write;
+        let frame = context as *const Thread;
+        let sp = (*frame).sp;
+        let lr = (*frame).gpr[30];
         let _ = write!(
             crate::platform::qemu_virt::uart::UartWriter,
+            "ABORT: PID {} {} at PC={:#x} FAR={:#x} ESR={:#x} DFSC={:#x} WnR={} SP={:#x} LR={:#x}\n",
+            pid, abort_type, elr, far, esr, dfsc, wnr, sp, lr,
+        );
+    }
+
+    #[cfg(feature = "platform-bcm2712")]
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            crate::platform::bcm2712::uart::UartWriter,
             "ABORT: PID {} {} at PC={:#x} FAR={:#x} ESR={:#x} DFSC={:#x}\n",
             pid, abort_type, elr, far, esr, dfsc,
         );
     }
 
-    // TODO: Determine fault type from ISS:
-    //   - Translation fault (DFSC 0x04..0x07) → allocate page (demand paging)
-    //   - Permission fault (DFSC 0x0C..0x0F) → check if COW, else kill process
-    //   - Alignment fault (DFSC 0x21) → kill process
-    // For now, halt the process by looping forever.
-    loop {
-        core::arch::asm!("wfe", options(nomem, nostack));
-    }
+    // Terminate the faulting process and switch to the next runnable process.
+    // This prevents a single crashed process from halting the entire system.
+    let frame = context as *mut Thread;
+    let proc = super::process::Process::current();
+    let tid = proc.current_tid();
+    proc.save_context_to_table(tid, frame);
+
+    crate::services::SystemServices::with_mut(|ss| {
+        let _ = ss.terminate_current_process(u32::MAX);
+    });
+
+    // Load the next process's context into the frame for ERET.
+    let resume_proc = super::process::Process::current();
+    let resume_tid = resume_proc.current_tid();
+    resume_proc.load_context_from_table(resume_tid, frame);
 }
 
 /// Handle an unknown exception type.
-unsafe fn _handle_unknown(_context: *mut u8, esr: u64) {
+unsafe fn _handle_unknown(context: *mut u8, esr: u64) {
+    use super::process::Thread;
+
     let pid = crate::arch::process::current_pid();
 
     #[cfg(feature = "platform-qemu-virt")]
@@ -401,7 +426,27 @@ unsafe fn _handle_unknown(_context: *mut u8, esr: u64) {
         );
     }
 
-    loop {
-        core::arch::asm!("wfe", options(nomem, nostack));
+    #[cfg(feature = "platform-bcm2712")]
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            crate::platform::bcm2712::uart::UartWriter,
+            "UNKNOWN EXCEPTION: PID {} ESR={:#x}\n",
+            pid, esr,
+        );
     }
+
+    // Terminate the faulting process and switch to the next runnable process.
+    let frame = context as *mut Thread;
+    let proc = super::process::Process::current();
+    let tid = proc.current_tid();
+    proc.save_context_to_table(tid, frame);
+
+    crate::services::SystemServices::with_mut(|ss| {
+        let _ = ss.terminate_current_process(u32::MAX);
+    });
+
+    let resume_proc = super::process::Process::current();
+    let resume_tid = resume_proc.current_tid();
+    resume_proc.load_context_from_table(resume_tid, frame);
 }
