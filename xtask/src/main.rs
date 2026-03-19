@@ -9,6 +9,7 @@ fn main() -> anyhow::Result<()> {
         Some("check") => check()?,
         Some("build") => build(&args[1..])?,
         Some("qemu") => qemu(&args[1..])?,
+        Some("rpi5") => rpi5()?,
         Some(cmd) => anyhow::bail!("unknown command: {cmd}"),
         None => {
             println!("BeetOS xtask build system");
@@ -124,12 +125,14 @@ fn build(args: &[String]) -> anyhow::Result<()> {
 
     let feature = match platform.as_str() {
         "qemu-virt" => "platform-qemu-virt",
+        "bcm2712" => "platform-bcm2712",
         "apple-t8103" => "platform-apple-t8103",
         other => anyhow::bail!("unknown platform: {other}"),
     };
 
     let linker_script = match platform.as_str() {
         "qemu-virt" => root.join("xous/kernel/link-qemu-virt.x"),
+        "bcm2712" => root.join("xous/kernel/link-bcm2712.x"),
         "apple-t8103" => root.join("xous/kernel/link-aarch64.x"),
         _ => unreachable!(),
     };
@@ -157,6 +160,49 @@ fn build(args: &[String]) -> anyhow::Result<()> {
     let binary = root
         .join("target/aarch64-unknown-none/debug/beetos-kernel");
     println!("Built: {}", binary.display());
+
+    Ok(())
+}
+
+/// Build a kernel8.img for Raspberry Pi 5 (BCM2712).
+///
+/// kernel8.img is a raw binary (ELF stripped to flat binary) placed in the
+/// root of the SD card. The RPi5 firmware loads it at physical 0x80000.
+///
+/// Usage:
+///   cargo xtask rpi5
+///   # Then copy kernel8.img to the SD card root
+fn rpi5() -> anyhow::Result<()> {
+    let args = vec!["--platform".to_string(), "bcm2712".to_string()];
+    build(&args)?;
+
+    let root = workspace_root();
+    let elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    let img = root.join("kernel8.img");
+
+    anyhow::ensure!(elf.exists(), "kernel ELF not found at {}", elf.display());
+
+    // Convert ELF to flat binary with llvm-objcopy or rust-objcopy
+    let status = Command::new("llvm-objcopy")
+        .args(["-O", "binary"])
+        .arg(&elf)
+        .arg(&img)
+        .status()
+        .or_else(|_| {
+            Command::new("rust-objcopy")
+                .args(["-O", "binary"])
+                .arg(&elf)
+                .arg(&img)
+                .status()
+        })?;
+
+    anyhow::ensure!(status.success(), "objcopy failed");
+
+    let size = std::fs::metadata(&img)?.len();
+    println!("Built: {} ({} bytes)", img.display(), size);
+    println!();
+    println!("Copy kernel8.img to the root of your RPi5 SD card:");
+    println!("  cp {} /Volumes/bootfs/kernel8.img", img.display());
 
     Ok(())
 }

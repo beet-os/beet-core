@@ -171,8 +171,31 @@ fn handle_irq() -> bool {
         return is_timer;
     }
 
+    #[cfg(feature = "platform-bcm2712")]
+    {
+        use crate::platform::bcm2712::{gic, timer};
+
+        let irq = gic::ack_irq();
+        if irq == gic::IRQ_SPURIOUS {
+            return false;
+        }
+
+        let is_timer = irq == timer::TIMER_IRQ;
+
+        match irq {
+            timer::TIMER_IRQ => { timer::handle_tick(); }
+            irq_id => {
+                use core::fmt::Write;
+                let _ = write!(crate::platform::bcm2712::uart::UartWriter, "IRQ {}\n", irq_id);
+            }
+        }
+
+        gic::eoi(irq);
+        return is_timer;
+    }
+
     #[cfg(feature = "platform-apple-t8103")]
-    { /* TODO(M3): AIC dispatch */ false }
+    { /* TODO(M3b): AIC dispatch */ false }
 }
 
 /// Send a received UART character to the console/shell server via IPC.

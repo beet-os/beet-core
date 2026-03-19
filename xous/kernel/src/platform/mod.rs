@@ -4,6 +4,9 @@
 #[cfg(feature = "platform-qemu-virt")]
 pub mod qemu_virt;
 
+#[cfg(feature = "platform-bcm2712")]
+pub mod bcm2712;
+
 #[cfg(feature = "platform-apple-t8103")]
 pub mod apple_t8103;
 
@@ -13,11 +16,14 @@ pub mod rand;
 #[cfg(feature = "platform-qemu-virt")]
 pub fn init() { self::qemu_virt::init(); }
 
+#[cfg(feature = "platform-bcm2712")]
+pub fn init() { self::bcm2712::init(); }
+
 #[cfg(feature = "platform-apple-t8103")]
 pub fn init() { self::apple_t8103::init(); }
 
 /// Platform init stub for hosted mode (no platform hardware).
-#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
+#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-bcm2712", feature = "platform-apple-t8103")))]
 #[allow(dead_code)]
 pub fn init() {}
 
@@ -25,10 +31,13 @@ pub fn init() {}
 #[cfg(feature = "platform-qemu-virt")]
 pub fn shutdown() -> ! { self::qemu_virt::shutdown(); }
 
+#[cfg(feature = "platform-bcm2712")]
+pub fn shutdown() -> ! { self::bcm2712::shutdown(); }
+
 #[cfg(feature = "platform-apple-t8103")]
 pub fn shutdown() -> ! { self::apple_t8103::shutdown(); }
 
-#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
+#[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-bcm2712", feature = "platform-apple-t8103")))]
 #[allow(dead_code)]
 pub fn shutdown() -> ! { loop { core::hint::spin_loop() } }
 
@@ -39,6 +48,8 @@ pub mod cache {
     pub fn clean_cache_l1() {
         #[cfg(feature = "platform-qemu-virt")]
         crate::platform::qemu_virt::cache::clean_cache_l1();
+        #[cfg(feature = "platform-bcm2712")]
+        crate::platform::bcm2712::cache::clean_cache_l1();
         #[cfg(feature = "platform-apple-t8103")]
         crate::platform::apple_t8103::cache::clean_cache_l1();
     }
@@ -46,6 +57,8 @@ pub mod cache {
     pub fn clean_cache_l2() {
         #[cfg(feature = "platform-qemu-virt")]
         crate::platform::qemu_virt::cache::clean_cache_l2();
+        #[cfg(feature = "platform-bcm2712")]
+        crate::platform::bcm2712::cache::clean_cache_l2();
         #[cfg(feature = "platform-apple-t8103")]
         crate::platform::apple_t8103::cache::clean_cache_l2();
     }
@@ -53,6 +66,8 @@ pub mod cache {
     pub fn print_cache_stats() {
         #[cfg(feature = "platform-qemu-virt")]
         crate::platform::qemu_virt::cache::print_cache_stats();
+        #[cfg(feature = "platform-bcm2712")]
+        crate::platform::bcm2712::cache::print_cache_stats();
         #[cfg(feature = "platform-apple-t8103")]
         crate::platform::apple_t8103::cache::print_cache_stats();
     }
@@ -65,6 +80,8 @@ pub mod wdt {
     pub fn restart() {
         #[cfg(feature = "platform-qemu-virt")]
         crate::platform::qemu_virt::wdt::restart();
+        #[cfg(feature = "platform-bcm2712")]
+        crate::platform::bcm2712::wdt::restart();
         #[cfg(feature = "platform-apple-t8103")]
         crate::platform::apple_t8103::wdt::restart();
     }
