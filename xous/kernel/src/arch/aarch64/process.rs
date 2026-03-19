@@ -351,17 +351,54 @@ impl Process {
             })?
         };
 
-        // Allocate a user stack (64 pages = 1MB with 16KB pages).
+        // Allocate and map user stack pages (64 pages = 1MB with 16KB pages).
         let stack_pages = beetos::STACK_PAGE_COUNT;
         let stack_size = stack_pages * beetos::PAGE_SIZE;
         let stack_base = beetos::USER_STACK_BOTTOM - stack_size;
         let stack = unsafe { MemoryRange::new(stack_base, stack_size).map_err(|_| Error::BadAddress)? };
 
-        // Allocate an IRQ stack (3 pages).
+        // Guard page: leave one unmapped page below the stack.
+        // Stack overflow → translation fault instead of silent corruption.
+        // (The guard page is simply never mapped — no allocation needed.)
+
+        unsafe {
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let process = services.process_mut(pid)?;
+                // Map each stack page
+                for i in 0..stack_pages {
+                    let va = stack_base + i * beetos::PAGE_SIZE;
+                    let (phys, _) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
+                    core::ptr::write_bytes(phys as *mut u8, 0, beetos::PAGE_SIZE);
+                    process.mapping.map_page(
+                        mm, phys, va as *mut usize,
+                        xous::MemoryFlags::W, true,
+                    )?;
+                }
+                Ok::<(), Error>(())
+            })?;
+        }
+
+        // Allocate and map IRQ stack pages (3 pages).
         let irq_stack_pages = beetos::USER_IRQ_STACK_PAGE_COUNT;
         let irq_stack_size = irq_stack_pages * beetos::PAGE_SIZE;
         let irq_stack_base = beetos::USER_IRQ_STACK_BOTTOM - irq_stack_size;
         let irq_stack = unsafe { MemoryRange::new(irq_stack_base, irq_stack_size).map_err(|_| Error::BadAddress)? };
+
+        unsafe {
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let process = services.process_mut(pid)?;
+                for i in 0..irq_stack_pages {
+                    let va = irq_stack_base + i * beetos::PAGE_SIZE;
+                    let (phys, _) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
+                    core::ptr::write_bytes(phys as *mut u8, 0, beetos::PAGE_SIZE);
+                    process.mapping.map_page(
+                        mm, phys, va as *mut usize,
+                        xous::MemoryFlags::W, true,
+                    )?;
+                }
+                Ok::<(), Error>(())
+            })?;
+        }
 
         // Set up the initial thread context with the ELF entry point.
         Self::setup_process(

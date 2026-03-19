@@ -83,6 +83,9 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     // Initialize the MemoryManager with the bootstrap page tracker
     arch::boot::init_memory_manager(&boot_info);
 
+    // Store the boot TTBR0 so user process page tables can include kernel mappings
+    arch::mem::set_kernel_boot_ttbr0(boot_info.ttbr0);
+
     // Initialize PID1 (kernel process) with all exceptions masked
     // to avoid timer interrupt storm during the large memset.
     core::arch::asm!("msr daifset, #0xf", options(nomem, nostack));

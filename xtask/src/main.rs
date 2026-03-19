@@ -64,9 +64,59 @@ fn parse_platform(args: &[String]) -> String {
     "qemu-virt".to_string()
 }
 
+/// Build userspace binaries (apps/) for aarch64-unknown-none.
+fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
+    let user_linker = root.join("apps/link-user.x");
+    let linker_arg = format!("-Clink-arg=-T{}", user_linker.display());
+
+    let target_dir = root.join("target/aarch64-unknown-none/debug");
+
+    // Build all app crates
+    for app in &["hello"] {
+        println!("Building app: {app}");
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "--package",
+                app,
+                "--target",
+                "aarch64-unknown-none",
+            ])
+            .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1"))
+            .status()?;
+        anyhow::ensure!(status.success(), "building app '{app}' failed");
+
+        // Strip debug info to keep the embedded ELF small
+        let elf = target_dir.join(app);
+        let stripped = target_dir.join(format!("{app}.stripped"));
+        let status = Command::new("llvm-strip")
+            .args(["--strip-debug", "-o"])
+            .arg(&stripped)
+            .arg(&elf)
+            .status()
+            .or_else(|_| {
+                // Fallback to rust-objcopy from cargo-binutils
+                Command::new("rust-objcopy")
+                    .args(["--strip-debug"])
+                    .arg(&elf)
+                    .arg(&stripped)
+                    .status()
+            })?;
+        anyhow::ensure!(status.success(), "stripping app '{app}' failed");
+
+        let size = std::fs::metadata(&stripped)?.len();
+        println!("  {app}.stripped: {size} bytes");
+    }
+
+    Ok(())
+}
+
 fn build(args: &[String]) -> anyhow::Result<()> {
     let platform = parse_platform(args);
     let root = workspace_root();
+
+    // Build userspace apps first (kernel embeds them via include_bytes!)
+    build_apps(&root)?;
 
     let feature = match platform.as_str() {
         "qemu-virt" => "platform-qemu-virt",

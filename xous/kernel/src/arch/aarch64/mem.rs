@@ -158,6 +158,21 @@ fn flags_to_pte(flags: MemoryFlags, user: bool) -> u64 {
     pte
 }
 
+/// Boot-time kernel TTBR0 (identity-map L1 table).
+/// Set once during early boot; read by `MemoryMapping::allocate()` to copy
+/// the kernel's L1[0] entry into every user process's page table.
+static mut KERNEL_BOOT_TTBR0: usize = 0;
+
+/// Store the kernel's boot TTBR0 so it can be shared with user processes.
+///
+/// # Safety
+///
+/// Must be called exactly once during early boot, before any user processes
+/// are created.
+pub unsafe fn set_kernel_boot_ttbr0(ttbr0: usize) {
+    KERNEL_BOOT_TTBR0 = ttbr0;
+}
+
 /// The memory mapping for a single process.
 /// On AArch64, this is essentially the TTBR0_EL1 value (user page table root)
 /// plus the ASID.
@@ -198,6 +213,7 @@ impl MemoryMapping {
     }
 
     /// Get the physical address of the L1 page table.
+    #[allow(dead_code)]
     pub fn ttbr0(&self) -> usize {
         self.ttbr0
     }
@@ -231,6 +247,37 @@ impl MemoryMapping {
         // Zero the L1 table
         let l1_ptr = l1_phys as *mut u8;
         core::ptr::write_bytes(l1_ptr, 0, PAGE_SIZE);
+
+        // Deep-copy the kernel's identity-map page tables into the user L1.
+        //
+        // The kernel runs identity-mapped via TTBR0 with code/data in L1[0].
+        // User processes switch TTBR0 on context switch, so their L1 must include
+        // the kernel mapping for syscall/exception handlers to work.
+        //
+        // We cannot just copy the L1[0] entry (which points to the kernel's L2
+        // table) because load_elf might overlay L3 pages on top of L2 entries
+        // for user code at low VAs. If they shared the same L2 table, that
+        // would corrupt the kernel's device mappings.
+        //
+        // Instead, allocate a fresh L2 table and copy the kernel's L2 contents.
+        let kernel_ttbr0 = KERNEL_BOOT_TTBR0;
+        if kernel_ttbr0 != 0 {
+            let kernel_l1 = kernel_ttbr0 as *const u64;
+            let kernel_l1_entry0 = core::ptr::read_volatile(kernel_l1);
+            if kernel_l1_entry0 & PTE_VALID != 0 {
+                // Allocate a new L2 table for this process
+                let new_l2 = crate::mem::MemoryManager::with_mut(|mm| {
+                    mm.alloc_range(1, pid).map(|(addr, _)| addr).map_err(|_| Error::OutOfMemory)
+                })?;
+                // Copy the kernel's L2 contents
+                let kernel_l2 = (kernel_l1_entry0 & PTE_ADDR_MASK) as *const u8;
+                core::ptr::copy_nonoverlapping(kernel_l2, new_l2 as *mut u8, PAGE_SIZE);
+                // Point user L1[0] at the new L2 copy
+                let user_l1 = l1_phys as *mut u64;
+                let desc = (new_l2 as u64 & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
+                core::ptr::write_volatile(user_l1, desc);
+            }
+        }
 
         self.ttbr0 = l1_phys;
         self.pid = pid.get() as usize;

@@ -277,18 +277,53 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
 }
 
 /// Handle a data or instruction abort.
-unsafe fn _handle_abort(_context: *mut u8, _esr: u64, _is_instruction: bool) {
+unsafe fn _handle_abort(_context: *mut u8, esr: u64, is_instruction: bool) {
     let far: u64;
     core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
 
+    let elr: u64;
+    core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
+
+    let pid = crate::arch::process::current_pid();
+    let abort_type = if is_instruction { "IABT" } else { "DABT" };
+    let iss = esr & 0x01FF_FFFF;
+    let dfsc = iss & 0x3F; // Data/Instruction Fault Status Code
+
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            crate::platform::qemu_virt::uart::UartWriter,
+            "ABORT: PID {} {} at PC={:#x} FAR={:#x} ESR={:#x} DFSC={:#x}\n",
+            pid, abort_type, elr, far, esr, dfsc,
+        );
+    }
+
     // TODO: Determine fault type from ISS:
-    //   - Translation fault → allocate page (demand paging)
-    //   - Permission fault → check if COW, else kill process
-    //   - Alignment fault → kill process
-    let _ = far;
+    //   - Translation fault (DFSC 0x04..0x07) → allocate page (demand paging)
+    //   - Permission fault (DFSC 0x0C..0x0F) → check if COW, else kill process
+    //   - Alignment fault (DFSC 0x21) → kill process
+    // For now, halt the process by looping forever.
+    loop {
+        core::arch::asm!("wfe", options(nomem, nostack));
+    }
 }
 
 /// Handle an unknown exception type.
-unsafe fn _handle_unknown(_context: *mut u8, _esr: u64) {
-    // TODO: Log the exception and terminate the process
+unsafe fn _handle_unknown(_context: *mut u8, esr: u64) {
+    let pid = crate::arch::process::current_pid();
+
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            crate::platform::qemu_virt::uart::UartWriter,
+            "UNKNOWN EXCEPTION: PID {} ESR={:#x}\n",
+            pid, esr,
+        );
+    }
+
+    loop {
+        core::arch::asm!("wfe", options(nomem, nostack));
+    }
 }

@@ -434,203 +434,98 @@ pub unsafe fn init_memory_manager(info: &BootInfo) {
 }
 
 // ============================================================================
-// Minimal EL0 process launch
+// ELF-based process launch
 // ============================================================================
 
-/// User process virtual addresses.
-/// Must be in a different L1 index than the kernel identity map (L1[0]).
-/// With 16KB granule, L1 entries cover 64 GiB each:
-///   L1[0] = 0x0_0000_0000..0xF_FFFF_FFFF  (kernel identity map)
-///   L1[1] = 0x10_0000_0000..0x1F_FFFF_FFFF (user space)
-const USER_CODE_VA: usize = 0x0000_0010_0000_0000; // 64 GiB (L1[1])
-const USER_STACK_VA: usize = 0x0000_0010_0001_0000; // 64 GiB + 64KB
+/// Embedded userspace ELF binary (built by `cargo xtask build`).
+/// The hello program creates a server and yields in a loop, proving the full
+/// pipeline: Rust source → ELF → load_elf → MMU-isolated process → syscalls.
+static HELLO_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/hello.stripped")
+);
 
-/// Server program (PID 2): creates a server, then enters an infinite WFE loop.
-/// No cooperation (no Yield) — only timer preemption can switch away.
-///
-/// ```asm
-///     mov x0, #14             // CreateServerWithAddress
-///     movz x1, #0x0001
-///     movk x1, #0xBEE7, lsl #16  // SID = 0xBEE70001
-///     mov x2..x5, #0
-///     mov x8, #0
-///     svc #0
-/// .loop:
-///     wfe
-///     b .loop
-/// ```
-static SERVER_PROGRAM: [u32; 11] = [
-    0xd280_01c0, // mov x0, #14 (CreateServerWithAddress)
-    0xd280_0021, // movz x1, #0x0001
-    0xf2b7_dce1, // movk x1, #0xBEE7, lsl #16
-    0xd280_0002, // mov x2, #0
-    0xd280_0003, // mov x3, #0
-    0xd280_0004, // mov x4, #0
-    0xd280_0005, // mov x5, #0
-    0xd280_0008, // mov x8, #0
-    0xd400_0001, // svc #0
-    0xd503_205f, // wfe
-    0x17ff_ffff, // b .loop
-];
-
-/// Client program (PID 3): connects to the server, then enters an infinite WFE loop.
-/// No cooperation (no Yield) — only timer preemption can switch away.
-///
-/// ```asm
-///     mov x0, #17             // Connect(SID = 0xBEE70001)
-///     movz x1, #0x0001
-///     movk x1, #0xBEE7, lsl #16
-///     mov x2..x4, #0
-///     svc #0
-///     mov x20, x1             // save CID
-/// .loop:
-///     wfe
-///     b .loop
-/// ```
-static CLIENT_PROGRAM: [u32; 10] = [
-    0xd280_0220, // mov x0, #17 (Connect)
-    0xd280_0021, // movz x1, #0x0001
-    0xf2b7_dce1, // movk x1, #0xBEE7, lsl #16
-    0xd280_0002, // mov x2, #0
-    0xd280_0003, // mov x3, #0
-    0xd280_0004, // mov x4, #0
-    0xd400_0001, // svc #0
-    0xaa01_03f4, // mov x20, x1 (save CID)
-    0xd503_205f, // wfe
-    0x17ff_ffff, // b .loop
-];
-
-/// Create a user process: allocate address space, map code + stack, register in SystemServices.
-///
-/// Returns the PID of the created process.
+/// Create a user process from an ELF binary using the kernel's standard
+/// load_elf → allocate stack → setup_process pipeline.
 ///
 /// # Safety
 ///
 /// Must be called after MMU, MemoryManager, and SystemServices are initialized.
-unsafe fn create_user_process(
-    boot_info: &BootInfo,
+unsafe fn create_elf_process(
     pid: xous::PID,
-    program: &[u32],
+    elf_bytes: &[u8],
     name: &[u8],
 ) {
-    use xous::{MemoryFlags, PID};
+    use xous::MemoryAddress;
 
-    // 1. Set up the process's address space with user code and stack
-    let mut user_mapping = super::mem::MemoryMapping::default();
-    crate::mem::MemoryManager::with_mut(|mm| {
-        user_mapping.allocate(pid).expect("alloc user L1");
+    let elf_range = xous::MemoryRange::new(
+        elf_bytes.as_ptr() as usize,
+        elf_bytes.len(),
+    ).expect("elf range");
 
-        // Copy kernel L2 table reference into user L1.
-        let kernel_l1 = boot_info.ttbr0 as *const u64;
-        let user_l1 = user_mapping.ttbr0() as *mut u64;
-        let kernel_l1_entry0 = core::ptr::read_volatile(kernel_l1);
-        core::ptr::write_volatile(user_l1, kernel_l1_entry0);
+    let init = xous::ProcessInit {
+        elf: elf_range,
+        name_addr: MemoryAddress::new(name.as_ptr() as usize).expect("name addr"),
+        app_id: [pid.get() as u32, 0, 0, 0].into(),
+    };
 
-        // Allocate and map user code page (RX at EL0)
-        let (code_phys, _) = mm.alloc_range(1, pid).expect("alloc code page");
-        core::ptr::write_bytes(code_phys as *mut u8, 0, PAGE_SIZE);
-        core::ptr::copy_nonoverlapping(
-            program.as_ptr() as *const u8,
-            code_phys as *mut u8,
-            program.len() * 4,
-        );
-        user_mapping.map_page(
-            mm, code_phys, USER_CODE_VA as *mut usize,
-            MemoryFlags::X, true,
-        ).expect("map code page");
-
-
-        // Allocate and map user stack page (RW at EL0)
-        let (stack_phys, _) = mm.alloc_range(1, pid).expect("alloc stack page");
-        core::ptr::write_bytes(stack_phys as *mut u8, 0, PAGE_SIZE);
-        user_mapping.map_page(
-            mm, stack_phys, USER_STACK_VA as *mut usize,
-            MemoryFlags::W, true,
-        ).expect("map stack page");
+    crate::services::SystemServices::with_mut(|ss| {
+        ss.create_process(init).expect("create_process failed");
     });
 
-    // 2. Register in SystemServices and set up arch-level thread context
+    // Grant all syscall permissions
     crate::services::SystemServices::with_mut(|ss| {
-        use crate::process::{Process, INITIAL_TID, ThreadState};
-        use super::process::{Process as ArchProcess, ProcessSetup};
-
-        let mut process = Process::new(
-            user_mapping,
-            pid,
-            PID::new(1).unwrap(),  // parent = kernel
-            [pid.get() as u32, 0, 0, 0].into(),
-        );
-        process.set_name(name).expect("set process name");
+        let process = ss.process_mut(pid).expect("process not found");
         process.set_syscall_permissions(u64::MAX);
-        process.set_thread_state(INITIAL_TID, ThreadState::Ready);
-        let slot = pid.get() as usize - 1;
-        ss.insert_process(slot, process);
-
-        let stack = xous::MemoryRange::new(USER_STACK_VA, PAGE_SIZE)
-            .expect("stack range");
-        let irq_stack = xous::MemoryRange::new(USER_STACK_VA, PAGE_SIZE)
-            .expect("irq stack range");
-        ArchProcess::setup_process(
-            ProcessSetup {
-                pid,
-                entry_point: USER_CODE_VA,
-                stack,
-                irq_stack,
-                aslr_slide: 0,
-            },
-            ss,
-        ).expect("setup process");
     });
 }
 
 /// Launch user processes in EL0.
 ///
-/// Creates PID 2 and PID 3, both registered in SystemServices with the Scheduler.
-/// Starts execution at PID 2 — when it Yields, the scheduler switches to PID 3
-/// (context switch: save PID 2's regs, load PID 3's regs, switch TTBR0, ERET).
+/// Creates a process from the embedded hello ELF binary, registers it in
+/// SystemServices with the Scheduler, then ERets into it.
 ///
 /// # Safety
 ///
 /// Must be called after MMU, MemoryManager, and SystemServices (init_pid1) are initialized.
 /// Does not return — enters EL0 via ERET.
-pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
+pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     use xous::PID;
 
     #[cfg(feature = "platform-qemu-virt")]
-    crate::platform::qemu_virt::uart::puts("EL0: creating user processes...\n");
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            crate::platform::qemu_virt::uart::UartWriter,
+            "EL0: loading hello ELF ({} bytes)...\n",
+            HELLO_ELF.len(),
+        );
+    }
 
     let pid2 = PID::new(2).unwrap();
-    let pid3 = PID::new(3).unwrap();
+    create_elf_process(pid2, HELLO_ELF, b"hello");
 
-    // Create two user processes with separate address spaces.
-    // PID 2 = IPC server (creates server, receives messages)
-    // PID 3 = IPC client (connects, sends Scalar messages)
-    create_user_process(boot_info, pid2, &SERVER_PROGRAM, b"server");
-    create_user_process(boot_info, pid3, &CLIENT_PROGRAM, b"client");
+    #[cfg(feature = "platform-qemu-virt")]
+    crate::platform::qemu_virt::uart::puts("EL0: process created, launching...\n");
 
-    // Build a context frame for the initial ERET to PID 2.
-    // After PID 2 Yields, the scheduler picks PID 3 (next in queue),
-    // and the SVC handler loads PID 3's context from PROCESS_TABLE.
+    // Build a context frame for the initial ERET.
+    // Load PID 2's register state from PROCESS_TABLE.
     let kstack_phys = crate::mem::MemoryManager::with_mut(|mm| {
         mm.alloc_range(1, PID::new(1).unwrap()).expect("alloc kstack").0
     });
     core::ptr::write_bytes(kstack_phys as *mut u8, 0, PAGE_SIZE);
 
-    let context_ptr = kstack_phys as *mut u64;
-    let user_sp = USER_STACK_VA + PAGE_SIZE;
-    core::ptr::write_volatile(context_ptr.add(31), user_sp as u64);   // SP_EL0
-    core::ptr::write_volatile(context_ptr.add(32), USER_CODE_VA as u64);  // ELR_EL1
-    core::ptr::write_volatile(context_ptr.add(33), 0u64);             // SPSR_EL1 = EL0t
-
-    // Start with PID 2
+    // Set PID 2 as current and activate its address space
     super::process::set_current_pid(pid2);
     crate::services::SystemServices::with_mut(|ss| {
         ss.process(pid2).expect("pid2 not registered").activate();
     });
 
-    #[cfg(feature = "platform-qemu-virt")]
-    crate::platform::qemu_virt::uart::puts("EL0: launching (PID 2 first, PID 3 in scheduler queue)...\n");
+    // Load the process's saved context (PC, SP, SPSR set by setup_process)
+    let frame = kstack_phys as *mut super::process::Thread;
+    let proc = super::process::Process::current();
+    let tid = proc.current_tid();
+    proc.load_context_from_table(tid, frame);
 
-    // ERET to EL0 — PID 2 runs first
-    super::asm::_resume_context(context_ptr as *const u8)
+    // ERET to EL0 — hello process runs
+    super::asm::_resume_context(kstack_phys as *const u8)
 }
