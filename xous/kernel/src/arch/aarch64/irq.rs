@@ -131,11 +131,66 @@ fn handle_irq() {
 }
 
 /// Handle an SVC (syscall) from userspace.
-unsafe fn _handle_svc(_context: *mut u8, _iss: u64) {
-    // The ISS field contains the SVC immediate value (we use SVC #0).
-    // Syscall arguments are in X0-X5, X8-X9 (saved in context).
-    // TODO: Extract args from context, dispatch via crate::syscall::handle,
-    // write result back to context registers.
+///
+/// The context pointer points to the saved register frame on the kernel stack
+/// (matches the Thread register layout from asm.S's save_context).
+/// We extract syscall args, dispatch through the Xous kernel, and write
+/// the result directly into the saved frame so ERET returns it to userspace.
+unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
+    use super::process::{Process, Thread};
+    use xous::{Result as XousResult, SysCall};
+
+    let frame = &mut *(context as *mut Thread);
+    let args = frame.get_args();
+
+    // Parse the raw register values into a typed SysCall enum.
+    // args[0] = syscall number, args[1..7] = arguments
+    let call = match SysCall::from_args(
+        args[0], args[1], args[2], args[3],
+        args[4], args[5], args[6], args[7],
+    ) {
+        Ok(call) => call,
+        Err(_e) => {
+            let result = XousResult::Error(xous::Error::InvalidSyscall);
+            frame.set_args(&result.to_args());
+            return;
+        }
+    };
+
+    let proc = Process::current();
+    let tid = proc.current_tid();
+
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            crate::platform::qemu_virt::uart::UartWriter,
+            "SVC: PID {} TID {} {:?}\n",
+            crate::arch::process::current_pid(), tid, call,
+        );
+    }
+
+    // Dispatch the syscall through the Xous kernel
+    let response = crate::syscall::handle(tid, call)
+        .unwrap_or_else(XousResult::Error);
+
+    // Write the result directly into the saved context frame.
+    // restore_context (asm.S) will load these registers before ERET.
+    //
+    // ResumeProcess means the kernel already arranged a context switch
+    // (e.g. waking a blocked thread) — don't overwrite.
+    if response != XousResult::ResumeProcess {
+        frame.set_args(&response.to_args());
+    }
+
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        use core::fmt::Write;
+        let _ = write!(
+            crate::platform::qemu_virt::uart::UartWriter,
+            "SVC result: {:?}\n", response,
+        );
+    }
 }
 
 /// Handle a data or instruction abort.

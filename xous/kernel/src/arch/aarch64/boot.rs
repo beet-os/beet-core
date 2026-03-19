@@ -442,17 +442,20 @@ pub unsafe fn init_memory_manager(info: &BootInfo) {
 const USER_CODE_VA: usize = 0x0000_0001_0000_0000; // 4 GiB
 const USER_STACK_VA: usize = 0x0000_0001_0001_0000; // 4 GiB + 64KB
 
-/// Minimal AArch64 user program: infinite WFE loop.
+/// Minimal AArch64 user program: performs a GetProcessId syscall, then WFE loop.
 /// This is the raw machine code that will be mapped as the user's .text page.
 ///
 /// ```asm
-///     mov x0, #0x42       // x0 = 0x42 (proof we got here)
+///     mov x0, #33          // SysCallNumber::GetProcessId = 33
+///     svc #0               // trap to EL1 — kernel dispatches syscall
+///     // On return: X0 = result tag (8 = ProcessID), X1 = PID value
 /// .loop:
 ///     wfe
 ///     b .loop
 /// ```
-static USER_PROGRAM: [u32; 3] = [
-    0xd280_0840, // mov x0, #0x42
+static USER_PROGRAM: [u32; 4] = [
+    0xd280_0420, // mov x0, #33 (GetProcessId)
+    0xd400_0001, // svc #0
     0xd503_205f, // wfe
     0x17ff_ffff, // b .-4 (branch back to wfe)
 ];
