@@ -12,5 +12,5 @@ fn handle_panic(_arg: &PanicInfo) -> ! {
 
     armv7::asm::bkpt(); // Invoke a debugger breakpoint
 
-    loop {}
+    loop { core::hint::spin_loop() }
 }

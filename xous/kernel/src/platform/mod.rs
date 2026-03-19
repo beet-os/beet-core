@@ -30,7 +30,7 @@ pub fn shutdown() -> ! { self::apple_t8103::shutdown(); }
 
 #[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-apple-t8103")))]
 #[allow(dead_code)]
-pub fn shutdown() -> ! { loop {} }
+pub fn shutdown() -> ! { loop { core::hint::spin_loop() } }
 
 /// Platform cache operations.
 #[cfg(beetos)]
