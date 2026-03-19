@@ -106,7 +106,8 @@ pub unsafe fn load_elf(
         return Err(Error::BadAddress);
     }
 
-    let header = &*(base as *const Elf64Header);
+    // Use read_unaligned throughout — ELF data may not be aligned to struct requirements
+    let header = core::ptr::read_unaligned(base as *const Elf64Header);
 
     // Validate ELF magic
     if header.e_ident[0..4] != ELF_MAGIC {
@@ -139,7 +140,7 @@ pub unsafe fn load_elf(
     // Validate W^X: no segment should be both writable and executable
     let phdr_base = base.add(header.e_phoff as usize) as *const Elf64Phdr;
     for i in 0..header.e_phnum as usize {
-        let phdr = &*phdr_base.add(i);
+        let phdr = core::ptr::read_unaligned(phdr_base.add(i));
         if phdr.p_type == PT_LOAD {
             if (phdr.p_flags & PF_W != 0) && (phdr.p_flags & PF_X != 0) {
                 return Err(Error::BadAddress); // W^X violation
@@ -149,7 +150,7 @@ pub unsafe fn load_elf(
 
     // Load PT_LOAD segments
     for i in 0..header.e_phnum as usize {
-        let phdr = &*phdr_base.add(i);
+        let phdr = core::ptr::read_unaligned(phdr_base.add(i));
         if phdr.p_type != PT_LOAD {
             continue;
         }
@@ -207,7 +208,7 @@ pub unsafe fn load_elf(
 
     // Apply relocations for PIE
     if header.e_type == ET_DYN {
-        apply_relocations(base, header, phdr_base, aslr_slide)?;
+        apply_relocations(base, &header, phdr_base, aslr_slide)?;
     }
 
     Ok(ElfLoadResult {
@@ -229,16 +230,16 @@ unsafe fn apply_relocations(
     let mut rela_ent: u64 = 0;
 
     for i in 0..header.e_phnum as usize {
-        let phdr = &*phdr_base.add(i);
+        let phdr = core::ptr::read_unaligned(phdr_base.add(i));
         if phdr.p_type == PT_DYNAMIC {
             let dyn_base = base.add(phdr.p_offset as usize) as *const Elf64Dyn;
             let count = phdr.p_filesz as usize / core::mem::size_of::<Elf64Dyn>();
             for j in 0..count {
-                let dyn_entry = &*dyn_base.add(j);
+                let dyn_entry = core::ptr::read_unaligned(dyn_base.add(j));
                 match dyn_entry.d_tag {
-                    7 => rela_addr = Some(dyn_entry.d_val),   // DT_RELA
-                    8 => rela_size = dyn_entry.d_val,          // DT_RELASZ
-                    9 => rela_ent = dyn_entry.d_val,           // DT_RELAENT
+                    7 => rela_addr = Some(dyn_entry.d_val),    // DT_RELA
+                    8 => rela_size = dyn_entry.d_val,           // DT_RELASZ
+                    9 => rela_ent = dyn_entry.d_val,            // DT_RELAENT
                     0 => break,                                 // DT_NULL
                     _ => {}
                 }
@@ -253,12 +254,12 @@ unsafe fn apply_relocations(
         let count = rela_size / rela_ent;
         let rela_base = (rela_offset as usize + slide) as *const Elf64Rela;
         for i in 0..count as usize {
-            let rela = &*rela_base.add(i);
+            let rela = core::ptr::read_unaligned(rela_base.add(i));
             let rtype = (rela.r_info & 0xFFFF_FFFF) as u32;
             if rtype == R_AARCH64_RELATIVE {
                 let target = (rela.r_offset as usize + slide) as *mut u64;
                 let value = (rela.r_addend as usize).wrapping_add(slide) as u64;
-                core::ptr::write(target, value);
+                core::ptr::write_unaligned(target, value);
             }
         }
     }
