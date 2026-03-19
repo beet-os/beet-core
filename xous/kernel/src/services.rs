@@ -121,8 +121,62 @@ impl SystemServices {
         (pid, self.panic_message.as_slice())
     }
 
+    /// Initialize PID1 (kernel process) without loading any services.
+    ///
+    /// Used when booting directly (e.g., QEMU `-kernel` without a loader).
+    /// The kernel runs as PID1 with full permissions. Services can be
+    /// dynamically loaded later via CreateProcess syscalls.
+    #[cfg(beetos)]
+    pub fn init_pid1(&mut self) {
+        use beetos::{
+            KERNEL_IRQ_HANDLER_STACK_BOTTOM, KERNEL_IRQ_HANDLER_STACK_PAGE_COUNT, KERNEL_STACK_BOTTOM,
+            KERNEL_STACK_PAGE_COUNT, PAGE_SIZE,
+        };
+
+        const PID1: PID = PID::new(1).unwrap();
+
+        let mut process = Process::new(
+            MemoryMapping::current(),
+            PID1,
+            PID1,
+            [0x31444950u32, 0, 0, 0].into(), // 'PID1'
+        );
+        process.set_thread_priority(INITIAL_TID, xous::ThreadPriority::Idle);
+        process.set_thread_state(INITIAL_TID, ThreadState::Ready);
+        process.set_name(b"kernel").expect("Couldn't set the PID1 name");
+        process.set_syscall_permissions(u64::MAX);
+        self.processes[0] = Some(process);
+
+        let stack = unsafe {
+            MemoryRange::new(
+                KERNEL_STACK_BOTTOM - KERNEL_STACK_PAGE_COUNT * PAGE_SIZE,
+                KERNEL_STACK_PAGE_COUNT * PAGE_SIZE,
+            )
+            .expect("stack")
+        };
+        let irq_stack = unsafe {
+            MemoryRange::new(
+                KERNEL_IRQ_HANDLER_STACK_BOTTOM - KERNEL_IRQ_HANDLER_STACK_PAGE_COUNT * PAGE_SIZE,
+                KERNEL_IRQ_HANDLER_STACK_PAGE_COUNT * PAGE_SIZE,
+            )
+            .expect("irq stack")
+        };
+
+        ArchProcess::setup_process(
+            crate::arch::process::ProcessSetup {
+                pid: PID1,
+                entry_point: 0,
+                stack,
+                irq_stack,
+                aslr_slide: 0,
+            },
+            self,
+        )
+        .expect("couldn't setup PID1 process");
+    }
+
     /// Create a new "System Services" object based on the arguments from the
-    /// kernel. These arguments decide where the memory spaces are located, as
+    /// kernel loader. These arguments decide where the memory spaces are located, as
     /// well as where the stack and program counter should initially go.
     #[cfg(beetos)]
     pub fn init_from_memory(&mut self, args: &crate::args::KernelArguments) {

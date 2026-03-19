@@ -306,11 +306,11 @@ impl Process {
         // TODO(M2): Implement memory return for IPC
     }
 
-    /// Create a new process.
+    /// Create a new process, load its ELF binary, and set up its initial thread.
     pub fn create(
         pid: PID,
-        _init_data: ProcessInit,
-        _services: &mut SystemServices,
+        init_data: ProcessInit,
+        services: &mut SystemServices,
     ) -> Result<ProcessStartup, Error> {
         let idx = pid.get() as usize - 1;
         if idx >= MAX_PROCESS_COUNT {
@@ -329,6 +329,44 @@ impl Process {
             proc.threads[INITIAL_TID - 1].allocated = true;
             PROCESS_TABLE[idx] = Some(proc);
         }
+
+        // Load the ELF binary into the process's address space.
+        // The process's MemoryMapping was already created by SystemServices::create_process().
+        let process = services.process_mut(pid)?;
+        let elf_result = unsafe {
+            crate::mem::MemoryManager::with_mut(|mm| {
+                super::elf::load_elf(
+                    init_data.elf,
+                    pid,
+                    &mut process.mapping,
+                    mm,
+                )
+            })?
+        };
+
+        // Allocate a user stack (64 pages = 1MB with 16KB pages).
+        let stack_pages = beetos::STACK_PAGE_COUNT;
+        let stack_size = stack_pages * beetos::PAGE_SIZE;
+        let stack_base = beetos::USER_STACK_BOTTOM - stack_size;
+        let stack = unsafe { MemoryRange::new(stack_base, stack_size).map_err(|_| Error::BadAddress)? };
+
+        // Allocate an IRQ stack (3 pages).
+        let irq_stack_pages = beetos::USER_IRQ_STACK_PAGE_COUNT;
+        let irq_stack_size = irq_stack_pages * beetos::PAGE_SIZE;
+        let irq_stack_base = beetos::USER_IRQ_STACK_BOTTOM - irq_stack_size;
+        let irq_stack = unsafe { MemoryRange::new(irq_stack_base, irq_stack_size).map_err(|_| Error::BadAddress)? };
+
+        // Set up the initial thread context with the ELF entry point.
+        Self::setup_process(
+            ProcessSetup {
+                pid,
+                entry_point: elf_result.entry_point,
+                stack,
+                irq_stack,
+                aslr_slide: elf_result.aslr_slide,
+            },
+            services,
+        )?;
 
         Ok(ProcessStartup::new(pid))
     }

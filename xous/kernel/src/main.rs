@@ -54,12 +54,6 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     // Store the boot arguments (FDT pointer) for later use
     args::KernelArguments::init(arg_offset);
 
-    // At this point we have UART output, GIC, and timer running.
-    // The full Xous kernel init (memory manager, services) will be
-    // wired up when we integrate the loader and process infrastructure.
-    //
-    // For M2, we demonstrate: boot → platform init → UART output → timer ticks → idle.
-
     arch::init();
 
     // Initialize RNG (detects RNDR support, seeds from counter)
@@ -67,6 +61,20 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
 
     platform::rand::get_u32();
     platform::rand::get_u32();
+
+    // Initialize the Xous kernel services infrastructure.
+    //
+    // Full process loading requires:
+    //   1. MemoryManager initialized with RAM page tracker (from loader)
+    //   2. KernelArguments with BElf/PMem/PSys tags (from loader)
+    //   3. MMU enabled with identity-mapped kernel pages
+    //
+    // On QEMU virt without a loader, we skip process infra setup.
+    // The shell runs directly in kernel context (EL1). When a loader
+    // is integrated, this will call:
+    //   mm.init_from_memory(arg_offset, &args);
+    //   ss.init_from_memory(&args);  // creates PID1 + loads BElf services
+    //   scheduler.activate_current(); // start first user process
 
     // Unmask IRQs so timer ticks are delivered
     core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack)); // Clear IRQ mask
