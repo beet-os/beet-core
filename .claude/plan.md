@@ -331,7 +331,239 @@ Interactive shell with in-memory filesystem. You can create, read, list, and del
 
 ---
 
-## Milestone 5 — NVMe Storage
+## Milestone 5 — Process Lifecycle (Spawn / Exit / Wait)
+
+**Goal:** A process can spawn another, wait for it to finish, and get its exit code. The shell can launch programs: `bsh> hello` → new process prints "Hello, BeetOS!" → exits → shell shows prompt.
+
+**Architecture:** Microkernel-proper. A **Process Manager** (`procman`) service in userspace handles lifecycle policy. The kernel provides the mechanism (syscalls). The shell talks to procman via Xous IPC, never directly to the kernel for spawn/wait.
+
+```
+bsh> hello
+  ↓
+Shell → BlockingScalar(SpawnAndWait, "hello") → ProcMan (IPC)
+  ↓
+ProcMan → SVC SpawnByName("hello") → Kernel
+  ↓
+Kernel: looks up "hello" in binary table
+        creates process (ELF load, page tables, stack, UART mapping)
+        returns PID
+  ↓
+ProcMan → SVC WaitProcess(pid) → Kernel
+  ↓
+Kernel: parks procman thread (WaitProcess { pid })
+        schedules hello process
+  ↓
+Hello runs at EL0: writes "Hello, BeetOS!" to UART, calls TerminateProcess(0)
+  ↓
+Kernel: cleans up hello (pages, servers, connections)
+        wakes procman thread → exit_code=0
+  ↓
+ProcMan → ReturnScalar(exit_code) → Shell (IPC return)
+  ↓
+Shell: prints "[exited: 0]", shows bsh> prompt
+```
+
+### Syscalls
+
+Two new syscalls on top of existing Xous ones:
+
+| Syscall | Number | Signature | Description |
+|---------|--------|-----------|-------------|
+| `SpawnByName` | 57 | `(name_ptr, name_len) → PID` | Kernel looks up name in embedded binary table, creates process (ELF load + stack + UART mapping), returns PID. |
+| `WaitProcess` | 58 | `(pid) → exit_code` | Blocks until target process calls `TerminateProcess`. Returns exit code. |
+
+Existing syscalls used as-is:
+- `TerminateProcess(exit_code)` = 22 — already has full cleanup (pages, servers, connections, reparent children)
+- `GetProcessId` = 33 — used by hello to print its PID
+- `CreateServerWithAddress`, `ReceiveMessage`, `SendMessage`, `Connect`, `ReturnScalar1` — all existing Xous IPC
+
+### New kernel infrastructure
+
+#### 1. Binary registry (`boot.rs`)
+
+```rust
+/// Embedded binary table: name → ELF bytes.
+/// The kernel holds these via include_bytes! — no filesystem needed.
+static BINARY_TABLE: &[(&str, &[u8])] = &[
+    ("hello", HELLO_ELF),
+    ("shell", SHELL_ELF),
+];
+```
+
+#### 2. SpawnByName handler (`syscall.rs`, `boot.rs`)
+
+The kernel:
+1. Copies the name from user VA (validated, max 32 bytes)
+2. Looks up `BINARY_TABLE` by name
+3. Calls existing `create_elf_process` pipeline (ELF load → stack alloc → page table setup)
+4. Maps UART MMIO into the new process (same as shell gets it today)
+5. Passes UART VA via x0 (same mechanism as shell)
+6. Grants syscall permissions
+7. Returns `Result::ProcessID(pid)`
+
+Key: the new process is created in `Ready` state but NOT immediately scheduled. The caller (procman) decides what to do next (typically WaitProcess).
+
+#### 3. WaitProcess handler (`syscall.rs`, `services.rs`)
+
+New `ThreadState::WaitProcess { pid: PID }` variant added to the existing enum.
+
+When `WaitProcess(target_pid)` is called:
+- If target PID doesn't exist or already exited: return immediately with exit code
+- Otherwise: set caller thread to `ThreadState::WaitProcess { pid: target_pid }`, yield
+
+When `terminate_current_process(exit_code)` runs:
+- Existing cleanup (servers, connections, memory, pages) stays unchanged
+- **New**: scan all threads in all processes for `WaitProcess { pid: dying_pid }`, wake them with `Result::Scalar1(exit_code)`
+
+#### 4. UART mapping for spawned processes
+
+`SpawnByName` automatically maps the UART MMIO page into every new process at `SHELL_UART_VA`. This is a boot-time policy — all processes can write to the console. Future milestones can restrict this.
+
+### New crates
+
+#### `api/procman/` — Process Manager API
+
+```rust
+#![no_std]
+
+pub const PROCMAN_SID: [u32; 4] = [0x5052_4F43, 0x4D41_4E00, 0, 0]; // "PROCMAN\0"
+
+#[repr(usize)]
+pub enum ProcManOp {
+    /// Spawn a process by name and wait for it to exit.
+    /// BlockingScalar: arg1-arg4 = name bytes packed as 4×usize (max 32 bytes).
+    /// Returns: Scalar1(exit_code) on success.
+    SpawnAndWait = 0,
+    /// Spawn a process by name, return immediately with PID.
+    /// Scalar: arg1-arg4 = name bytes packed as 4×usize.
+    /// Returns: Scalar1(pid) on success.
+    Spawn = 1,
+    /// Wait for a process to exit.
+    /// BlockingScalar: arg1 = pid.
+    /// Returns: Scalar1(exit_code).
+    Wait = 2,
+}
+
+/// Pack a process name (up to 32 bytes) into 4 usize values for Scalar messages.
+pub fn pack_name(name: &str) -> [usize; 4] { ... }
+/// Unpack a name from 4 usize values.
+pub fn unpack_name(args: &[usize; 4]) -> &str { ... }
+```
+
+#### `os/procman/` — Process Manager Service
+
+Userspace process that:
+1. Creates server with `PROCMAN_SID`
+2. Loops on `ReceiveMessage`:
+   - `SpawnAndWait(name)`: calls `SpawnByName` syscall, then `WaitProcess(pid)`, returns exit code to sender
+   - `Spawn(name)`: calls `SpawnByName`, returns PID to sender
+   - `Wait(pid)`: calls `WaitProcess`, returns exit code to sender
+3. Gets UART mapped (same as shell) for potential debug output
+
+The procman is launched at boot alongside idle and shell.
+
+### Updated apps
+
+#### `apps/hello/` — rewritten
+
+```rust
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    // x0 = UART VA (set by kernel)
+    let uart_base = read_x0();
+    uart_puts(uart_base, "Hello, BeetOS!\n");
+    uart_puts(uart_base, "I am PID ");
+    // GetProcessId syscall
+    uart_puts(uart_base, &pid_to_str());
+    uart_puts(uart_base, ", running at EL0.\n");
+    xous::terminate_process(0);  // clean exit
+}
+```
+
+#### `apps/shell/` — updated command dispatch
+
+```rust
+match cmd {
+    "help" | "echo" | "info" | ... => /* builtins */,
+    unknown_cmd => {
+        // Try to spawn via procman
+        let cid = connect_to_procman();  // lazy connect, blocks until procman ready
+        let name_packed = pack_name(unknown_cmd);
+        match xous::send_message(cid, Message::new_blocking_scalar(
+            ProcManOp::SpawnAndWait as usize,
+            name_packed[0], name_packed[1], name_packed[2], name_packed[3],
+        )) {
+            Ok(Result::Scalar1(exit_code)) => {
+                write!(UartWriter, "[exited: {}]\n", exit_code);
+            }
+            Err(e) => {
+                write!(UartWriter, "bsh: {}: not found\n", unknown_cmd);
+            }
+        }
+    }
+}
+```
+
+### Boot sequence (updated)
+
+```
+Kernel boots → MMU → MemoryManager → SystemServices
+  ↓
+launch_first_process():
+  1. create_elf_process(PID 2, HELLO_ELF, "idle")      — idle loop
+  2. create_elf_process(PID 3, PROCMAN_ELF, "procman")  — process manager
+  3. create_elf_process(PID 4, SHELL_ELF, "shell")      — interactive shell
+  4. Map UART into procman (PID 3) and shell (PID 4)
+  5. ERET into shell (PID 4)
+  ↓
+Scheduler runs:
+  - Shell prints banner, creates CONSOLE server, connects to PROCMAN (blocks until procman ready)
+  - ProcMan creates PROCMAN server → shell's connect unblocks
+  - Shell enters ReceiveMessage loop
+  - Idle yields in a loop
+  ↓
+User types "hello":
+  - UART IRQ → kernel sends char to shell via CONSOLE IPC
+  - Shell receives chars, parses "hello", sends SpawnAndWait to procman
+  - ProcMan calls SpawnByName("hello") → kernel creates PID 5
+  - ProcMan calls WaitProcess(5) → blocks
+  - Hello runs, prints, calls TerminateProcess(0)
+  - Kernel wakes procman, procman returns exit_code to shell
+  - Shell prints "[exited: 0]", shows prompt
+```
+
+### Implementation order
+
+1. **Kernel: SpawnByName syscall + binary table** — mechanism for creating processes by name
+2. **Kernel: WaitProcess syscall + ThreadState** — mechanism for waiting on process exit
+3. **Kernel: TerminateProcess wakeup** — wake WaitProcess waiters when process dies
+4. **api/procman/** — IPC types and name packing helpers
+5. **os/procman/** — process manager service binary
+6. **apps/hello/** — rewrite to print and exit
+7. **apps/shell/** — add procman connect + unknown-command spawn
+8. **boot.rs** — launch procman alongside idle and shell
+9. **xtask** — build procman ELF, embed in kernel
+
+### Tests
+
+- [ ] Hosted mode: `cargo test` still passes (all 43 existing tests)
+- [ ] QEMU: `bsh> hello` prints "Hello, BeetOS!" and returns to prompt
+- [ ] QEMU: `bsh> hello` shows correct PID (e.g., PID 5)
+- [ ] QEMU: `bsh> hello` then `bsh> hello` shows PID 6 (new process each time)
+- [ ] QEMU: unknown command shows "not found" error
+- [ ] QEMU: process cleanup works (no memory leak across many spawns)
+
+### What this does NOT include (deferred)
+
+- No dynamic ELF loading from filesystem (binaries are embedded at compile time)
+- No fork/exec semantics (spawn only)
+- No signal delivery (TerminateProcess is self-termination only; TerminatePid exists but is restricted)
+- No per-process UART permission control (all processes get UART for now)
+- No procman access control (any process can spawn anything)
+
+---
+
+## Milestone 6 — NVMe Storage
 
 **Goal:** Read the built-in SSD. Mount read-only filesystem. Verified boot.
 
@@ -350,7 +582,7 @@ Kernel reads the SSD. Rootfs mounted read-only with signature verification.
 
 ---
 
-## Milestone 6 — Network
+## Milestone 7 — Network
 
 **Goal:** TCP/IP via USB-C Ethernet. Remote shell access.
 
@@ -364,7 +596,7 @@ Kernel reads the SSD. Rootfs mounted read-only with signature verification.
 
 ---
 
-## Milestone 7 — Encrypted Storage & WiFi
+## Milestone 8 — Encrypted Storage & WiFi
 
 - [ ] NVMe write support
 - [ ] Encrypted data partition (AES-256-GCM)
@@ -373,7 +605,7 @@ Kernel reads the SSD. Rootfs mounted read-only with signature verification.
 
 ---
 
-## Milestone 8 — Full std Support (optional, when needed)
+## Milestone 9 — Full std Support (optional, when needed)
 
 **Goal:** Fork the Rust compiler to add `aarch64-unknown-xous-elf` target. Services can use full `std`.
 
@@ -421,11 +653,11 @@ Pinned to a specific nightly. Bump when needed (not at every Rust release). The 
 
 ## Future Milestones
 
-- M9: Trackpad, DCP (display coprocessor)
-- M10: GPU (AGX) — reference Asahi Lina's Rust DRM driver
-- M11: Desktop environment (Wayland compositor or COSMIC port)
-- M12: A/B updates, OTA distribution
-- M13: M2/M3/M4 support (new platform/ modules + device trees)
+- M10: Trackpad, DCP (display coprocessor)
+- M11: GPU (AGX) — reference Asahi Lina's Rust DRM driver
+- M12: Desktop environment (Wayland compositor or COSMIC port)
+- M13: A/B updates, OTA distribution
+- M14: M2/M3/M4 support (new platform/ modules + device trees)
 - Future: Raspberry Pi 4 platform (platform/rpi4/), Ampere Altra, etc.
 
 ---
