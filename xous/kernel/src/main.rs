@@ -39,17 +39,24 @@ use xous::*;
 
 #[cfg(beetos)]
 #[no_mangle]
-/// Rust entry point called from start.S after basic hardware setup.
+/// Rust entry point called from start.S after MMU is enabled and the
+/// kernel has jumped to high VA (TTBR1 space).
 ///
-/// On QEMU virt: x0 = FDT pointer from QEMU.
-/// On Apple M1: x0 = FDT pointer from m1n1.
+/// At this point:
+///   - MMU is ON with TTBR0 (identity map) and TTBR1 (kernel linear map)
+///   - VBAR_EL1 is set to exception vectors at high VA
+///   - SP points to kernel stack at high VA
+///   - BSS is zeroed
+///   - All kernel code/data is accessible through TTBR1
+///
+/// `arg_offset` is the FDT physical address (from QEMU or m1n1 in x0).
 ///
 /// # Safety
 ///
 /// This is safe to call only once, from the startup assembly.
 pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
-    // Initialize platform hardware first (UART for output, GIC, timer)
-    // This runs with MMU OFF — UART/GIC use hardcoded physical MMIO addresses.
+    // Initialize platform hardware (UART for output, GIC, timer).
+    // MMIO is accessed at high VA through TTBR1 (phys_to_virt).
     platform::init();
 
     // Store the boot arguments (FDT pointer) for later use
@@ -63,12 +70,12 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     platform::rand::get_u32();
     platform::rand::get_u32();
 
-    // ---- MMU and Memory Manager initialization ----
+    // ---- Memory Manager initialization ----
     //
-    // Parse FDT for RAM regions, set up identity-map page tables, and enable MMU.
-    // After this, the kernel runs at the same physical addresses (identity mapped).
-    // The MemoryManager is initialized with a page tracker covering all RAM.
-    let boot_info = arch::boot::enable_mmu(arg_offset as *const u8);
+    // The assembly boot code already set up page tables and enabled MMU.
+    // Here we parse FDT for RAM info, allocate the page tracker, and
+    // initialize the MemoryManager.
+    let boot_info = arch::boot::init_memory(arg_offset as *const u8);
 
     #[cfg(feature = "platform-qemu-virt")]
     {
@@ -82,9 +89,6 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
 
     // Initialize the MemoryManager with the bootstrap page tracker
     arch::boot::init_memory_manager(&boot_info);
-
-    // Store the boot TTBR0 so user process page tables can include kernel mappings
-    arch::mem::set_kernel_boot_ttbr0(boot_info.ttbr0);
 
     // Initialize PID1 (kernel process) with all exceptions masked
     // to avoid timer interrupt storm during the large memset.
@@ -100,17 +104,12 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     #[cfg(feature = "platform-qemu-virt")]
     platform::qemu_virt::uart::enable_rx_interrupt();
 
-    // Launch a minimal EL0 process to prove userspace works.
-    // This creates a separate address space (TTBR0) with:
-    //   - Kernel identity map (EL1-only, inaccessible from EL0)
-    //   - User code page (RX at EL0): infinite WFE loop
-    //   - User stack page (RW at EL0)
-    // Then ERETs to EL0. The timer IRQ proves the kernel can handle
-    // exceptions from userspace and return correctly.
+    // Launch user processes in EL0.
+    // Creates separate address spaces (TTBR0 only — no kernel mappings),
+    // then ERETs to the shell at EL0.
     //
-    // NOTE: This replaces the shell — the kernel enters EL0 and only
-    // runs IRQ handlers. A future scheduler will time-slice between
-    // user processes and the kernel shell.
+    // From this point on, TTBR0 switches between user processes on context
+    // switch. The kernel always runs through TTBR1 (stable, never changes).
     arch::boot::launch_first_process(&boot_info);
 }
 

@@ -175,8 +175,12 @@ pub unsafe fn load_elf(
             let (page_phys, _zeroed) = mm.alloc_range(1, pid).map_err(|_| Error::OutOfMemory)?;
             let page_virt = (page_start + offset) as *mut usize;
 
+            // Access the page via high VA (through TTBR1) since the kernel
+            // runs at high VA and TTBR0 may be a different process's mapping.
+            let page_kern_va = beetos::phys_to_virt(page_phys);
+
             // Zero the page first
-            core::ptr::write_bytes(page_phys as *mut u8, 0, beetos::PAGE_SIZE);
+            core::ptr::write_bytes(page_kern_va as *mut u8, 0, beetos::PAGE_SIZE);
 
             // Copy file data if this page overlaps with filesz
             let page_va = page_start + offset;
@@ -195,7 +199,7 @@ pub unsafe fn load_elf(
                     let actual_copy = core::cmp::min(copy_len, len - src_start);
                     core::ptr::copy_nonoverlapping(
                         base.add(src_start),
-                        (page_phys as *mut u8).add(dst_offset),
+                        (page_kern_va as *mut u8).add(dst_offset),
                         actual_copy,
                     );
                 }

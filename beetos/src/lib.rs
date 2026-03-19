@@ -61,6 +61,28 @@ pub const THREAD_CONTEXT_AREA: usize = 0x0000_7000_0000_0000;
 /// Start of kernel virtual address space (upper half).
 pub const KERNEL_VIRT_BASE: usize = 0xFFFF_8000_0000_0000;
 
+/// Offset between physical addresses and kernel virtual addresses.
+///
+/// The kernel uses a linear map: kernel VA = PA + KERNEL_VA_OFFSET.
+/// TTBR1 maps all physical RAM and MMIO at this offset so the kernel
+/// can access any physical address without going through TTBR0.
+///
+/// TTBR0 is reserved for user process page tables and changes on every
+/// context switch. TTBR1 (kernel) never changes.
+pub const KERNEL_VA_OFFSET: usize = KERNEL_VIRT_BASE; // 0xFFFF_8000_0000_0000
+
+/// Convert a physical address to its kernel virtual address (TTBR1 linear map).
+#[inline]
+pub const fn phys_to_virt(pa: usize) -> usize {
+    pa.wrapping_add(KERNEL_VA_OFFSET)
+}
+
+/// Convert a kernel virtual address to its physical address.
+#[inline]
+pub const fn virt_to_phys(va: usize) -> usize {
+    va.wrapping_sub(KERNEL_VA_OFFSET)
+}
+
 /// Physical RAM identity-mapped into kernel space.
 pub const MAPPED_PHYSICAL_RAM: usize = 0xFFFF_A000_0000_0000;
 

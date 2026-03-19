@@ -1,44 +1,36 @@
 // SPDX-FileCopyrightText: 2024 BeetOS contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Early boot: FDT parsing, MMU enable, MemoryManager initialization.
+//! Early boot: FDT parsing, MemoryManager initialization.
 //!
-//! Called from `_start_rust` before anything else that needs virtual memory.
-//! At this point the MMU is OFF — all addresses are physical.
+//! Called from `_start_rust` AFTER the assembly boot code has already:
+//!   1. Created bootstrap page tables (TTBR0 identity map + TTBR1 kernel map)
+//!   2. Enabled the MMU
+//!   3. Jumped to high VA (TTBR1 space)
 //!
-//! # Boot sequence
+//! At this point the kernel is running at high VA through TTBR1.
+//! All physical memory is accessible via `beetos::phys_to_virt(pa)`.
 //!
-//! 1. Parse FDT (from QEMU or m1n1) to discover RAM base + size
-//! 2. Place page tracker + bootstrap page tables after kernel `_end`
-//! 3. Build identity-map page tables (VA = PA) using L2 block descriptors
-//! 4. Enable MMU (MAIR, TCR, TTBR0, SCTLR)
-//! 5. Initialize MemoryManager with the page tracker
+//! # Boot sequence (this module)
 //!
-//! After this, the kernel continues running at physical addresses (identity
-//! mapped via TTBR0). User processes will get their own TTBR0 with kernel
-//! pages mapped as EL1-only (inaccessible from EL0).
-
-use core::arch::asm;
+//! 1. Parse FDT (at `phys_to_virt(fdt_pa)`) to discover RAM base + size
+//! 2. Allocate page tracker after kernel `_end` (high VA, bump allocator)
+//! 3. Initialize MemoryManager with the page tracker
+//!
+//! The assembly boot code (start.S) handles page table creation and MMU enable.
 
 use beetos::PAGE_SIZE;
 
-use super::mem::{MAIR_VALUE, TCR_VALUE};
-
 // ============================================================================
-// Linker symbols
+// Linker symbols (at high VA after relink)
 // ============================================================================
 
 extern "C" {
-    static _start: u8;
     static _end: u8;
 }
 
-/// Get the kernel's physical start address.
-fn kernel_start() -> usize {
-    unsafe { &_start as *const u8 as usize }
-}
-
-/// Get the kernel's physical end address (first byte after kernel image + stack).
+/// Get the kernel's end address (high VA, first byte after kernel image + stack).
+/// Runtime allocations (page tracker, etc.) start here.
 fn kernel_end() -> usize {
     unsafe { &_end as *const u8 as usize }
 }
@@ -96,7 +88,7 @@ unsafe fn cstr_starts_with(ptr: *const u8, prefix: &[u8]) -> bool {
 ///
 /// # Safety
 ///
-/// `fdt_ptr` must point to a valid FDT blob.
+/// `fdt_ptr` must point to a valid FDT blob (may be at high VA via phys_to_virt).
 pub unsafe fn parse_fdt_ram(fdt_ptr: *const u8) -> Option<RamRegion> {
     let magic = be32(fdt_ptr);
     if magic != FDT_MAGIC {
@@ -168,49 +160,17 @@ pub unsafe fn parse_fdt_ram(fdt_ptr: *const u8) -> Option<RamRegion> {
 }
 
 // ============================================================================
-// Bootstrap page tables (identity map with L2 blocks)
+// Bump allocator (works in high VA space)
 // ============================================================================
 
-// L2 block = 32 MiB with 16KB granule
-const L2_BLOCK_SIZE: usize = 32 * 1024 * 1024;
-const L2_BLOCK_ADDR_MASK: u64 = 0x0000_FFFF_FE00_0000; // bits [47:25]
-
-// Descriptor bits
-const DESC_VALID: u64 = 1 << 0;
-const DESC_TABLE: u64 = 1 << 1; // L1/L2 table descriptor: bits[1:0] = 0b11
-const DESC_BLOCK: u64 = DESC_VALID; // L2 block descriptor: bits[1:0] = 0b01 (valid, NOT table)
-
-// Page table entry attributes (same definitions as mem.rs, duplicated to avoid
-// coupling boot code to the full MemoryMapping infrastructure)
-const ATTR_IDX_DEVICE: u64 = 0 << 2; // MAIR index 0: Device-nGnRnE
-const ATTR_IDX_NORMAL: u64 = 1 << 2; // MAIR index 1: Normal WB cacheable
-const ATTR_AF: u64 = 1 << 10; // Access flag
-const ATTR_SH_ISH: u64 = 0b11 << 8; // Inner-shareable
-const ATTR_AP_RW_EL1: u64 = 0b00 << 6; // Read/write at EL1 only
-const ATTR_UXN: u64 = 1 << 54; // User execute-never
-const ATTR_PXN: u64 = 1 << 53; // Privileged execute-never
-
-/// Normal memory block attributes: RWX at EL1, no user access.
-/// The entire RAM identity map is kernel-only. We use L2 blocks (32MB)
-/// so we can't separate text/data permissions — that requires L3 pages.
-/// PXN=0 allows EL1 execution. UXN=1 blocks EL0 execution.
-const BLOCK_NORMAL_RWX: u64 =
-    DESC_BLOCK | ATTR_IDX_NORMAL | ATTR_AF | ATTR_SH_ISH | ATTR_AP_RW_EL1 | ATTR_UXN;
-
-/// Device memory block attributes: RW at EL1, no user access, no execute, no cache.
-const BLOCK_DEVICE_RW: u64 =
-    DESC_BLOCK | ATTR_IDX_DEVICE | ATTR_AF | ATTR_SH_ISH | ATTR_AP_RW_EL1 | ATTR_UXN | ATTR_PXN;
-
-/// Number of L1 entries (16KB / 8 bytes = 2048).
-const TABLE_ENTRIES: usize = 2048;
-
 /// Bump allocator for bootstrap page allocation (before MemoryManager exists).
+/// Works in high VA space — allocations are accessible through TTBR1.
 struct BumpAllocator {
     next: usize,
 }
 
 impl BumpAllocator {
-    /// Create a new bump allocator starting at the given physical address.
+    /// Create a new bump allocator starting at the given high VA.
     fn new(start: usize) -> Self {
         Self { next: Self::align_up(start) }
     }
@@ -219,7 +179,7 @@ impl BumpAllocator {
         (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
     }
 
-    /// Allocate one zeroed 16KB page.
+    /// Allocate one zeroed 16KB page. Returns the high VA of the page.
     fn alloc_page(&mut self) -> usize {
         let page = self.next;
         self.next += PAGE_SIZE;
@@ -227,40 +187,47 @@ impl BumpAllocator {
         page
     }
 
-    /// Current high-water mark.
+    /// Current high-water mark (high VA).
     fn current(&self) -> usize {
         self.next
     }
 }
 
+// ============================================================================
+// Boot info and initialization
+// ============================================================================
+
 /// Information about the bootstrap memory layout, returned to the caller
 /// so the MemoryManager can be initialized.
 #[allow(dead_code)]
 pub struct BootInfo {
-    /// RAM base address (from FDT).
+    /// RAM base address (PA, from FDT).
     pub ram_base: usize,
     /// RAM size in bytes (from FDT, capped to beetos::RAM_SIZE).
     pub ram_size: usize,
-    /// Physical address of the page tracker (allocations array).
+    /// High VA of the page tracker (allocations array).
     pub page_tracker_base: usize,
     /// Size of page tracker in bytes.
     pub page_tracker_size: usize,
-    /// Physical address of the L1 page table (set as TTBR0_EL1).
-    pub ttbr0: usize,
-    /// First free address after all bootstrap allocations.
+    /// First free high VA after all bootstrap allocations.
     pub bootstrap_end: usize,
 }
 
-/// Set up identity-map page tables and enable the MMU.
+/// Initialize memory management after MMU is enabled.
+///
+/// Parses FDT for RAM info, allocates the page tracker, and prepares
+/// BootInfo for MemoryManager initialization.
 ///
 /// # Safety
 ///
-/// Must be called exactly once, early in boot, with MMU off.
-/// `fdt_ptr` must point to a valid FDT blob or be null (uses defaults).
-pub unsafe fn enable_mmu(fdt_ptr: *const u8) -> BootInfo {
-    // 1. Discover RAM from FDT (or use platform defaults)
-    let (ram_base, ram_size_raw) = if !fdt_ptr.is_null() {
-        parse_fdt_ram(fdt_ptr)
+/// Must be called exactly once, early in boot, after MMU is on and
+/// the kernel is running at high VA. `fdt_phys` is the physical address
+/// of the FDT blob (from the bootloader).
+pub unsafe fn init_memory(fdt_phys: *const u8) -> BootInfo {
+    // 1. Discover RAM from FDT (accessed at high VA)
+    let (ram_base, ram_size_raw) = if !fdt_phys.is_null() {
+        let fdt_va = beetos::phys_to_virt(fdt_phys as usize) as *const u8;
+        parse_fdt_ram(fdt_va)
             .map(|r| (r.base, r.size))
             .unwrap_or((beetos::PLAINTEXT_DRAM_BASE, beetos::RAM_SIZE))
     } else {
@@ -270,14 +237,8 @@ pub unsafe fn enable_mmu(fdt_ptr: *const u8) -> BootInfo {
     // Cap to compile-time max (bitmap size is fixed)
     let ram_size = ram_size_raw.min(beetos::RAM_SIZE);
 
-    // Verify kernel is within RAM
-    let k_start = kernel_start();
-    let k_end = kernel_end();
-    assert!(k_start >= ram_base && k_end <= ram_base + ram_size,
-        "kernel not within discovered RAM");
-
-    // 2. Set up bump allocator after kernel _end
-    let mut bump = BumpAllocator::new(k_end);
+    // 2. Set up bump allocator after kernel _end (high VA)
+    let mut bump = BumpAllocator::new(kernel_end());
 
     // 3. Allocate page tracker (Option<PID> = 2 bytes per page)
     let num_pages = ram_size / PAGE_SIZE;
@@ -285,118 +246,8 @@ pub unsafe fn enable_mmu(fdt_ptr: *const u8) -> BootInfo {
     let page_tracker_base = bump.current();
     // Advance bump past page tracker (round up to page boundary)
     bump.next = BumpAllocator::align_up(page_tracker_base + page_tracker_size);
-    // Zero the page tracker
+    // Zero the page tracker (at high VA, through TTBR1)
     core::ptr::write_bytes(page_tracker_base as *mut u8, 0, bump.current() - page_tracker_base);
-
-    // 4. Allocate page tables: 1 L1 + N L2 tables
-    let l1_page = bump.alloc_page();
-    let l1_table = l1_page as *mut u64;
-
-    // We need L2 tables for MMIO and RAM. Each L1 entry covers 64 GiB.
-    //
-    // QEMU virt: MMIO (0..0x4000_0000) + RAM (0x4000_0000+) — both in L1[0].
-    // Apple M1: RAM at 0x8_0000_0000 — still in L1[0] (0..64GiB).
-    // BCM2712 (RPi5): RAM at 0x0, peripherals at ~66GiB → needs L1[0] + L1[1].
-    let l2_page = bump.alloc_page();
-    let l2_table = l2_page as *mut u64;
-
-    // Wire L1[0] → L2 table (covers VA 0..64 GiB)
-    let l1_desc = (l2_page as u64 & super::mem::PTE_ADDR_MASK) | DESC_VALID | DESC_TABLE;
-    core::ptr::write_volatile(l1_table.add(0), l1_desc);
-
-    // 5. Map MMIO region below RAM as device memory (L2 blocks).
-    // QEMU virt: 0..0x4000_0000 (GIC + UART below RAM).
-    // BCM2712: RAM starts at 0x0, so this range is empty (no-op).
-    if ram_base > 0 {
-        let mmio_blocks = ram_base / L2_BLOCK_SIZE;
-
-        for i in 0..mmio_blocks {
-            let phys = i * L2_BLOCK_SIZE;
-            let l2_idx = phys / L2_BLOCK_SIZE;
-            let desc = (phys as u64 & L2_BLOCK_ADDR_MASK) | BLOCK_DEVICE_RW;
-            core::ptr::write_volatile(l2_table.add(l2_idx), desc);
-        }
-    }
-
-    // 6. Map RAM as normal memory (L2 blocks).
-    let ram_blocks = (ram_size + L2_BLOCK_SIZE - 1) / L2_BLOCK_SIZE;
-
-    for i in 0..ram_blocks {
-        let phys = ram_base + i * L2_BLOCK_SIZE;
-        let l2_idx = phys / L2_BLOCK_SIZE;
-
-        if l2_idx < TABLE_ENTRIES {
-            let desc = (phys as u64 & L2_BLOCK_ADDR_MASK) | BLOCK_NORMAL_RWX;
-            core::ptr::write_volatile(l2_table.add(l2_idx), desc);
-        }
-    }
-
-    // 6b. BCM2712: map high peripherals (>64GiB) in L1[1].
-    // UART0 at 0x107D001000 and GIC at 0x107FFF9000 are both above 64GiB,
-    // in L1[1] (covers 64GiB..128GiB). We map two 32MB blocks covering them.
-    #[cfg(feature = "platform-bcm2712")]
-    {
-        // L1[1] covers physical 0x10_0000_0000..0x20_0000_0000 (64GiB..128GiB).
-        const L1_1_BASE: usize = 64 * 1024 * 1024 * 1024; // 64GiB
-        let l2_hi_page = bump.alloc_page();
-        let l2_hi_table = l2_hi_page as *mut u64;
-        let l1_hi_desc = (l2_hi_page as u64 & super::mem::PTE_ADDR_MASK) | DESC_VALID | DESC_TABLE;
-        core::ptr::write_volatile(l1_table.add(1), l1_hi_desc);
-
-        // Map blocks 62..=63 within L1[1]'s L2 table:
-        //   block 62: 0x107C000000..0x107DFFFFFF (covers UART at 0x107D001000)
-        //   block 63: 0x107E000000..0x107FFFFFFF (covers GIC  at 0x107FFF9000)
-        for block in 62usize..=63 {
-            let phys = L1_1_BASE + block * L2_BLOCK_SIZE;
-            let desc = (phys as u64 & L2_BLOCK_ADDR_MASK) | BLOCK_DEVICE_RW;
-            core::ptr::write_volatile(l2_hi_table.add(block), desc);
-        }
-    }
-
-    // 7. Set up MMU system registers
-    // MAIR_EL1: memory attribute indirection register
-    asm!("msr mair_el1, {}", in(reg) MAIR_VALUE, options(nomem, nostack));
-
-    // TCR_EL1: translation control register
-    asm!("msr tcr_el1, {}", in(reg) TCR_VALUE, options(nomem, nostack));
-
-    // TTBR0_EL1: user/kernel page table base (identity map for now)
-    // ASID = 0 in upper bits (kernel uses ASID 0)
-    asm!("msr ttbr0_el1, {}", in(reg) l1_page as u64, options(nomem, nostack));
-
-    // TTBR1_EL1: kernel upper-half page table (empty for now — we'll use it
-    // later when the kernel is re-linked at upper VA). Set to same L1 to avoid
-    // faults on accidental upper-half accesses.
-    asm!("msr ttbr1_el1, {}", in(reg) l1_page as u64, options(nomem, nostack));
-
-    // Ensure all writes to page tables are visible before enabling MMU
-    asm!("dsb ish", options(nomem, nostack));
-    asm!("isb", options(nomem, nostack));
-
-    // Invalidate all TLB entries
-    asm!("tlbi vmalle1is", options(nomem, nostack));
-    asm!("dsb ish", options(nomem, nostack));
-    asm!("isb", options(nomem, nostack));
-
-    // 8. Enable MMU
-    // Set SCTLR_EL1 explicitly instead of read-modify-write, to avoid
-    // inheriting unwanted bits from the reset value (which is IMPDEF).
-    let sctlr: u64 = (1 << 0)   // M: enable MMU
-                    | (1 << 2)   // C: enable data cache
-                    | (1 << 3)   // SA: SP alignment check
-                    | (1 << 12)  // I: enable instruction cache
-                    | (1 << 26)  // UCI: allow EL0 cache maintenance
-                    ; // WXN (bit 19) = 0: don't enforce W→XN for EL1
-                      // EE (bit 25) = 0: little-endian at EL1
-    asm!(
-        "msr sctlr_el1, {}",
-        "isb",
-        in(reg) sctlr,
-        options(nomem, nostack),
-    );
-
-    // MMU is now ON. Identity mapping means VA = PA for everything we mapped.
-    // The kernel continues running at the same physical addresses.
 
     let bootstrap_end = bump.current();
 
@@ -405,7 +256,6 @@ pub unsafe fn enable_mmu(fdt_ptr: *const u8) -> BootInfo {
         ram_size,
         page_tracker_base,
         page_tracker_size,
-        ttbr0: l1_page,
         bootstrap_end,
     }
 }
@@ -417,7 +267,7 @@ pub unsafe fn enable_mmu(fdt_ptr: *const u8) -> BootInfo {
 ///
 /// # Safety
 ///
-/// Must be called after `enable_mmu` returns.
+/// Must be called after `init_memory` returns.
 pub unsafe fn init_memory_manager(info: &BootInfo) {
     use xous::PID;
 
@@ -425,29 +275,21 @@ pub unsafe fn init_memory_manager(info: &BootInfo) {
     let num_pages = info.ram_size / PAGE_SIZE;
     let pid1 = PID::new(1).unwrap();
 
-    // Build the allocations slice from the page tracker region
+    // Build the allocations slice from the page tracker region (at high VA)
     let alloc_ptr = info.page_tracker_base as *mut Option<PID>;
     let allocations = core::slice::from_raw_parts_mut(alloc_ptr, num_pages);
 
     // Mark all pages as free initially
     allocations.fill(None);
 
-    // Mark kernel + bootstrap pages as owned by PID 1
-    let k_start_page = (kernel_start() - ram_base) / PAGE_SIZE;
-    let bootstrap_end_page = (BumpAllocator::align_up(info.bootstrap_end) - ram_base) / PAGE_SIZE;
-    for page in k_start_page..bootstrap_end_page {
-        if page < num_pages {
-            allocations[page] = Some(pid1);
-        }
-    }
-
-    // Also mark the FDT region as used (first 512KB before kernel = 32 pages)
-    let fdt_start_page = 0; // FDT is at ram_base
-    let fdt_end_page = (kernel_start() - ram_base) / PAGE_SIZE;
-    for page in fdt_start_page..fdt_end_page {
-        if page < num_pages {
-            allocations[page] = Some(pid1);
-        }
+    // Mark all pages from ram_base to bootstrap_end as owned by PID 1.
+    // This covers: FDT, boot code (.text.boot), boot page tables (.boot.bss),
+    // kernel image (.text, .rodata, .data), BSS, stack, and page tracker.
+    let bootstrap_phys_end = beetos::virt_to_phys(info.bootstrap_end);
+    let first_used_page = 0; // FDT is at ram_base
+    let last_used_page = (bootstrap_phys_end - ram_base + PAGE_SIZE - 1) / PAGE_SIZE;
+    for page in first_used_page..last_used_page.min(num_pages) {
+        allocations[page] = Some(pid1);
     }
 
     // Initialize the MemoryManager with this page tracker
@@ -618,7 +460,8 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let kstack_phys = crate::mem::MemoryManager::with_mut(|mm| {
         mm.alloc_range(1, PID::new(1).unwrap()).expect("alloc kstack").0
     });
-    core::ptr::write_bytes(kstack_phys as *mut u8, 0, PAGE_SIZE);
+    let kstack_va = beetos::phys_to_virt(kstack_phys);
+    core::ptr::write_bytes(kstack_va as *mut u8, 0, PAGE_SIZE);
 
     // Set shell as current and activate its address space
     super::process::set_current_pid(shell_pid);
@@ -627,11 +470,11 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     });
 
     // Load the process's saved context (PC, SP, SPSR set by setup_process)
-    let frame = kstack_phys as *mut super::process::Thread;
+    let frame = kstack_va as *mut super::process::Thread;
     let proc = super::process::Process::current();
     let tid = proc.current_tid();
     proc.load_context_from_table(tid, frame);
 
     // ERET to EL0 — shell process runs
-    super::asm::_resume_context(kstack_phys as *const u8)
+    super::asm::_resume_context(kstack_va as *const u8)
 }

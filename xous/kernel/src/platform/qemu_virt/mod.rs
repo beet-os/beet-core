@@ -18,26 +18,25 @@ pub mod gic;
 pub mod timer;
 pub mod uart;
 
-/// Default MMIO addresses for QEMU virt (used when FDT parsing is not yet available).
-/// These match QEMU's hw/arm/virt.c defaults.
+/// Default MMIO physical addresses for QEMU virt (from hw/arm/virt.c).
+/// Converted to kernel VA (TTBR1 linear map) at init time via `phys_to_virt`.
 mod defaults {
-    pub const UART0_BASE: usize = 0x0900_0000;
-    pub const GICD_BASE: usize = 0x0800_0000;
-    pub const GICR_BASE: usize = 0x080A_0000;
+    pub const UART0_PHYS: usize = 0x0900_0000;
+    pub const GICD_PHYS: usize = 0x0800_0000;
+    pub const GICR_PHYS: usize = 0x080A_0000;
 }
 
 /// Initialize the QEMU virt platform.
 ///
-/// This is called early in the boot process, before the Xous kernel services start.
-/// We use QEMU virt default addresses since QEMU's memory map is fixed and well-known.
-///
-/// Future improvement: parse FDT for addresses (makes this work with non-default QEMU configs).
+/// Called after MMU is enabled and the kernel is running at high VA (TTBR1).
+/// MMIO addresses are converted to kernel VA via `phys_to_virt` so all
+/// device access goes through TTBR1, not TTBR0.
 pub fn init() {
-    uart::init(defaults::UART0_BASE);
+    uart::init(beetos::phys_to_virt(defaults::UART0_PHYS));
     uart::puts("BeetOS v0.1.0\n");
     uart::puts("Platform: QEMU virt (AArch64)\n");
 
-    gic::init(defaults::GICD_BASE, defaults::GICR_BASE);
+    gic::init(beetos::phys_to_virt(defaults::GICD_PHYS), beetos::phys_to_virt(defaults::GICR_PHYS));
     uart::puts("GIC: initialized\n");
 
     timer::init();

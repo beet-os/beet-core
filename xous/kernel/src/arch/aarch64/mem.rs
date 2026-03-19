@@ -12,8 +12,14 @@
 //!   - L2: 2048 entries, each covering 32 MiB (bits [35:25])
 //!   - L3: 2048 entries, each covering 16 KiB (bits [24:14])
 //!
-//! TTBR0_EL1 holds the user page table root (L1).
-//! TTBR1_EL1 holds the kernel page table root (L1).
+//! # TTBR0 / TTBR1 Split
+//!
+//! TTBR0_EL1 holds the user page table root — changes on every context switch.
+//! TTBR1_EL1 holds the kernel page table root — set once at boot, never changed.
+//!
+//! The kernel runs at high VA (0xFFFF_8000_...) through TTBR1.
+//! User processes use low VA (0x0000_...) through TTBR0.
+//! The kernel accesses physical memory via `beetos::phys_to_virt(pa)`.
 
 use core::arch::asm;
 
@@ -162,24 +168,12 @@ fn flags_to_pte(flags: MemoryFlags, user: bool) -> u64 {
     pte
 }
 
-/// Boot-time kernel TTBR0 (identity-map L1 table).
-/// Set once during early boot; read by `MemoryMapping::allocate()` to copy
-/// the kernel's L1[0] entry into every user process's page table.
-static mut KERNEL_BOOT_TTBR0: usize = 0;
-
-/// Store the kernel's boot TTBR0 so it can be shared with user processes.
-///
-/// # Safety
-///
-/// Must be called exactly once during early boot, before any user processes
-/// are created.
-pub unsafe fn set_kernel_boot_ttbr0(ttbr0: usize) {
-    KERNEL_BOOT_TTBR0 = ttbr0;
-}
-
 /// The memory mapping for a single process.
 /// On AArch64, this is essentially the TTBR0_EL1 value (user page table root)
 /// plus the ASID.
+///
+/// User process mappings go into TTBR0 (low VA addresses).
+/// The kernel lives in TTBR1 (high VA) and is NOT part of any process's mapping.
 #[derive(Copy, Clone, Default, Debug, PartialEq)]
 pub struct MemoryMapping {
     /// Physical address of the L1 page table for this process (stored in TTBR0_EL1).
@@ -223,6 +217,8 @@ impl MemoryMapping {
     }
 
     /// Activate this mapping — switch TTBR0_EL1 and CONTEXTIDR_EL1.
+    ///
+    /// Only TTBR0 changes (user address space). TTBR1 (kernel) never changes.
     pub fn activate(self) {
         let ttbr0_val = self.ttbr0 as u64 | ((self.pid as u64) << 48); // ASID in upper bits
         unsafe {
@@ -237,7 +233,11 @@ impl MemoryMapping {
         }
     }
 
-    /// Allocate a new page table hierarchy for a process.
+    /// Allocate a new page table hierarchy for a user process.
+    ///
+    /// Creates a fresh L1 table for TTBR0. The table is initially empty —
+    /// user pages are mapped into it as needed. The kernel is NOT mapped
+    /// in user TTBR0; it lives in TTBR1 which never changes.
     ///
     /// # Safety
     ///
@@ -248,40 +248,12 @@ impl MemoryMapping {
             mm.alloc_range(1, pid).map(|(addr, _zeroed)| addr).map_err(|_| Error::OutOfMemory)
         })?;
 
-        // Zero the L1 table
-        let l1_ptr = l1_phys as *mut u8;
-        core::ptr::write_bytes(l1_ptr, 0, PAGE_SIZE);
+        // Zero the L1 table (access via high VA through TTBR1)
+        let l1_va = beetos::phys_to_virt(l1_phys);
+        core::ptr::write_bytes(l1_va as *mut u8, 0, PAGE_SIZE);
 
-        // Deep-copy the kernel's identity-map page tables into the user L1.
-        //
-        // The kernel runs identity-mapped via TTBR0 with code/data in L1[0].
-        // User processes switch TTBR0 on context switch, so their L1 must include
-        // the kernel mapping for syscall/exception handlers to work.
-        //
-        // We cannot just copy the L1[0] entry (which points to the kernel's L2
-        // table) because load_elf might overlay L3 pages on top of L2 entries
-        // for user code at low VAs. If they shared the same L2 table, that
-        // would corrupt the kernel's device mappings.
-        //
-        // Instead, allocate a fresh L2 table and copy the kernel's L2 contents.
-        let kernel_ttbr0 = KERNEL_BOOT_TTBR0;
-        if kernel_ttbr0 != 0 {
-            let kernel_l1 = kernel_ttbr0 as *const u64;
-            let kernel_l1_entry0 = core::ptr::read_volatile(kernel_l1);
-            if kernel_l1_entry0 & PTE_VALID != 0 {
-                // Allocate a new L2 table for this process
-                let new_l2 = crate::mem::MemoryManager::with_mut(|mm| {
-                    mm.alloc_range(1, pid).map(|(addr, _)| addr).map_err(|_| Error::OutOfMemory)
-                })?;
-                // Copy the kernel's L2 contents
-                let kernel_l2 = (kernel_l1_entry0 & PTE_ADDR_MASK) as *const u8;
-                core::ptr::copy_nonoverlapping(kernel_l2, new_l2 as *mut u8, PAGE_SIZE);
-                // Point user L1[0] at the new L2 copy
-                let user_l1 = l1_phys as *mut u64;
-                let desc = (new_l2 as u64 & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
-                core::ptr::write_volatile(user_l1, desc);
-            }
-        }
+        // User TTBR0 starts empty — no kernel mappings needed.
+        // The kernel runs entirely in TTBR1 (high VA).
 
         self.ttbr0 = l1_phys;
         self.pid = pid.get() as usize;
@@ -297,6 +269,9 @@ impl MemoryMapping {
     }
 
     /// Map a physical page into this address space.
+    ///
+    /// Page tables are accessed via `phys_to_virt()` (through TTBR1),
+    /// so this works regardless of the current TTBR0 setting.
     pub fn map_page(
         &mut self,
         mm: &mut MemoryManager,
@@ -309,7 +284,8 @@ impl MemoryMapping {
         let pte_flags = flags_to_pte(flags, map_user);
 
         // Walk or allocate L1 → L2 → L3
-        let l1_table = self.ttbr0 as *mut u64;
+        // Access the L1 table at its high VA (through TTBR1)
+        let l1_table = beetos::phys_to_virt(self.ttbr0) as *mut u64;
         let l1_idx = l1_index(va);
         let l2_table = self.ensure_table(mm, l1_table, l1_idx)?;
         let l2_idx = l2_index(va);
@@ -329,6 +305,9 @@ impl MemoryMapping {
     }
 
     /// Ensure a next-level table exists at `table[index]`. If not, allocate one.
+    ///
+    /// `table` is a high VA pointer (accessed through TTBR1).
+    /// Returns a high VA pointer to the next-level table.
     fn ensure_table(
         &self,
         mm: &mut MemoryManager,
@@ -337,38 +316,41 @@ impl MemoryMapping {
     ) -> Result<*mut u64, Error> {
         let entry = unsafe { core::ptr::read_volatile(table.add(index)) };
         if entry & PTE_VALID != 0 && entry & PTE_TABLE != 0 {
-            // Table already exists
-            Ok((entry & PTE_ADDR_MASK) as *mut u64)
+            // Table already exists — extract its PA and convert to high VA
+            let next_pa = (entry & PTE_ADDR_MASK) as usize;
+            Ok(beetos::phys_to_virt(next_pa) as *mut u64)
         } else {
-            // Allocate a new table page
+            // Allocate a new table page (returns PA)
             let pid = PID::new(self.pid as u8).unwrap_or(unsafe { PID::new_unchecked(1) });
-            let new_table = mm.alloc_range(1, pid).map(|(addr, _zeroed)| addr).map_err(|_| Error::OutOfMemory)?;
-            unsafe { core::ptr::write_bytes(new_table as *mut u8, 0, PAGE_SIZE) };
+            let new_table_pa = mm.alloc_range(1, pid).map(|(addr, _zeroed)| addr).map_err(|_| Error::OutOfMemory)?;
+            // Zero the new table (via high VA)
+            let new_table_va = beetos::phys_to_virt(new_table_pa);
+            unsafe { core::ptr::write_bytes(new_table_va as *mut u8, 0, PAGE_SIZE) };
 
-            // Write table descriptor
-            let desc = (new_table as u64 & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
+            // Write table descriptor (PA in the PTE, not VA)
+            let desc = (new_table_pa as u64 & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
             unsafe { core::ptr::write_volatile(table.add(index), desc) };
 
-            Ok(new_table as *mut u64)
+            Ok(new_table_va as *mut u64)
         }
     }
 
     /// Unmap a page at the given virtual address.
     pub fn unmap_page(&self, virt: *mut usize) -> Result<(), Error> {
         let va = virt as usize;
-        let l1_table = self.ttbr0 as *mut u64;
+        let l1_table = beetos::phys_to_virt(self.ttbr0) as *mut u64;
 
-        // Walk L1 → L2 → L3
+        // Walk L1 → L2 → L3 (all via high VA)
         let l1_entry = unsafe { core::ptr::read_volatile(l1_table.add(l1_index(va))) };
         if l1_entry & PTE_VALID == 0 {
             return Err(Error::BadAddress);
         }
-        let l2_table = (l1_entry & PTE_ADDR_MASK) as *mut u64;
+        let l2_table = beetos::phys_to_virt((l1_entry & PTE_ADDR_MASK) as usize) as *mut u64;
         let l2_entry = unsafe { core::ptr::read_volatile(l2_table.add(l2_index(va))) };
         if l2_entry & PTE_VALID == 0 {
             return Err(Error::BadAddress);
         }
-        let l3_table = (l2_entry & PTE_ADDR_MASK) as *mut u64;
+        let l3_table = beetos::phys_to_virt((l2_entry & PTE_ADDR_MASK) as usize) as *mut u64;
         let l3_idx = l3_index(va);
 
         // Clear the entry
@@ -433,18 +415,18 @@ impl MemoryMapping {
     /// Translate a virtual address to its physical address.
     pub fn virt_to_phys(&self, virt: *const usize) -> Result<usize, Error> {
         let va = virt as usize;
-        let l1_table = self.ttbr0 as *mut u64;
+        let l1_table = beetos::phys_to_virt(self.ttbr0) as *mut u64;
 
         let l1_entry = unsafe { core::ptr::read_volatile(l1_table.add(l1_index(va))) };
         if l1_entry & PTE_VALID == 0 {
             return Err(Error::BadAddress);
         }
-        let l2_table = (l1_entry & PTE_ADDR_MASK) as *mut u64;
+        let l2_table = beetos::phys_to_virt((l1_entry & PTE_ADDR_MASK) as usize) as *mut u64;
         let l2_entry = unsafe { core::ptr::read_volatile(l2_table.add(l2_index(va))) };
         if l2_entry & PTE_VALID == 0 {
             return Err(Error::BadAddress);
         }
-        let l3_table = (l2_entry & PTE_ADDR_MASK) as *mut u64;
+        let l3_table = beetos::phys_to_virt((l2_entry & PTE_ADDR_MASK) as usize) as *mut u64;
         let l3_entry = unsafe { core::ptr::read_volatile(l3_table.add(l3_index(va))) };
         if l3_entry & PTE_VALID == 0 {
             return Err(Error::BadAddress);
@@ -525,9 +507,12 @@ impl MemoryMapping {
         // Allocate a new physical page and map it as user read-write.
         let pid = mapping.get_pid();
         let (phys, zeroed) = mm.alloc_range(1, pid)?;
-        // Zero the page if it wasn't already zeroed
+        // Zero the page if it wasn't already zeroed (via high VA)
         if !zeroed {
-            unsafe { core::ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE) };
+            unsafe {
+                let va = beetos::phys_to_virt(phys);
+                core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE);
+            };
         }
         let mut mapping = mapping;
         mapping.map_page(mm, phys, address, MemoryFlags::W, true)
