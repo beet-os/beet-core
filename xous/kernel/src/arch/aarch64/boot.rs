@@ -442,36 +442,37 @@ pub unsafe fn init_memory_manager(info: &BootInfo) {
 const USER_CODE_VA: usize = 0x0000_0001_0000_0000; // 4 GiB
 const USER_STACK_VA: usize = 0x0000_0001_0001_0000; // 4 GiB + 64KB
 
-/// Minimal AArch64 user program: performs a GetProcessId syscall, then WFE loop.
+/// Minimal AArch64 user program: GetProcessId syscall, then Yield in a loop.
 /// This is the raw machine code that will be mapped as the user's .text page.
 ///
 /// ```asm
 ///     mov x0, #33          // SysCallNumber::GetProcessId = 33
-///     svc #0               // trap to EL1 — kernel dispatches syscall
+///     svc #0               // trap to EL1
 ///     // On return: X0 = result tag (8 = ProcessID), X1 = PID value
 /// .loop:
-///     wfe
+///     mov x0, #3           // SysCallNumber::Yield = 3
+///     svc #0
 ///     b .loop
 /// ```
-static USER_PROGRAM: [u32; 4] = [
+static USER_PROGRAM: [u32; 5] = [
     0xd280_0420, // mov x0, #33 (GetProcessId)
     0xd400_0001, // svc #0
-    0xd503_205f, // wfe
-    0x17ff_ffff, // b .-4 (branch back to wfe)
+    0xd280_0060, // mov x0, #3 (Yield)
+    0xd400_0001, // svc #0
+    0x17ff_fffe, // b .-8 (branch back to mov x0, #3)
 ];
 
-/// Launch a minimal user process in EL0.
+/// Launch a minimal user process in EL0, registered in SystemServices.
 ///
-/// This is a proof-of-concept: allocates one code page and one stack page,
-/// creates a new TTBR0 with the kernel identity-mapped (EL1-only) plus
-/// user code (RX) and stack (RW), then ERETs to EL0.
-///
-/// The process runs an infinite WFE loop. The kernel can observe it ran
-/// by checking that the first timer IRQ from EL0 is handled correctly.
+/// Creates PID 2 as a proper Xous process:
+/// - Registered in SystemServices with MemoryMapping, thread state, scheduler
+/// - Has its own address space (TTBR0) with kernel identity-mapped at EL1-only
+/// - User code page (RX at EL0) and stack page (RW at EL0)
+/// - Can make syscalls (Yield, GetProcessId, etc.) through the normal dispatch
 ///
 /// # Safety
 ///
-/// Must be called after MMU and MemoryManager are initialized.
+/// Must be called after MMU, MemoryManager, and SystemServices (init_pid1) are initialized.
 /// Does not return — enters EL0 via ERET.
 pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
     use xous::{MemoryFlags, PID};
@@ -481,88 +482,100 @@ pub unsafe fn launch_first_process(boot_info: &BootInfo) -> ! {
 
     let pid2 = PID::new(2).unwrap();
 
-    // 1. Allocate a new L1 page table for the user process
+    // 1. Set up the process's address space with user code and stack
     let mut user_mapping = super::mem::MemoryMapping::default();
     crate::mem::MemoryManager::with_mut(|mm| {
         user_mapping.allocate(pid2).expect("alloc user L1");
 
-        // 2. Copy kernel L2 table reference into user L1.
+        // Copy kernel L2 table reference into user L1.
         // The kernel's L1[0] points to an L2 table with identity-mapped RAM + MMIO.
-        // We copy this descriptor so the kernel is accessible at EL1 within the
-        // user's address space (user can't access it — AP bits are EL1-only).
+        // User can't access it — AP bits are EL1-only.
         let kernel_l1 = boot_info.ttbr0 as *const u64;
         let user_l1 = user_mapping.ttbr0() as *mut u64;
         let kernel_l1_entry0 = core::ptr::read_volatile(kernel_l1);
         core::ptr::write_volatile(user_l1, kernel_l1_entry0);
 
-        // 3. Allocate a physical page for user code and copy the program into it
+        // Allocate and map user code page (RX at EL0)
         let (code_phys, _) = mm.alloc_range(1, pid2).expect("alloc code page");
         core::ptr::write_bytes(code_phys as *mut u8, 0, PAGE_SIZE);
-        let code_src = USER_PROGRAM.as_ptr() as *const u8;
         core::ptr::copy_nonoverlapping(
-            code_src,
+            USER_PROGRAM.as_ptr() as *const u8,
             code_phys as *mut u8,
             USER_PROGRAM.len() * 4,
         );
-
-        // Map user code page as RX at EL0
         user_mapping.map_page(
-            mm,
-            code_phys,
-            USER_CODE_VA as *mut usize,
-            MemoryFlags::X,
-            true,  // user page
+            mm, code_phys, USER_CODE_VA as *mut usize,
+            MemoryFlags::X, true,
         ).expect("map code page");
 
-        // 4. Allocate a physical page for user stack
+        // Allocate and map user stack page (RW at EL0)
         let (stack_phys, _) = mm.alloc_range(1, pid2).expect("alloc stack page");
         core::ptr::write_bytes(stack_phys as *mut u8, 0, PAGE_SIZE);
-
-        // Map user stack page as RW at EL0
         user_mapping.map_page(
-            mm,
-            stack_phys,
-            USER_STACK_VA as *mut usize,
-            MemoryFlags::W,
-            true,  // user page
+            mm, stack_phys, USER_STACK_VA as *mut usize,
+            MemoryFlags::W, true,
         ).expect("map stack page");
     });
 
-    // 5. Build a context frame for the user thread.
-    // Allocate a page for the thread's kernel stack / context save area.
+    // 2. Register PID 2 in SystemServices and set up arch-level thread context.
+    //
+    // This makes the process visible to the Xous kernel: the Scheduler
+    // knows about it, Yield can park/ready the thread, and IPC can
+    // route messages to it.
+    crate::services::SystemServices::with_mut(|ss| {
+        use crate::process::{Process, INITIAL_TID, ThreadState};
+        use super::process::{Process as ArchProcess, ProcessSetup};
+
+        // Register in SystemServices (kernel-level process table)
+        let mut process = Process::new(
+            user_mapping,
+            pid2,
+            PID::new(1).unwrap(),  // parent = kernel
+            [0x32444950u32, 0, 0, 0].into(),  // AppId = 'PID2'
+        );
+        process.set_name(b"init").expect("set process name");
+        process.set_syscall_permissions(u64::MAX);  // full permissions for now
+        process.set_thread_state(INITIAL_TID, ThreadState::Ready);
+        ss.insert_process(1, process);  // slot index 1 = PID 2
+
+        // Set up arch-level thread context in PROCESS_TABLE
+        let stack = xous::MemoryRange::new(USER_STACK_VA, PAGE_SIZE)
+            .expect("stack range");
+        let irq_stack = xous::MemoryRange::new(USER_STACK_VA, PAGE_SIZE)
+            .expect("irq stack range");
+        ArchProcess::setup_process(
+            ProcessSetup {
+                pid: pid2,
+                entry_point: USER_CODE_VA,
+                stack,
+                irq_stack,
+                aslr_slide: 0,
+            },
+            ss,
+        ).expect("setup process");
+    });
+
+    // 4. Build a context frame for the initial ERET to EL0.
     let kstack_phys = crate::mem::MemoryManager::with_mut(|mm| {
         mm.alloc_range(1, PID::new(1).unwrap()).expect("alloc kstack").0
     });
     core::ptr::write_bytes(kstack_phys as *mut u8, 0, PAGE_SIZE);
 
-    // Place the context frame at the bottom of the kernel stack page.
-    // After restore_context, SP_EL1 = context_ptr + 816.
-    // This leaves the rest of the page as kernel stack space for exception handlers.
     let context_ptr = kstack_phys as *mut u64;
-
-    // Write context frame (matches asm.S save_context layout):
-    //   [0..248]    X0-X30 (all zero)
-    //   [248]       SP_EL0 = top of user stack page
-    //   [256]       ELR_EL1 = user code entry point
-    //   [264]       SPSR_EL1 = 0 (EL0t, interrupts enabled)
-    //   [272..816]  TPIDR, FPCR, FPSR, pad, V0-V31 (all zero)
-
-    // SP_EL0: stack grows downward, so SP = top of the stack page
     let user_sp = USER_STACK_VA + PAGE_SIZE;
-    core::ptr::write_volatile(context_ptr.add(31), user_sp as u64);  // offset 248 = SP_EL0
+    core::ptr::write_volatile(context_ptr.add(31), user_sp as u64);   // SP_EL0
+    core::ptr::write_volatile(context_ptr.add(32), USER_CODE_VA as u64);  // ELR_EL1
+    core::ptr::write_volatile(context_ptr.add(33), 0u64);             // SPSR_EL1 = EL0t
 
-    // ELR_EL1: entry point = start of user code page
-    core::ptr::write_volatile(context_ptr.add(32), USER_CODE_VA as u64);  // offset 256
-
-    // SPSR_EL1: 0 = EL0t (user mode, AArch64, all interrupts enabled)
-    core::ptr::write_volatile(context_ptr.add(33), 0u64);  // offset 264
-
-    // 6. Switch to user address space
-    user_mapping.activate();
+    // 5. Switch to user address space and set current PID
+    super::process::set_current_pid(pid2);
+    crate::services::SystemServices::with_mut(|ss| {
+        ss.process(pid2).expect("pid2 not registered").activate();
+    });
 
     #[cfg(feature = "platform-qemu-virt")]
-    crate::platform::qemu_virt::uart::puts("EL0: launching user process (wfe loop)...\n");
+    crate::platform::qemu_virt::uart::puts("EL0: launching user process...\n");
 
-    // 7. ERET to EL0
+    // 6. ERET to EL0
     super::asm::_resume_context(context_ptr as *const u8)
 }

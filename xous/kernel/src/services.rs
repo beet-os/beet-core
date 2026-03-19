@@ -314,6 +314,13 @@ impl SystemServices {
         self.processes[Self::process_index(pid)].as_mut().ok_or(Error::ProcessNotFound)
     }
 
+    /// Insert a pre-built process into the process table at the given slot index.
+    /// Used during early boot to register processes created outside of create_process().
+    #[cfg(beetos)]
+    pub fn insert_process(&mut self, slot_index: usize, process: Process) {
+        self.processes[slot_index] = Some(process);
+    }
+
     pub fn free_process(&mut self, pid: PID) { self.processes[Self::process_index(pid)] = None; }
 
     pub fn current_process(&self) -> &Process { self.process(current_pid()).unwrap() }

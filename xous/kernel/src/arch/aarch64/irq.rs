@@ -63,13 +63,15 @@ unsafe extern "C" fn _user_sync_handler_rust(context: *mut u8) {
 #[no_mangle]
 unsafe extern "C" fn _user_irq_handler_rust(_context: *mut u8) {
     // Report the first IRQ from EL0 as proof that userspace is running
-    static mut FIRST_EL0_IRQ: bool = true;
-    if FIRST_EL0_IRQ {
-        FIRST_EL0_IRQ = false;
-        #[cfg(feature = "platform-qemu-virt")]
-        crate::platform::qemu_virt::uart::puts(
-            "\n*** SUCCESS: first IRQ from EL0! User process is running in its own address space. ***\n"
-        );
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static FIRST_EL0_IRQ: AtomicBool = AtomicBool::new(true);
+        if FIRST_EL0_IRQ.swap(false, Ordering::Relaxed) {
+            crate::platform::qemu_virt::uart::puts(
+                "\n*** SUCCESS: first IRQ from EL0! User process is running in its own address space. ***\n"
+            );
+        }
     }
     handle_irq();
 }
@@ -160,36 +162,53 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
     let proc = Process::current();
     let tid = proc.current_tid();
 
+    // Log the first N syscalls for debugging, then go quiet.
     #[cfg(feature = "platform-qemu-virt")]
     {
-        use core::fmt::Write;
-        let _ = write!(
-            crate::platform::qemu_virt::uart::UartWriter,
-            "SVC: PID {} TID {} {:?}\n",
-            crate::arch::process::current_pid(), tid, call,
-        );
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static SVC_COUNT: AtomicU32 = AtomicU32::new(0);
+        let n = SVC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 10 {
+            use core::fmt::Write;
+            let _ = write!(
+                crate::platform::qemu_virt::uart::UartWriter,
+                "SVC[{}]: PID {} TID {} {:?}\n",
+                n, crate::arch::process::current_pid(), tid, call,
+            );
+        }
     }
 
-    // Dispatch the syscall through the Xous kernel
+    // Dispatch the syscall through the Xous kernel.
+    //
+    // Syscalls like Yield and SendMessage set the thread result via
+    // SystemServices::set_thread_result() (writes to PROCESS_TABLE) and
+    // return ResumeProcess. Other syscalls (GetProcessId, etc.) return
+    // the result directly.
     let response = crate::syscall::handle(tid, call)
         .unwrap_or_else(XousResult::Error);
 
-    // Write the result directly into the saved context frame.
-    // restore_context (asm.S) will load these registers before ERET.
-    //
-    // ResumeProcess means the kernel already arranged a context switch
-    // (e.g. waking a blocked thread) — don't overwrite.
-    if response != XousResult::ResumeProcess {
+    if response == XousResult::ResumeProcess {
+        // The kernel wrote the result to PROCESS_TABLE.threads[tid].
+        // Copy it to the stack frame so restore_context picks it up.
+        let result_args = proc.thread(tid).get_args();
+        frame.set_args(&result_args);
+    } else {
+        // Simple syscall — write the result directly to the stack frame.
         frame.set_args(&response.to_args());
     }
 
     #[cfg(feature = "platform-qemu-virt")]
     {
-        use core::fmt::Write;
-        let _ = write!(
-            crate::platform::qemu_virt::uart::UartWriter,
-            "SVC result: {:?}\n", response,
-        );
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static SVC_RESULT_COUNT: AtomicU32 = AtomicU32::new(0);
+        let n = SVC_RESULT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 10 {
+            use core::fmt::Write;
+            let _ = write!(
+                crate::platform::qemu_virt::uart::UartWriter,
+                "  => {:?}\n", response,
+            );
+        }
     }
 }
 
