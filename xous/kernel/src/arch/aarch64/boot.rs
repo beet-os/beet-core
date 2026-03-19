@@ -626,12 +626,15 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         ss.process(shell_pid).expect("shell not registered").activate();
     });
 
-    // Load the process's saved context (PC, SP, SPSR set by setup_process)
-    let frame = kstack_phys as *mut super::process::Thread;
+    // Load the process's saved context (PC, SP, SPSR set by setup_process).
+    // Use the TTBR1 address for the frame so restore_context reads via TTBR1
+    // (never switched), not via TTBR0 (which points to the shell's page tables).
+    let kstack_high = kstack_phys | 0xFFFF_8000_0000_0000;
+    let frame = kstack_high as *mut super::process::Thread;
     let proc = super::process::Process::current();
     let tid = proc.current_tid();
     proc.load_context_from_table(tid, frame);
 
     // ERET to EL0 — shell process runs
-    super::asm::_resume_context(kstack_phys as *const u8)
+    super::asm::_resume_context(kstack_high as *const u8)
 }

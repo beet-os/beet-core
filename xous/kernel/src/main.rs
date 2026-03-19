@@ -70,6 +70,23 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     // The MemoryManager is initialized with a page tracker covering all RAM.
     let boot_info = arch::boot::enable_mmu(arg_offset as *const u8);
 
+    // Switch the kernel stack pointer from the identity-map (TTBR0) address
+    // to the TTBR1 equivalent. TTBR1 points to the same L1 as the boot TTBR0
+    // and is NEVER switched during context changes. This ensures the kernel
+    // stack is always accessed via a stable page table, preventing QEMU softmmu
+    // from serving stale data when TTBR0 changes between user processes.
+    //
+    // The TTBR1 valid range starts at 0xFFFF_8000_0000_0000 (with T1SZ=17).
+    // Adding this prefix to a low VA produces a TTBR1 VA that maps to the
+    // same L1 index → same L2 block → same physical address.
+    #[cfg(beetos)]
+    unsafe {
+        let sp: usize;
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack));
+        let sp_high = sp | 0xFFFF_8000_0000_0000;
+        core::arch::asm!("mov sp, {}", in(reg) sp_high, options(nomem, nostack));
+    }
+
     #[cfg(feature = "platform-qemu-virt")]
     {
         use core::fmt::Write;
