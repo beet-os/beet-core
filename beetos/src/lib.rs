@@ -5,6 +5,29 @@
 //!
 //! This crate is the BeetOS equivalent of KeyOS's `keyos` crate.
 //! All addresses are for AArch64 with 16KB pages (Apple Silicon).
+//!
+//! # AArch64 Address Space
+//!
+//! With `TCR_EL1.T0SZ = T1SZ = 17`, AArch64 gives us a 47-bit VA space
+//! split into two halves by the hardware:
+//!
+//! - **TTBR0 (lower half):** `0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF`
+//!   Per-process user space. Switched on every context switch.
+//!
+//! - **TTBR1 (upper half):** `0xFFFF_8000_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF`
+//!   Kernel space. Set once at boot, never changed. The kernel uses a
+//!   **linear map**: `kernel_VA = PA + KERNEL_VA_OFFSET`.
+//!
+//! Addresses between the two halves (bit 47 set but upper bits not all-ones)
+//! generate a translation fault — this is the "VA hole" that separates user
+//! and kernel space.
+//!
+//! # Page Table Geometry (16KB granule)
+//!
+//! Each 16KB page table holds 2048 entries (8 bytes each). The 47-bit VA
+//! is decoded as: L1[11 bits] → L2[11 bits] → L3[11 bits] → offset[14 bits].
+//! See `xous/kernel/src/arch/aarch64/mem.rs` for the full page table
+//! documentation including PTE format, MAIR configuration, and W^X enforcement.
 
 #![no_std]
 
@@ -14,11 +37,22 @@ pub const PAGE_SIZE: usize = 16384;
 /// Log2 of PAGE_SIZE (14 for 16KB).
 pub const PAGE_SHIFT: usize = 14;
 
-// ======================== User-accessible addresses (EL0) ========================
+// ======================== User-accessible addresses (EL0, TTBR0) ========================
 //
-// AArch64 with 4-level page tables and 16KB granule gives us 47-bit VA space.
-// TTBR0_EL1 covers the lower half: 0x0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF
-// TTBR1_EL1 covers the upper half: 0xFFFF_8000_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF
+// All addresses in this section are in the lower VA half (bit 47 = 0), mapped
+// through TTBR0_EL1 which is per-process. Page table entries have nG=1 (non-global)
+// so TLB entries are tagged with the process ASID.
+//
+// Layout (low to high):
+//   0x0000_0000_0000_0000  Null guard page (unmapped, catches null derefs)
+//   0x0000_0001_0000       ASLR region start (code, heap, data)
+//   0x0000_3000_0000_0000  mmap area
+//   0x0000_4000_0000_0000  Memory mirror (CoW, shared memory)
+//   0x0000_5000_0000_0000  Raw ELF temp area
+//   0x0000_5800_0000_0000  Kernel argument table (PID1 only)
+//   0x0000_6FE0_0000_0000  User IRQ stack
+//   0x0000_6FF0_0000_0000  User stack
+//   0x0000_7000_0000_0000  End of user area (thread context above, kernel-only)
 
 /// Start of ASLR range for user processes.
 pub const ASLR_START: usize = 0x0000_0001_0000;
@@ -57,27 +91,57 @@ pub const USER_AREA_END: usize = 0x0000_7000_0000_0000;
 pub const THREAD_CONTEXT_AREA: usize = 0x0000_7000_0000_0000;
 
 // ======================== Global kernel-accessible addresses (TTBR1 / upper half) ========================
+//
+// All addresses in this section are in the upper VA half (bits [63:47] all ones),
+// mapped through TTBR1_EL1 which is set once at boot and never changed.
+// Page table entries are global (nG=0) — TLB entries survive context switches.
+//
+// The kernel uses a SIMPLE LINEAR MAP: kernel_VA = PA + 0xFFFF_8000_0000_0000.
+// This means the kernel can access any physical address (RAM or MMIO) by adding
+// the offset. No per-address page table setup is needed — the boot code maps the
+// entire physical address range at this offset using L2 block descriptors.
+//
+// Layout (low to high within upper half):
+//   0xFFFF_8000_0000_0000  Linear map base (PA 0x0 maps here)
+//   0xFFFF_A000_0000_0000  Physical RAM identity region
+//   0xFFFF_FF80_0000_8000  Allocation tracker bitmaps
+//   0xFFFF_FFFF_FFD0_0000  Kernel code (.text, .rodata, .data)
+//   0xFFFF_FFFF_FFF8_0000  Kernel stack (256KB)
+//   0xFFFF_FFFF_FFFE_4000  IRQ stack (64KB)
+//   0xFFFF_FFFF_FFFF_0000  Exception stack (128KB)
 
 /// Start of kernel virtual address space (upper half).
 pub const KERNEL_VIRT_BASE: usize = 0xFFFF_8000_0000_0000;
 
 /// Offset between physical addresses and kernel virtual addresses.
 ///
-/// The kernel uses a linear map: kernel VA = PA + KERNEL_VA_OFFSET.
+/// The kernel uses a **linear map**: `kernel_VA = PA + KERNEL_VA_OFFSET`.
 /// TTBR1 maps all physical RAM and MMIO at this offset so the kernel
 /// can access any physical address without going through TTBR0.
+///
+/// This is the fundamental mechanism by which the kernel manipulates user
+/// page tables: it reads/writes page table pages at their physical address
+/// + this offset, which goes through TTBR1 regardless of TTBR0 state.
 ///
 /// TTBR0 is reserved for user process page tables and changes on every
 /// context switch. TTBR1 (kernel) never changes.
 pub const KERNEL_VA_OFFSET: usize = KERNEL_VIRT_BASE; // 0xFFFF_8000_0000_0000
 
 /// Convert a physical address to its kernel virtual address (TTBR1 linear map).
+///
+/// Example: `phys_to_virt(0x4000_0000)` → `0xFFFF_8000_4000_0000`
+///
+/// The returned VA goes through TTBR1, which maps all physical memory.
+/// This works regardless of the current TTBR0 (user process) setting.
 #[inline]
 pub const fn phys_to_virt(pa: usize) -> usize {
     pa.wrapping_add(KERNEL_VA_OFFSET)
 }
 
-/// Convert a kernel virtual address to its physical address.
+/// Convert a kernel virtual address back to its physical address.
+///
+/// Only valid for addresses in the TTBR1 linear map range.
+/// Example: `virt_to_phys(0xFFFF_8000_4000_0000)` → `0x4000_0000`
 #[inline]
 pub const fn virt_to_phys(va: usize) -> usize {
     va.wrapping_sub(KERNEL_VA_OFFSET)

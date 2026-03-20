@@ -1,20 +1,63 @@
 // SPDX-FileCopyrightText: 2024 BeetOS contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// AArch64 kernel entry point — TTBR1 kernel mapping.
+// AArch64 kernel entry point — bootstrap page tables and TTBR1 kernel mapping.
 //
-// Boot sequence:
-//   1. _start runs at PA with MMU off (loaded by QEMU -kernel)
-//   2. Drop from EL2 to EL1 if needed, enable FP/SIMD
-//   3. Create bootstrap page tables:
-//      - TTBR0: identity map (PA → PA) for boot transition
-//      - TTBR1: linear map (PA + 0xFFFF_8000_0000_0000 → PA) for kernel
-//   4. Enable MMU
-//   5. Jump to _high_va_entry at high VA (through TTBR1)
-//   6. Set SP, VBAR, clear BSS, call _start_rust — all at high VA
+// This file creates the initial page tables that let the kernel transition
+// from running at physical addresses (MMU off) to running at high virtual
+// addresses through TTBR1 (MMU on).
 //
-// After step 5, ALL kernel code runs through TTBR1. TTBR0 is free
-// for user process page tables and changes on every context switch.
+// ╔═══════════════════════════════════════════════════════════════════════╗
+// ║                        BOOT SEQUENCE                                ║
+// ╠═══════════════════════════════════════════════════════════════════════╣
+// ║  1. _start: entry at PA, MMU OFF                                    ║
+// ║     └─ Drop EL2 → EL1 if needed (RPi5, some QEMU configs)          ║
+// ║     └─ Enable FP/SIMD (CPACR_EL1.FPEN = 0b11)                      ║
+// ║     └─ Save FDT pointer (x0 → x19)                                 ║
+// ║                                                                     ║
+// ║  2. _create_boot_page_tables:                                       ║
+// ║     └─ TTBR0 L1[0] → shared L2 (identity map for boot transition)  ║
+// ║     └─ TTBR1 L1[0] → shared L2 (kernel linear map, permanent)      ║
+// ║     └─ L2[0..31]  = Device blocks (32 × 32MB = 1GB MMIO)           ║
+// ║     └─ L2[32..63] = Normal blocks (32 × 32MB = 1GB RAM)            ║
+// ║                                                                     ║
+// ║  3. _enable_mmu_boot:                                               ║
+// ║     └─ Write MAIR_EL1, TCR_EL1, TTBR0_EL1, TTBR1_EL1              ║
+// ║     └─ TLB invalidate all, DSB+ISB                                  ║
+// ║     └─ Set SCTLR_EL1.M = 1 (MMU ON)                                ║
+// ║                                                                     ║
+// ║  4. Branch to _high_va_entry (absolute address in TTBR1 space)      ║
+// ║     └─ Now executing at 0xFFFF_8000_... through TTBR1               ║
+// ║     └─ Set real kernel stack (SP = _stack_top at high VA)           ║
+// ║     └─ Set VBAR_EL1 to exception vectors at high VA                 ║
+// ║     └─ Clear .bss, call _start_rust(fdt_ptr)                        ║
+// ║                                                                     ║
+// ║  After step 4: ALL kernel code runs through TTBR1.                  ║
+// ║  TTBR0 is free for user process page tables.                        ║
+// ╚═══════════════════════════════════════════════════════════════════════╝
+//
+// BOOTSTRAP PAGE TABLE LAYOUT (16KB granule, L2 block descriptors):
+//
+//   TTBR0 L1 (identity map)     TTBR1 L1 (kernel map)
+//   ┌─────────────────┐         ┌─────────────────┐
+//   │ [0] → L2 (PA)   │         │ [0] → L2 (PA)   │  ← same L2 table!
+//   │ [1..2047] = 0   │         │ [1..2047] = 0   │
+//   └─────────────────┘         └─────────────────┘
+//
+//   Shared L2 table (64 entries used):
+//   ┌──────────────────────────────────────────────────────────┐
+//   │ [0..31]  → Device blocks: PA 0x0000_0000..0x3FFF_FFFF   │  1GB MMIO
+//   │ [32..63] → Normal blocks: PA 0x4000_0000..0x7FFF_FFFF   │  1GB RAM
+//   │ [64..2047] = 0 (unmapped)                                │
+//   └──────────────────────────────────────────────────────────┘
+//
+//   Identity map (TTBR0): VA 0x4000_0000 → PA 0x4000_0000 (same address)
+//   Kernel map  (TTBR1): VA 0xFFFF_8000_4000_0000 → PA 0x4000_0000
+//
+// The identity map lets the CPU keep fetching instructions after MMU enable
+// (PC is still at PA). The kernel map lets us branch to high VA immediately
+// after. Once at high VA, the identity map in TTBR0 is no longer needed and
+// will be replaced by user process page tables.
 
 // ============================================================================
 // Boot section — runs at physical address with MMU off
@@ -83,19 +126,28 @@ _start:
 // ============================================================================
 // Boot page table setup (runs at PA, called from _start)
 // ============================================================================
-// Creates:
-//   TTBR0 identity map: PA 0..2GB → VA 0..2GB (for boot transition)
-//   TTBR1 kernel map:   PA 0..2GB → VA 0xFFFF_8000_0000_0000..+2GB
 //
-// Uses pre-allocated tables in .boot.bss:
-//   _boot_l1_ttbr0 (16KB): L1 table for TTBR0
-//   _boot_l1_ttbr1 (16KB): L1 table for TTBR1
-//   _boot_l2       (16KB): L2 table shared by both (same PA→PA mapping)
+// Creates two L1 tables sharing one L2 table:
 //
-// For 16KB granule:
-//   L1 entry covers 64 GiB (2048 entries × 32 MiB per L2 block)
-//   L2 block covers 32 MiB
-//   We map 64 L2 blocks = 2 GiB (MMIO 0..1GB + RAM 1..2GB)
+//   TTBR0 (identity):  VA 0x0000_0000..0x7FFF_FFFF → PA 0..2GB
+//   TTBR1 (kernel):    VA 0xFFFF_8000_0000_0000..+2GB → PA 0..2GB
+//
+// Pre-allocated in .boot.bss (must be 16KB-aligned for hardware):
+//   _boot_l1_ttbr0 (16KB): L1 table for TTBR0 (identity map)
+//   _boot_l1_ttbr1 (16KB): L1 table for TTBR1 (kernel map)
+//   _boot_l2       (16KB): L2 table shared by both
+//
+// 16KB granule geometry:
+//   L1 entry covers 2048 × 32 MiB = 64 GiB (points to L2 table)
+//   L2 BLOCK entry covers 32 MiB directly (no L3 needed for boot)
+//   We use 64 L2 block entries = 2 GiB total:
+//     [0..31]  = Device (MMIO 0x0..0x3FFF_FFFF)
+//     [32..63] = Normal (RAM  0x4000_0000..0x7FFF_FFFF)
+//
+// Block descriptor bits for L2 (32 MiB blocks):
+//   Device: Valid | AttrIdx=0 | SH=ISH | AF | UXN | PXN = 0x0060_0000_0000_0701
+//   Normal: Valid | AttrIdx=1 | SH=ISH | AF | UXN       = 0x0040_0000_0000_0705
+//           (No PXN — kernel must execute from RAM at boot)
 
 _create_boot_page_tables:
     stp     x29, x30, [sp, #-16]!
@@ -169,50 +221,80 @@ _create_boot_page_tables:
 // ============================================================================
 // Enable MMU (runs at PA, called from _start)
 // ============================================================================
+//
+// Configures the four system registers that control address translation,
+// then flips the MMU enable bit. After `msr sctlr_el1` + `isb`, the CPU
+// fetches the next instruction through the page tables.
+//
+// Register setup order (must be done with MMU OFF):
+//   1. MAIR_EL1  — define memory attribute encodings
+//   2. TCR_EL1   — configure page table walk parameters
+//   3. TTBR0_EL1 — load identity map L1 base (temporary)
+//   4. TTBR1_EL1 — load kernel map L1 base (permanent)
+//   5. TLB invalidate — ensure no stale entries
+//   6. SCTLR_EL1.M = 1 — MMU ON
 
 _enable_mmu_boot:
-    // MAIR_EL1: memory attribute indirection register
-    //   Attr0 = 0x00 (Device-nGnRnE)
-    //   Attr1 = 0xFF (Normal WB, RA, WA, inner+outer)
-    //   Attr2 = 0x44 (Normal non-cacheable)
+    // MAIR_EL1: Memory Attribute Indirection Register
+    // Maps AttrIndx values in PTEs to actual memory type encodings:
+    //   Attr0 (byte 0) = 0x00: Device-nGnRnE (strongest device ordering)
+    //   Attr1 (byte 1) = 0xFF: Normal, Inner+Outer Write-Back, Read+Write Allocate
+    //   Attr2 (byte 2) = 0x44: Normal, Inner+Outer Non-Cacheable
+    // Must match PTE_ATTR_DEVICE/PTE_ATTR_NORMAL/PTE_ATTR_NORMAL_NC in mem.rs
     movz    x0, #0xFF00
     movk    x0, #0x0044, lsl #16
     msr     mair_el1, x0
 
-    // TCR_EL1: translation control register
-    //   T0SZ=17, T1SZ=17 (47-bit VA per half)
-    //   TG0=0b10 (16KB granule), TG1=0b01 (16KB granule)
-    //   IPS=0b101 (48-bit PA)
-    //   SH0=SH1=0b11 (inner shareable)
-    //   ORGN0=IRGN0=ORGN1=IRGN1=0b01 (WB RA WA)
-    // Pre-computed: 0x0000_0005_7511_B511
+    // TCR_EL1: Translation Control Register
+    // Controls page table walk for both TTBR0 (user) and TTBR1 (kernel).
+    //
+    //   T0SZ  = 17  → 47-bit VA for TTBR0 (user):   0x0000_0000..0x7FFF_FFFF_FFFF
+    //   T1SZ  = 17  → 47-bit VA for TTBR1 (kernel):  0xFFFF_8000_0000_0000..0xFFFF_FFFF_FFFF_FFFF
+    //   TG0   = 10  → 16KB granule for TTBR0
+    //   TG1   = 01  → 16KB granule for TTBR1
+    //   IPS   = 101 → 48-bit physical address space
+    //   SH0/1 = 11  → Inner Shareable (page table walks are cache-coherent)
+    //   *RGN* = 01  → Write-Back, Read+Write Allocate (page table walk caching)
+    //
+    // Pre-computed value: 0x0000_0005_7511_B511
+    // Must match TCR_VALUE in mem.rs
     ldr     x0, =0x57511B511
     msr     tcr_el1, x0
 
-    // TTBR0_EL1: identity map (boot only, replaced by user page tables later)
+    // TTBR0_EL1: Translation Table Base Register 0
+    // Points to the boot identity-map L1 table. This is temporary — replaced
+    // by user process page tables after the first context switch.
     adr     x0, _boot_l1_ttbr0
     msr     ttbr0_el1, x0
 
-    // TTBR1_EL1: kernel linear map (permanent, never changed)
+    // TTBR1_EL1: Translation Table Base Register 1
+    // Points to the kernel linear-map L1 table. This is PERMANENT — never
+    // changed after boot. All kernel code and data is accessed through TTBR1.
     adr     x0, _boot_l1_ttbr1
     msr     ttbr1_el1, x0
 
-    // Ensure page table writes are visible
+    // Barrier: ensure all page table writes are visible to the hardware walker
+    // before we enable translation.
     dsb     ish
     isb
 
-    // Invalidate all TLB entries
+    // Invalidate all TLB entries (inner-shareable) to ensure no stale
+    // translations from a previous boot or warm reset.
     tlbi    vmalle1is
     dsb     ish
     isb
 
-    // Enable MMU
-    // SCTLR_EL1: M(0) | C(2) | SA(3) | I(12) | UCI(26)
-    // WXN(19) = 0: don't enforce W→XN for EL1
+    // Enable the MMU by setting SCTLR_EL1 bits:
+    //   M   (bit 0)  = 1: MMU enable
+    //   C   (bit 2)  = 1: Data cache enable
+    //   SA  (bit 3)  = 1: Stack alignment check enable
+    //   I   (bit 12) = 1: Instruction cache enable
+    //   UCI (bit 26) = 1: Allow EL0 to use cache maintenance instructions
+    //   WXN (bit 19) = 0: Do NOT enforce W→XN globally (we enforce W^X per-PTE)
     movz    x0, #0x100D             // bits 0,2,3,12
     movk    x0, #0x0400, lsl #16   // bit 26
     msr     sctlr_el1, x0
-    isb
+    isb                             // Synchronize — next fetch uses MMU
 
     ret
 
