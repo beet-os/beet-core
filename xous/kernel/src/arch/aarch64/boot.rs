@@ -316,12 +316,16 @@ static PROCMAN_ELF: &[u8] = include_bytes!(
 static FS_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/fs.stripped")
 );
+/// hello-std: compiled with Rust std (aarch64-unknown-beetos), stripped to same dir by xtask.
+static HELLO_STD_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/hello-std.stripped")
+);
 /// Embedded binary table: name → ELF bytes.
 /// The kernel holds these via include_bytes! — no filesystem needed.
 /// Used by SpawnByName syscall to create processes by name.
 static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("idle", HELLO_ELF),
-    ("hello", HELLO_ELF),
+    ("hello", HELLO_STD_ELF),
     ("shell", SHELL_ELF),
     ("procman", PROCMAN_ELF),
     ("fs", FS_ELF),

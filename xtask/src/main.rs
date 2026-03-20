@@ -65,6 +65,14 @@ fn parse_platform(args: &[String]) -> String {
     "qemu-virt".to_string()
 }
 
+/// Find the stage1 rustc from the Rust fork (for building std-based apps).
+fn find_stage1_rustc(root: &std::path::Path) -> Option<PathBuf> {
+    // Look for ../rust/build/x86_64-unknown-linux-gnu/stage1/bin/rustc
+    let rust_root = root.parent()?.join("rust");
+    let rustc = rust_root.join("build/x86_64-unknown-linux-gnu/stage1/bin/rustc");
+    if rustc.exists() { Some(rustc) } else { None }
+}
+
 /// Build userspace binaries (apps/) for aarch64-unknown-none.
 fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
     let user_linker = root.join("apps/link-user.x");
@@ -99,25 +107,81 @@ fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
         // Strip debug info to keep the embedded ELF small
         let elf = target_dir.join(app);
         let stripped = target_dir.join(format!("{app}.stripped"));
-        let status = Command::new("llvm-strip")
-            .args(["--strip-debug", "-o"])
-            .arg(&stripped)
-            .arg(&elf)
-            .status()
-            .or_else(|_| {
-                // Fallback to rust-objcopy from cargo-binutils
-                Command::new("rust-objcopy")
-                    .args(["--strip-debug"])
-                    .arg(&elf)
-                    .arg(&stripped)
-                    .status()
-            })?;
-        anyhow::ensure!(status.success(), "stripping app '{app}' failed");
+        strip_binary(&elf, &stripped)?;
 
         let size = std::fs::metadata(&stripped)?.len();
         println!("  {app}.stripped: {size} bytes");
     }
 
+    // Build hello-std with the custom stage1 rustc (aarch64-unknown-beetos target)
+    if let Some(stage1_rustc) = find_stage1_rustc(root) {
+        build_std_app(root, &stage1_rustc, &user_linker, &ws_target)?;
+    } else {
+        println!("  [skip] hello-std: stage1 rustc not found (build ../rust first)");
+    }
+
+    Ok(())
+}
+
+/// Build hello-std using the custom stage1 rustc with aarch64-unknown-beetos target.
+fn build_std_app(
+    root: &std::path::Path,
+    stage1_rustc: &std::path::Path,
+    user_linker: &std::path::Path,
+    ws_target: &std::path::Path,
+) -> anyhow::Result<()> {
+    println!("Building app: hello-std (with std, aarch64-unknown-beetos)");
+    let manifest = root.join("apps/hello-std/Cargo.toml");
+    let linker_arg = format!("-Clink-arg=-T{}", user_linker.display());
+
+    // The stage1 sysroot is the parent of bin/rustc (i.e. the stage1 directory)
+    let sysroot = stage1_rustc
+        .parent().expect("no parent for rustc")
+        .parent().expect("no grandparent for rustc");
+    let sysroot_arg = format!("--sysroot={}", sysroot.display());
+
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--manifest-path",
+            manifest.to_str().expect("non-UTF8 path"),
+            "--target-dir",
+            ws_target.to_str().expect("non-UTF8 path"),
+            "--target",
+            "aarch64-unknown-beetos",
+        ])
+        .env("RUSTC", stage1_rustc)
+        .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1 {sysroot_arg}"))
+        .status()?;
+    anyhow::ensure!(status.success(), "building app 'hello-std' failed");
+
+    // Strip and copy to the no_std target dir so include_bytes! can find it
+    let std_target_dir = ws_target.join("aarch64-unknown-beetos/debug");
+    let nostd_target_dir = ws_target.join("aarch64-unknown-none/debug");
+    let elf = std_target_dir.join("hello-std");
+    let stripped = nostd_target_dir.join("hello-std.stripped");
+    strip_binary(&elf, &stripped)?;
+
+    let size = std::fs::metadata(&stripped)?.len();
+    println!("  hello-std.stripped: {size} bytes");
+    Ok(())
+}
+
+/// Strip debug info from an ELF binary.
+fn strip_binary(elf: &std::path::Path, stripped: &std::path::Path) -> anyhow::Result<()> {
+    let status = Command::new("llvm-strip")
+        .args(["--strip-debug", "-o"])
+        .arg(stripped)
+        .arg(elf)
+        .status()
+        .or_else(|_| {
+            Command::new("rust-objcopy")
+                .args(["--strip-debug"])
+                .arg(elf)
+                .arg(stripped)
+                .status()
+        })?;
+    anyhow::ensure!(status.success(), "stripping {:?} failed", elf.file_name());
     Ok(())
 }
 
@@ -265,7 +329,7 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
     let mut qemu_args = vec![
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
-        "-m".to_string(), "512M".to_string(),
+        "-m".to_string(), "2G".to_string(),
         "-nographic".to_string(),
         "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
     ];

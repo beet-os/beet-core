@@ -561,12 +561,10 @@ impl MemoryManager {
 
         let mut mem = unsafe { MemoryRange::new(virt as usize, size)? };
 
-        // If we allocated DDR pages (or used POPULATE), zero it out
-        #[cfg(beetos)]
-        if zero_after_alloc {
-            mem.as_slice_mut::<u32>().fill(0);
-            current_mapping.flush_cache(mem, xous::CacheOperation::Clean)?;
-        }
+        // Note: zeroing of POPULATE'd pages is skipped here.
+        // The dlmalloc allocator handles zeroing in userspace via allocates_zeros=false.
+        // The original code tried to zero via the user VA which caused a permission fault
+        // (EL1 cannot write to EL0-only pages).
         Ok(mem)
     }
 

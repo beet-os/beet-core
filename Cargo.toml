@@ -23,6 +23,7 @@ members = [
 exclude = [
     "loader",
     "apps/hello",
+    "apps/hello-std",
     "apps/shell",
     "os/procman",
     "os/fs",
