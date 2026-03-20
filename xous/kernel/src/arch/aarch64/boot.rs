@@ -427,12 +427,16 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let fs_pid = PID::new(5).unwrap();
     create_elf_process(fs_pid, FS_ELF, b"fs");
 
-    // Map UART MMIO into procman, shell, and fs for direct output.
+    // Create hello-std demo process (PID 6)
+    let hello_pid = PID::new(6).unwrap();
+    create_elf_process(hello_pid, HELLO_STD_ELF, b"hello");
+
+    // Map UART MMIO into procman, shell, fs, and hello-std for direct output.
     #[cfg(feature = "platform-qemu-virt")]
     {
         crate::services::SystemServices::with_mut(|ss| {
             crate::mem::MemoryManager::with_mut(|mm| {
-                for &pid in &[procman_pid, shell_pid, fs_pid] {
+                for &pid in &[procman_pid, shell_pid, fs_pid, hello_pid] {
                     let process = ss.process_mut(pid).expect("process for UART map");
                     process.mapping.map_page(
                         mm,
@@ -540,6 +544,10 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     {
         let idx = fs_pid.get() as usize - 1;
         super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
+    }
+    {
+        let idx = hello_pid.get() as usize - 1;
+        super::process::set_thread_arg0(idx, SHELL_UART_VA);
     }
 
     #[cfg(feature = "platform-qemu-virt")]

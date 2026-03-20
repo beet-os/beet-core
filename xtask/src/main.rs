@@ -67,10 +67,14 @@ fn parse_platform(args: &[String]) -> String {
 
 /// Find the stage1 rustc from the Rust fork (for building std-based apps).
 fn find_stage1_rustc(root: &std::path::Path) -> Option<PathBuf> {
-    // Look for ../rust/build/x86_64-unknown-linux-gnu/stage1/bin/rustc
     let rust_root = root.parent()?.join("rust");
-    let rustc = rust_root.join("build/x86_64-unknown-linux-gnu/stage1/bin/rustc");
-    if rustc.exists() { Some(rustc) } else { None }
+    for host in &["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin"] {
+        let rustc = rust_root.join(format!("build/{host}/stage1/bin/rustc"));
+        if rustc.exists() {
+            return Some(rustc);
+        }
+    }
+    None
 }
 
 /// Build userspace binaries (apps/) for aarch64-unknown-none.
