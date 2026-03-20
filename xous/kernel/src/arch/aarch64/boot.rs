@@ -313,7 +313,9 @@ static SHELL_ELF: &[u8] = include_bytes!(
 static PROCMAN_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/procman.stripped")
 );
-
+static FS_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/fs.stripped")
+);
 /// Embedded binary table: name → ELF bytes.
 /// The kernel holds these via include_bytes! — no filesystem needed.
 /// Used by SpawnByName syscall to create processes by name.
@@ -322,6 +324,7 @@ static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("hello", HELLO_ELF),
     ("shell", SHELL_ELF),
     ("procman", PROCMAN_ELF),
+    ("fs", FS_ELF),
 ];
 
 /// Look up a binary by name in the embedded binary table.
@@ -404,12 +407,11 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         );
     }
 
-    // Create the idle process first (PID 2) — just WFE loops, absorbs CPU
-    // when no other process is ready.
+    // Create the idle process first (PID 2)
     let idle_pid = PID::new(2).unwrap();
     create_elf_process(idle_pid, HELLO_ELF, b"idle");
 
-    // Create the procman process (PID 3) — process lifecycle manager.
+    // Create the procman process (PID 3)
     let procman_pid = PID::new(3).unwrap();
     create_elf_process(procman_pid, PROCMAN_ELF, b"procman");
 
@@ -417,35 +419,30 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let shell_pid = PID::new(4).unwrap();
     create_elf_process(shell_pid, SHELL_ELF, b"shell");
 
-    // Map UART MMIO into procman and shell address spaces for direct output.
+    // Create the filesystem service (PID 5)
+    let fs_pid = PID::new(5).unwrap();
+    create_elf_process(fs_pid, FS_ELF, b"fs");
+
+    // Map UART MMIO into procman, shell, and fs for direct output.
     #[cfg(feature = "platform-qemu-virt")]
     {
         crate::services::SystemServices::with_mut(|ss| {
             crate::mem::MemoryManager::with_mut(|mm| {
-                // Map UART into procman
-                let process = ss.process_mut(procman_pid).expect("procman process");
-                process.mapping.map_page(
-                    mm,
-                    UART_PHYS,
-                    SHELL_UART_VA as *mut usize,
-                    xous::MemoryFlags::W | xous::MemoryFlags::DEV,
-                    true,
-                ).expect("map UART into procman");
-
-                // Map UART into shell
-                let process = ss.process_mut(shell_pid).expect("shell process");
-                process.mapping.map_page(
-                    mm,
-                    UART_PHYS,
-                    SHELL_UART_VA as *mut usize,
-                    xous::MemoryFlags::W | xous::MemoryFlags::DEV,
-                    true,
-                ).expect("map UART into shell");
+                for &pid in &[procman_pid, shell_pid, fs_pid] {
+                    let process = ss.process_mut(pid).expect("process for UART map");
+                    process.mapping.map_page(
+                        mm,
+                        UART_PHYS,
+                        SHELL_UART_VA as *mut usize,
+                        xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                        true,
+                    ).expect("map UART");
+                }
             });
         });
     }
 
-    // Read disk data from virtio-blk (if available) and map into shell.
+    // Read disk data from virtio-blk and map into the fs service process.
     #[cfg(feature = "platform-qemu-virt")]
     let (disk_va, disk_size) = {
         use crate::platform::qemu_virt::blk;
@@ -455,7 +452,6 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
             let disk_pages = (disk_bytes + beetos::PAGE_SIZE - 1) / beetos::PAGE_SIZE;
 
             if disk_pages > 0 && disk_pages <= 256 {
-                // Allocate pages for disk data (owned by kernel PID 1).
                 let kernel_pid = xous::PID::new(1).unwrap();
                 let mut disk_phys_pages = [0usize; 256];
                 let mut ok = true;
@@ -464,20 +460,16 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
                     for i in 0..disk_pages {
                         match mm.alloc_range(1, kernel_pid) {
                             Ok((pa, _)) => {
-                                // Zero the page
                                 let kva = beetos::phys_to_virt(pa);
                                 core::ptr::write_bytes(kva as *mut u8, 0, beetos::PAGE_SIZE);
                                 disk_phys_pages[i] = pa;
                             }
-                            Err(_) => {
-                                ok = false;
-                            }
+                            Err(_) => { ok = false; }
                         }
                     }
                 });
 
                 if ok {
-                    // Read disk data into allocated pages, page by page.
                     let sectors_per_page = beetos::PAGE_SIZE / blk::SECTOR_SIZE;
                     let mut read_ok = true;
 
@@ -487,7 +479,6 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
                         let lba = (i * sectors_per_page) as u64;
                         let remaining = disk_bytes - i * beetos::PAGE_SIZE;
                         let read_len = core::cmp::min(remaining, beetos::PAGE_SIZE);
-                        // Round up to sector boundary for the read.
                         let read_sectors = (read_len + blk::SECTOR_SIZE - 1) / blk::SECTOR_SIZE;
                         let buf = core::slice::from_raw_parts_mut(
                             kva as *mut u8,
@@ -500,51 +491,50 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
                     }
 
                     if read_ok {
-                        // Map disk pages read-only into shell's address space.
+                        // Map disk pages read-only into the fs service's address space
                         crate::services::SystemServices::with_mut(|ss| {
                             crate::mem::MemoryManager::with_mut(|mm| {
-                                let process = ss.process_mut(shell_pid).expect("shell process");
+                                let process = ss.process_mut(fs_pid).expect("fs process");
                                 for i in 0..disk_pages {
                                     let va = DISK_DATA_VA + i * beetos::PAGE_SIZE;
                                     process.mapping.map_page(
                                         mm,
                                         disk_phys_pages[i],
                                         va as *mut usize,
-                                        xous::MemoryFlags::empty(), // read-only (no W, no X)
+                                        xous::MemoryFlags::empty(),
                                         true,
                                     ).ok();
                                 }
                             });
                         });
 
-                        crate::platform::qemu_virt::uart::puts("Disk: mapped into shell\n");
+                        crate::platform::qemu_virt::uart::puts("Disk: mapped into fs service\n");
                         (DISK_DATA_VA, disk_bytes)
                     } else {
                         crate::platform::qemu_virt::uart::puts("Disk: read failed\n");
                         (0, 0)
                     }
-                } else {
-                    (0, 0)
-                }
-            } else {
-                (0, 0)
-            }
-        } else {
-            (0, 0)
-        }
+                } else { (0, 0) }
+            } else { (0, 0) }
+        } else { (0, 0) }
     };
 
     #[cfg(not(feature = "platform-qemu-virt"))]
     let (disk_va, disk_size) = (0usize, 0usize);
 
     // Pass boot parameters via registers:
-    //   x0 = UART VA, x1 = disk data VA, x2 = disk size in bytes
+    //   procman/shell: x0 = UART VA (no disk access)
+    //   fs service:    x0 = UART VA, x1 = disk VA, x2 = disk size
     {
         let idx = procman_pid.get() as usize - 1;
-        super::process::set_thread_args(idx, SHELL_UART_VA, 0, 0);
+        super::process::set_thread_arg0(idx, SHELL_UART_VA);
     }
     {
         let idx = shell_pid.get() as usize - 1;
+        super::process::set_thread_arg0(idx, SHELL_UART_VA);
+    }
+    {
+        let idx = fs_pid.get() as usize - 1;
         super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
     }
 

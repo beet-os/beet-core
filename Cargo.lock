@@ -50,6 +50,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "beetos-api-fs"
+version = "0.1.0"
+dependencies = [
+ "xous",
+]
+
+[[package]]
 name = "beetos-api-keyboard"
 version = "0.1.0"
 dependencies = [

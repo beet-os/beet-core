@@ -1,0 +1,9 @@
+[package]
+name = "beetos-api-fs"
+version = "0.1.0"
+edition = "2021"
+description = "BeetOS filesystem API — IPC types for the FS service"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+xous = { path = "../../xous/xous-rs" }

@@ -5,38 +5,33 @@
 //!
 //! Receives UART characters from the kernel via IPC, writes output
 //! directly to UART MMIO (mapped into our address space by the kernel).
+//!
+//! File operations (ls, cat, mkdir, rm, write) are delegated to the
+//! filesystem service via Xous IPC (BlockingScalar).
 
 #![no_std]
 #![no_main]
 
-mod ramfs;
-mod tarfs;
-
 use core::fmt::Write;
 use core::panic::PanicInfo;
+
+use beetos_api_fs::{FsError, FsOp, FS_SID};
 
 // ============================================================================
 // UART output via mapped MMIO
 // ============================================================================
 
-/// PL011 register offsets.
 const UART_DR: usize = 0x00;
 const UART_FR: usize = 0x18;
 const UART_FR_TXFF: u32 = 1 << 5;
 
-/// UART base address in our virtual address space.
-/// Set by the kernel via x0 before ERET.
 static mut UART_BASE: usize = 0;
 
 fn putc(c: u8) {
     unsafe {
-        if UART_BASE == 0 {
-            return;
-        }
+        if UART_BASE == 0 { return; }
         let base = UART_BASE;
-        // Wait for TX FIFO to have space
         while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
-        // Add CR before LF for terminal compatibility
         if c == b'\n' {
             core::ptr::write_volatile((base + UART_DR) as *mut u32, b'\r' as u32);
             while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
@@ -45,15 +40,9 @@ fn putc(c: u8) {
     }
 }
 
-fn puts(s: &str) {
-    for b in s.bytes() {
-        putc(b);
-    }
-}
+fn puts(s: &str) { for b in s.bytes() { putc(b); } }
 
-/// Writer for `core::fmt::Write`.
 struct UartWriter;
-
 impl Write for UartWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         puts(s);
@@ -78,9 +67,7 @@ static mut SHELL: Shell = Shell {
     pos: 0,
 };
 
-fn prompt() {
-    puts("bsh> ");
-}
+fn prompt() { puts("bsh> "); }
 
 fn process_char(c: u8) {
     unsafe {
@@ -88,20 +75,13 @@ fn process_char(c: u8) {
             0x7F | 0x08 => {
                 if SHELL.pos > 0 {
                     SHELL.pos -= 1;
-                    putc(0x08);
-                    putc(b' ');
-                    putc(0x08);
+                    putc(0x08); putc(b' '); putc(0x08);
                 }
             }
             b'\r' | b'\n' => {
-                // Coalesce CR+LF: if we just processed a CR, ignore the following LF.
                 static mut LAST_WAS_CR: bool = false;
-                if c == b'\n' && LAST_WAS_CR {
-                    LAST_WAS_CR = false;
-                    return;
-                }
+                if c == b'\n' && LAST_WAS_CR { LAST_WAS_CR = false; return; }
                 LAST_WAS_CR = c == b'\r';
-
                 putc(b'\n');
                 let line_len = SHELL.pos;
                 SHELL.pos = 0;
@@ -112,11 +92,7 @@ fn process_char(c: u8) {
                 }
                 prompt();
             }
-            0x03 => {
-                puts("^C\n");
-                SHELL.pos = 0;
-                prompt();
-            }
+            0x03 => { puts("^C\n"); SHELL.pos = 0; prompt(); }
             0x04 => {
                 if SHELL.pos == 0 {
                     puts("\n(use 'reboot' to restart)\n");
@@ -140,46 +116,41 @@ fn execute_line(line: &[u8]) {
         Ok(s) => s.trim(),
         Err(_) => return,
     };
-    if line_str.is_empty() {
-        return;
-    }
+    if line_str.is_empty() { return; }
 
     let mut args: [&str; MAX_ARGS] = [""; MAX_ARGS];
     let mut argc = 0;
     for part in line_str.split_ascii_whitespace() {
-        if argc < MAX_ARGS {
-            args[argc] = part;
-            argc += 1;
-        }
+        if argc < MAX_ARGS { args[argc] = part; argc += 1; }
     }
-    if argc == 0 {
-        return;
-    }
+    if argc == 0 { return; }
 
     let cmd = args[0];
     let cmd_args = &args[1..argc];
 
     match cmd {
+        // Shell builtins
         "help" => cmd_help(),
         "echo" => cmd_echo(cmd_args),
         "info" => cmd_info(),
-        "mem" => cmd_mem(),
         "pid" => cmd_pid(),
+
+        // FS operations (via IPC to fs service)
         "ls" => cmd_ls(cmd_args),
         "cat" => cmd_cat(cmd_args),
         "write" => cmd_write(cmd_args, line_str),
         "rm" => cmd_rm(cmd_args),
         "mkdir" => cmd_mkdir(cmd_args),
         "blkinfo" => cmd_blkinfo(),
-        _ => {
-            // Try to spawn via procman
-            try_spawn_via_procman(cmd);
-        }
+        "mem" => cmd_mem(),
+
+        // External programs (spawned via procman)
+        _ => try_spawn_via_procman(cmd),
     }
 }
 
 // ============================================================================
-// Built-in commands
+// Builtins
 // ============================================================================
 
 fn cmd_help() {
@@ -187,7 +158,6 @@ fn cmd_help() {
     puts("  help              Show this help\n");
     puts("  echo [text...]    Print text\n");
     puts("  info              System information\n");
-    puts("  mem               Memory/filesystem statistics\n");
     puts("  pid               Show current process ID\n");
     puts("  ls [path]         List directory (ramfs or /disk/)\n");
     puts("  cat <path>        Display file contents\n");
@@ -195,6 +165,7 @@ fn cmd_help() {
     puts("  rm <path>         Remove a file or empty directory\n");
     puts("  mkdir <path>      Create a directory\n");
     puts("  blkinfo           Block device info\n");
+    puts("  mem               Filesystem statistics\n");
 }
 
 fn cmd_echo(args: &[&str]) {
@@ -214,251 +185,197 @@ fn cmd_info() {
 }
 
 fn cmd_pid() {
-    let result = xous::rsyscall(xous::SysCall::GetProcessId);
-    match result {
-        Ok(xous::Result::Scalar1(pid)) => {
-            let _ = write!(UartWriter, "PID: {}\n", pid);
-        }
-        _ => {
-            puts("pid: syscall failed\n");
+    match xous::rsyscall(xous::SysCall::GetProcessId) {
+        Ok(xous::Result::Scalar1(pid)) => { let _ = write!(UartWriter, "PID: {}\n", pid); }
+        _ => puts("pid: syscall failed\n"),
+    }
+}
+
+// ============================================================================
+// FS operations (BlockingScalar IPC to fs service)
+// ============================================================================
+
+static mut FS_CID: u32 = 0;
+
+fn get_fs_cid() -> u32 {
+    unsafe {
+        if FS_CID != 0 { return FS_CID; }
+        let sid = xous::SID::from_array(FS_SID);
+        match xous::rsyscall(xous::SysCall::Connect(sid)) {
+            Ok(xous::Result::ConnectionID(cid)) => { FS_CID = cid; cid }
+            _ => 0,
         }
     }
 }
 
-fn cmd_mem() {
-    let (used, total, bytes) = ramfs::stats();
-    let _ = write!(UartWriter, "RAM filesystem:\n");
-    let _ = write!(UartWriter, "  Files: {}/{}\n", used, total);
-    let _ = write!(UartWriter, "  Used:  {} bytes\n", bytes);
+/// Send a BlockingScalar to the FS service and return the result code.
+fn fs_scalar(op: FsOp, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> Option<usize> {
+    let cid = get_fs_cid();
+    if cid == 0 { return None; }
+    match xous::rsyscall(xous::SysCall::SendMessage(
+        cid,
+        xous::Message::BlockingScalar(xous::ScalarMessage {
+            id: op as usize, arg1, arg2, arg3, arg4,
+        }),
+    )) {
+        Ok(xous::Result::Scalar1(code)) => Some(code),
+        Ok(xous::Result::Scalar5(a, b, c, d, e)) => {
+            // Store for Stats — caller reads LAST_STATS
+            unsafe { LAST_STATS = (a, b, c, d, e); }
+            Some(0)
+        }
+        _ => None,
+    }
 }
+
+static mut LAST_STATS: (usize, usize, usize, usize, usize) = (0, 0, 0, 0, 0);
 
 fn cmd_ls(args: &[&str]) {
     let path = if args.is_empty() { "/" } else { args[0] };
-
-    // Handle /disk/ paths via tar filesystem.
-    if is_disk_path(path) {
-        if let Some(archive) = get_disk_archive() {
-            let subpath = disk_subpath(path);
-            archive.list(subpath, |name, is_dir, size| {
-                if is_dir {
-                    let _ = write!(UartWriter, "  {}/\n", name);
-                } else {
-                    let _ = write!(UartWriter, "  {} ({} bytes)\n", name, size);
-                }
-            });
-        } else {
-            puts("ls: no disk mounted\n");
-        }
-        return;
-    }
-
-    // Show disk in root listing.
-    let is_root = path == "/" || path.is_empty();
-    if is_root {
-        if get_disk_archive().is_some() {
-            puts("  disk/  (block device)\n");
-        }
-    }
-
-    match ramfs::list(path, |name, is_dir, size| {
-        if is_dir {
-            let _ = write!(UartWriter, "  {}/\n", name);
-        } else {
-            let _ = write!(UartWriter, "  {} ({} bytes)\n", name, size);
-        }
-    }) {
-        Ok(()) => {}
-        Err(ramfs::FsError::NotFound) => {
+    let packed = beetos_api_fs::pack_path(path);
+    match fs_scalar(FsOp::Ls, packed[0], packed[1], packed[2], packed[3]) {
+        Some(code) if code == FsError::Ok as usize => {}
+        Some(code) if code == FsError::NotFound as usize => {
             let _ = write!(UartWriter, "ls: {}: not found\n", path);
         }
-        Err(ramfs::FsError::NotDirectory) => {
+        Some(code) if code == FsError::NotDirectory as usize => {
             let _ = write!(UartWriter, "ls: {}: not a directory\n", path);
         }
-        Err(e) => {
-            let _ = write!(UartWriter, "ls: error: {:?}\n", e);
-        }
+        None => puts("ls: fs service not available\n"),
+        _ => puts("ls: error\n"),
     }
 }
 
 fn cmd_cat(args: &[&str]) {
-    if args.is_empty() {
-        puts("usage: cat <path>\n");
-        return;
-    }
+    if args.is_empty() { puts("usage: cat <path>\n"); return; }
     let path = args[0];
-
-    // Handle /disk/ paths via tar filesystem.
-    if is_disk_path(path) {
-        if let Some(archive) = get_disk_archive() {
-            let subpath = disk_subpath(path);
-            match archive.find(subpath) {
-                Some(data) => match core::str::from_utf8(data) {
-                    Ok(text) => {
-                        puts(text);
-                        if !text.ends_with('\n') { putc(b'\n'); }
-                    }
-                    Err(_) => {
-                        let _ = write!(UartWriter, "<binary: {} bytes>\n", data.len());
-                    }
-                },
-                None => {
-                    let _ = write!(UartWriter, "cat: {}: not found\n", path);
-                }
-            }
-        } else {
-            puts("cat: no disk mounted\n");
-        }
-        return;
-    }
-
-    match ramfs::read(path) {
-        Ok(data) => match core::str::from_utf8(data) {
-            Ok(text) => {
-                puts(text);
-                if !text.ends_with('\n') { putc(b'\n'); }
-            }
-            Err(_) => {
-                let _ = write!(UartWriter, "<binary: {} bytes>\n", data.len());
-            }
-        },
-        Err(ramfs::FsError::NotFound) => {
+    let packed = beetos_api_fs::pack_path(path);
+    match fs_scalar(FsOp::Cat, packed[0], packed[1], packed[2], packed[3]) {
+        Some(code) if code == FsError::Ok as usize => {}
+        Some(code) if code == FsError::NotFound as usize => {
             let _ = write!(UartWriter, "cat: {}: not found\n", path);
         }
-        Err(ramfs::FsError::IsDirectory) => {
+        Some(code) if code == FsError::IsDirectory as usize => {
             let _ = write!(UartWriter, "cat: {}: is a directory\n", path);
         }
-        Err(e) => {
-            let _ = write!(UartWriter, "cat: error: {:?}\n", e);
-        }
+        None => puts("cat: fs service not available\n"),
+        _ => puts("cat: error\n"),
     }
 }
 
 fn cmd_write(args: &[&str], full_line: &str) {
-    if args.len() < 2 {
-        puts("usage: write <path> <text>\n");
-        return;
-    }
+    if args.len() < 2 { puts("usage: write <path> <text>\n"); return; }
     let path = args[0];
-    if is_disk_path(path) {
-        puts("write: /disk/ is read-only\n");
-        return;
-    }
     let content = if let Some(pos) = full_line.find(path) {
         let after_path = pos + path.len();
         full_line[after_path..].trim_start()
     } else {
         args[1]
     };
-    match ramfs::write(path, content.as_bytes()) {
-        Ok(()) => {
-            let _ = write!(UartWriter, "wrote {} bytes to {}\n", content.len(), path);
+
+    // Pack path into arg1-arg2 (16 bytes max) and content into arg3-arg4 (16 bytes max)
+    let path_packed = beetos_api_fs::pack_path(path);
+    let content_bytes = content.as_bytes();
+    let ws = core::mem::size_of::<usize>();
+    let mut c_args = [0usize; 2];
+    for (i, chunk) in content_bytes.chunks(ws).enumerate() {
+        if i >= 2 { break; }
+        let mut buf = [0u8; core::mem::size_of::<usize>()];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        c_args[i] = usize::from_le_bytes(buf);
+    }
+
+    match fs_scalar(FsOp::WriteShort, path_packed[0], path_packed[1], c_args[0], c_args[1]) {
+        Some(code) if code == FsError::Ok as usize => {}
+        Some(code) if code == FsError::ReadOnly as usize => {
+            let _ = write!(UartWriter, "write: {}: read-only\n", path);
         }
-        Err(ramfs::FsError::IsDirectory) => {
+        Some(code) if code == FsError::IsDirectory as usize => {
             let _ = write!(UartWriter, "write: {}: is a directory\n", path);
         }
-        Err(e) => {
-            let _ = write!(UartWriter, "write: error: {:?}\n", e);
-        }
-    }
-}
-
-fn cmd_rm(args: &[&str]) {
-    if args.is_empty() {
-        puts("usage: rm <path>\n");
-        return;
-    }
-    if is_disk_path(args[0]) {
-        puts("rm: /disk/ is read-only\n");
-        return;
-    }
-    match ramfs::remove(args[0]) {
-        Ok(()) => {}
-        Err(ramfs::FsError::NotFound) => {
-            let _ = write!(UartWriter, "rm: {}: not found\n", args[0]);
-        }
-        Err(ramfs::FsError::NotEmpty) => {
-            let _ = write!(UartWriter, "rm: {}: directory not empty\n", args[0]);
-        }
-        Err(e) => {
-            let _ = write!(UartWriter, "rm: error: {:?}\n", e);
-        }
+        None => puts("write: fs service not available\n"),
+        _ => puts("write: error\n"),
     }
 }
 
 fn cmd_mkdir(args: &[&str]) {
-    if args.is_empty() {
-        puts("usage: mkdir <path>\n");
-        return;
-    }
-    match ramfs::mkdir(args[0]) {
-        Ok(()) => {}
-        Err(ramfs::FsError::AlreadyExists) => {
+    if args.is_empty() { puts("usage: mkdir <path>\n"); return; }
+    let packed = beetos_api_fs::pack_path(args[0]);
+    match fs_scalar(FsOp::Mkdir, packed[0], packed[1], packed[2], packed[3]) {
+        Some(code) if code == FsError::Ok as usize => {}
+        Some(code) if code == FsError::AlreadyExists as usize => {
             let _ = write!(UartWriter, "mkdir: {}: already exists\n", args[0]);
         }
-        Err(e) => {
-            let _ = write!(UartWriter, "mkdir: error: {:?}\n", e);
+        Some(code) if code == FsError::ReadOnly as usize => {
+            let _ = write!(UartWriter, "mkdir: {}: read-only\n", args[0]);
         }
+        None => puts("mkdir: fs service not available\n"),
+        _ => puts("mkdir: error\n"),
+    }
+}
+
+fn cmd_rm(args: &[&str]) {
+    if args.is_empty() { puts("usage: rm <path>\n"); return; }
+    let packed = beetos_api_fs::pack_path(args[0]);
+    match fs_scalar(FsOp::Remove, packed[0], packed[1], packed[2], packed[3]) {
+        Some(code) if code == FsError::Ok as usize => {}
+        Some(code) if code == FsError::NotFound as usize => {
+            let _ = write!(UartWriter, "rm: {}: not found\n", args[0]);
+        }
+        Some(code) if code == FsError::NotEmpty as usize => {
+            let _ = write!(UartWriter, "rm: {}: directory not empty\n", args[0]);
+        }
+        Some(code) if code == FsError::ReadOnly as usize => {
+            let _ = write!(UartWriter, "rm: {}: read-only\n", args[0]);
+        }
+        None => puts("rm: fs service not available\n"),
+        _ => puts("rm: error\n"),
     }
 }
 
 fn cmd_blkinfo() {
-    unsafe {
-        if DISK_SIZE == 0 {
-            puts("No block device\n");
-        } else {
-            let _ = write!(UartWriter, "Block device: {} bytes\n", DISK_SIZE);
-            let _ = write!(UartWriter, "Mounted at: /disk/ (read-only, tar)\n");
-            if let Some(archive) = get_disk_archive() {
-                let _ = write!(UartWriter, "Files: {}\n", archive.count());
+    match fs_scalar(FsOp::Stats, 0, 0, 0, 0) {
+        Some(_) => {
+            let (_, _, _, disk_size, disk_files) = unsafe { LAST_STATS };
+            if disk_size == 0 {
+                puts("No block device\n");
+            } else {
+                let _ = write!(UartWriter, "Block device: {} bytes\n", disk_size);
+                puts("Mounted at: /disk/ (read-only, tar)\n");
+                let _ = write!(UartWriter, "Files: {}\n", disk_files);
             }
         }
+        None => puts("blkinfo: fs service not available\n"),
     }
 }
 
-/// Get the disk tar archive, if available.
-fn get_disk_archive() -> Option<tarfs::TarArchive<'static>> {
-    unsafe {
-        if DISK_SIZE == 0 || DISK_BASE == 0 {
-            return None;
+fn cmd_mem() {
+    match fs_scalar(FsOp::Stats, 0, 0, 0, 0) {
+        Some(_) => {
+            let (used, total, bytes, disk_size, _) = unsafe { LAST_STATS };
+            puts("RAM filesystem:\n");
+            let _ = write!(UartWriter, "  Files: {}/{}\n", used, total);
+            let _ = write!(UartWriter, "  Used:  {} bytes\n", bytes);
+            if disk_size > 0 {
+                let _ = write!(UartWriter, "Disk: {} bytes\n", disk_size);
+            }
         }
-        let data = core::slice::from_raw_parts(DISK_BASE as *const u8, DISK_SIZE);
-        Some(tarfs::TarArchive::new(data))
+        None => puts("mem: fs service not available\n"),
     }
-}
-
-/// Check if a path refers to the disk filesystem.
-fn is_disk_path(path: &str) -> bool {
-    let p = path.strip_prefix('/').unwrap_or(path);
-    p == "disk" || p.starts_with("disk/")
-}
-
-/// Strip the disk prefix from a path.
-fn disk_subpath(path: &str) -> &str {
-    let p = path.strip_prefix('/').unwrap_or(path);
-    p.strip_prefix("disk/").unwrap_or(
-        p.strip_prefix("disk").unwrap_or(p)
-    )
 }
 
 // ============================================================================
 // Process spawning via procman
 // ============================================================================
 
-/// Connection ID to the procman service (lazily initialized).
 static mut PROCMAN_CID: u32 = 0;
 
 fn get_procman_cid() -> u32 {
     unsafe {
-        if PROCMAN_CID != 0 {
-            return PROCMAN_CID;
-        }
-        // Connect to procman (blocks until procman creates its server)
+        if PROCMAN_CID != 0 { return PROCMAN_CID; }
         let sid = xous::SID::from_array(beetos_api_procman::PROCMAN_SID);
         match xous::rsyscall(xous::SysCall::Connect(sid)) {
-            Ok(xous::Result::ConnectionID(cid)) => {
-                PROCMAN_CID = cid;
-                cid
-            }
+            Ok(xous::Result::ConnectionID(cid)) => { PROCMAN_CID = cid; cid }
             _ => 0,
         }
     }
@@ -476,34 +393,21 @@ fn try_spawn_via_procman(cmd: &str) {
         cid,
         xous::Message::BlockingScalar(xous::ScalarMessage {
             id: beetos_api_procman::ProcManOp::SpawnAndWait as usize,
-            arg1: name_packed[0],
-            arg2: name_packed[1],
-            arg3: name_packed[2],
-            arg4: name_packed[3],
+            arg1: name_packed[0], arg2: name_packed[1],
+            arg3: name_packed[2], arg4: name_packed[3],
         }),
     ));
 
     match result {
-        Ok(xous::Result::Scalar1(exit_code)) => {
+        Ok(xous::Result::Scalar1(exit_code)) | Ok(xous::Result::Scalar2(exit_code, _)) => {
             if exit_code == usize::MAX {
                 let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
             } else {
                 let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
             }
         }
-        Ok(xous::Result::Scalar2(exit_code, _)) => {
-            if exit_code == usize::MAX {
-                let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
-            } else {
-                let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
-            }
-        }
-        Err(_) => {
-            let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd);
-        }
-        _ => {
-            let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd);
-        }
+        Err(_) => { let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd); }
+        _ => { let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd); }
     }
 }
 
@@ -511,40 +415,13 @@ fn try_spawn_via_procman(cmd: &str) {
 // Entry point
 // ============================================================================
 
-/// Disk data base VA and size (set by kernel via x1, x2).
-static mut DISK_BASE: usize = 0;
-static mut DISK_SIZE: usize = 0;
-
-/// Entry point. The kernel passes boot parameters in x0-x2.
-///   x0 = UART MMIO VA
-///   x1 = disk data VA (0 if no disk)
-///   x2 = disk data size in bytes (0 if no disk)
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // Read boot parameters from registers.
     let uart_base: usize;
-    let disk_base: usize;
-    let disk_size: usize;
     unsafe {
-        core::arch::asm!(
-            "mov {0}, x0",
-            "mov {1}, x1",
-            "mov {2}, x2",
-            out(reg) uart_base,
-            out(reg) disk_base,
-            out(reg) disk_size,
-            options(nomem, nostack),
-        );
+        core::arch::asm!("mov {}, x0", out(reg) uart_base, options(nomem, nostack));
         UART_BASE = uart_base;
-        DISK_BASE = disk_base;
-        DISK_SIZE = disk_size;
     }
-
-    // Initialize ramfs
-    ramfs::init();
-    let _ = ramfs::mkdir("/tmp");
-    let _ = ramfs::mkdir("/etc");
-    let _ = ramfs::write("/etc/motd", b"Welcome to BeetOS!\n");
 
     // Print banner
     puts("\n");
@@ -556,15 +433,10 @@ pub extern "C" fn _start() -> ! {
     puts("\n");
     puts("BeetOS v0.1.0 — Type 'help' for commands.\n");
     puts("Shell running as userspace process (EL0)\n");
-    unsafe {
-        if DISK_SIZE > 0 {
-            let _ = write!(UartWriter, "Disk: {} bytes mounted at /disk/\n", DISK_SIZE);
-        }
-    }
     puts("\n");
     prompt();
 
-    // Create a server and receive characters from the kernel's UART IRQ handler.
+    // Create console server and receive characters from UART IRQ handler
     let sid = xous::SID::from_array(beetos_api_console::CONSOLE_SID);
     let _server = xous::rsyscall(xous::SysCall::CreateServerWithAddress(sid, 0..0));
 
@@ -572,17 +444,13 @@ pub extern "C" fn _start() -> ! {
         let msg = xous::rsyscall(xous::SysCall::ReceiveMessage(sid));
         match msg {
             Ok(xous::Result::MessageEnvelope(env)) => {
-                // Extract char from Scalar message
                 if let xous::Message::Scalar(scalar) = env.body {
                     if scalar.id == beetos_api_console::ConsoleOp::Char as usize {
                         process_char(scalar.arg1 as u8);
                     }
                 }
             }
-            _ => {
-                // Yield on error and retry
-                xous::yield_slice();
-            }
+            _ => { xous::yield_slice(); }
         }
     }
 }
@@ -590,7 +458,5 @@ pub extern "C" fn _start() -> ! {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     puts("PANIC in shell!\n");
-    loop {
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
-    }
+    loop { unsafe { core::arch::asm!("wfe", options(nomem, nostack)) }; }
 }
