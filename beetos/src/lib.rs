@@ -199,3 +199,13 @@ pub const LOADER_CODE_ADDRESS: usize = PLAINTEXT_DRAM_BASE;
 
 /// Boot splash framebuffer pages.
 pub const BOOT_SPLASH_FB: usize = 0x0000_5000_0000_0000;
+
+// ======================== Argv ========================
+
+/// Virtual address where the kernel maps the argv page for spawned processes.
+/// The page is mapped read-only and contains null-separated argument strings.
+/// x1 = ARGV_PAGE_VA, x2 = total byte length of argv data.
+pub const ARGV_PAGE_VA: usize = 0x10_0300_0000;
+
+/// Maximum size of argv data (fits in one page).
+pub const ARGV_MAX_LEN: usize = PAGE_SIZE;

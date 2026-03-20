@@ -402,9 +402,9 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
             is_permitted_by_mask()
         }
 
-        // SpawnByName and WaitProcess are privileged (require permission mask)
+        // SpawnByName, SpawnByNameWithArgs, and WaitProcess are privileged
         #[cfg(beetos)]
-        SysCall::SpawnByName(..) | SysCall::WaitProcess(..) => is_permitted_by_mask(),
+        SysCall::SpawnByName(..) | SysCall::SpawnByNameWithArgs(..) | SysCall::WaitProcess(..) => is_permitted_by_mask(),
 
         SysCall::Invalid(..) => Err(Error::UnhandledSyscall),
     }
@@ -763,6 +763,18 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidString)?;
             SystemServices::with_mut(|ss| {
                 ss.spawn_by_name(name).map(Result::ProcessID)
+            })
+        }
+        #[cfg(beetos)]
+        SysCall::SpawnByNameWithArgs(name0, name1, argv_ptr, argv_len) => {
+            // Unpack name from 2 usizes (max 16 bytes)
+            let name_words = [name0, name1];
+            let ws = core::mem::size_of::<usize>();
+            let name_raw = unsafe { core::slice::from_raw_parts(name_words.as_ptr() as *const u8, 2 * ws) };
+            let name_end = name_raw.iter().position(|&b| b == 0).unwrap_or(2 * ws);
+            let name = core::str::from_utf8(&name_raw[..name_end]).map_err(|_| Error::InvalidString)?;
+            SystemServices::with_mut(|ss| {
+                ss.spawn_by_name_with_args(name, argv_ptr, argv_len).map(Result::ProcessID)
             })
         }
         #[cfg(beetos)]

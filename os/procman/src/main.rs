@@ -77,15 +77,23 @@ pub extern "C" fn _start() -> ! {
         let msg = xous::rsyscall(xous::SysCall::ReceiveMessage(sid));
         match msg {
             Ok(xous::Result::MessageEnvelope(env)) => {
-                match env.body {
+                match &env.body {
                     xous::Message::BlockingScalar(scalar) => {
-                        handle_blocking_scalar(env.sender, scalar);
+                        handle_blocking_scalar(env.sender, *scalar);
                     }
                     xous::Message::Scalar(scalar) => {
-                        handle_scalar(env.sender, scalar);
+                        handle_scalar(env.sender, *scalar);
+                    }
+                    xous::Message::MutableBorrow(mem) => {
+                        // Handle mutable borrow messages manually.
+                        // We must NOT let the Envelope Drop auto-return memory
+                        // because we need to write the exit code first.
+                        handle_mutable_borrow_ref(env.sender, mem);
+                        // Prevent the Envelope's Drop from returning memory again
+                        core::mem::forget(env);
                     }
                     _ => {
-                        // Ignore non-scalar messages
+                        // Ignore other message types
                     }
                 }
             }
@@ -162,6 +170,65 @@ fn handle_scalar(sender: xous::MessageSender, scalar: xous::ScalarMessage) {
             ));
         }
         _ => {}
+    }
+}
+
+fn handle_mutable_borrow_ref(sender: xous::MessageSender, mem: &xous::MemoryMessage) {
+    match mem.id {
+        id if id == ProcManOp::SpawnAndWaitWithArgs as usize => {
+            let valid_len = mem.valid.map(|v| v.get()).unwrap_or(0);
+            let buf = unsafe {
+                core::slice::from_raw_parts(mem.buf.as_ptr(), mem.buf.len())
+            };
+            let (name, args_start, args_len) = beetos_api_procman::parse_cmdline(buf, valid_len);
+
+            // Prepare argv data (portion after the name)
+            let argv_data = if args_len > 0 {
+                &buf[args_start..args_start + args_len]
+            } else {
+                &[]
+            };
+
+            // Call SpawnByNameWithArgs syscall
+            let name_packed = beetos_api_procman::pack_name_short(name);
+            let argv_ptr = if argv_data.is_empty() { 0 } else { argv_data.as_ptr() as usize };
+            let spawn_result = xous::rsyscall(xous::SysCall::SpawnByNameWithArgs(
+                name_packed[0], name_packed[1], argv_ptr, argv_data.len(),
+            ));
+
+            // Write the exit code into the buffer's first usize (so caller can read it)
+            let exit_code = match spawn_result {
+                Ok(xous::Result::ProcessID(pid)) => {
+                    // Wait for the process to exit
+                    let wait_result = xous::rsyscall(xous::SysCall::WaitProcess(pid));
+                    match wait_result {
+                        Ok(xous::Result::Scalar1(code)) => code,
+                        _ => usize::MAX,
+                    }
+                }
+                Err(_e) => {
+                    let _ = write!(UartWriter, "[procman] spawn failed for '{}'\n", name);
+                    usize::MAX
+                }
+                _ => usize::MAX,
+            };
+
+            // Write exit code into the buffer so the caller can read it
+            let buf_mut = unsafe {
+                core::slice::from_raw_parts_mut(mem.buf.as_mut_ptr(), mem.buf.len())
+            };
+            if buf_mut.len() >= core::mem::size_of::<usize>() {
+                let exit_bytes = exit_code.to_le_bytes();
+                buf_mut[..exit_bytes.len()].copy_from_slice(&exit_bytes);
+            }
+
+            // Return the memory to unblock the caller
+            xous::return_memory_offset_valid(sender, mem.buf, None, None).ok();
+        }
+        _ => {
+            // Unknown opcode — just return memory
+            xous::return_memory_offset_valid(sender, mem.buf, None, None).ok();
+        }
     }
 }
 

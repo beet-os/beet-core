@@ -92,11 +92,39 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    // Read argv: x1 = argv_ptr, x2 = argv_len (set by kernel if spawned with args)
+    let argv_ptr: usize;
+    let argv_len: usize;
+    unsafe {
+        core::arch::asm!("mov {}, x1", out(reg) argv_ptr, options(nomem, nostack));
+        core::arch::asm!("mov {}, x2", out(reg) argv_len, options(nomem, nostack));
+    }
+
     // Otherwise, we were spawned as "hello" — print greeting and exit
     puts("Hello, BeetOS!\n");
     puts("I am PID ");
     put_usize(pid);
     puts(", running at EL0.\n");
+
+    // Display argv if present
+    if argv_ptr != 0 && argv_len > 0 {
+        let argv_data = unsafe { core::slice::from_raw_parts(argv_ptr as *const u8, argv_len) };
+        puts("argv: [");
+        let mut first = true;
+        for arg in argv_data.split(|&b| b == 0) {
+            if arg.is_empty() { continue; }
+            if !first { puts(", "); }
+            first = false;
+            puts("\"");
+            if let Ok(s) = core::str::from_utf8(arg) {
+                puts(s);
+            } else {
+                puts("<invalid utf8>");
+            }
+            puts("\"");
+        }
+        puts("]\n");
+    }
 
     // Clean exit
     xous::terminate_process(0);

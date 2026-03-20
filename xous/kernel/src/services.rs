@@ -1212,6 +1212,146 @@ impl SystemServices {
         Ok(pid)
     }
 
+    /// Spawn a new process by name with argv data.
+    ///
+    /// Like `spawn_by_name`, but also allocates a page for argv data,
+    /// copies the provided args into it, maps it read-only into the new
+    /// process at `ARGV_PAGE_VA`, and sets x1/x2 so the process can read
+    /// its arguments.
+    ///
+    /// `argv_ptr` and `argv_len` point to a buffer in the calling process's
+    /// address space containing null-separated argument strings.
+    #[cfg(beetos)]
+    pub fn spawn_by_name_with_args(
+        &mut self,
+        name: &str,
+        argv_ptr: usize,
+        argv_len: usize,
+    ) -> Result<xous::PID, Error> {
+        use xous::MemoryAddress;
+
+        let elf_bytes = crate::arch::boot::lookup_binary(name).ok_or_else(|| {
+            println!("[!] spawn_by_name_with_args: binary '{}' not found", name);
+            Error::ProcessNotFound
+        })?;
+
+        let elf_range = unsafe {
+            MemoryRange::new(elf_bytes.as_ptr() as usize, elf_bytes.len())
+        }.map_err(|_| Error::InternalError)?;
+
+        let mut name_buf = [0u8; xous::arch::MAX_PROCESS_NAME_LEN];
+        let copy_len = name.len().min(name_buf.len());
+        name_buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
+
+        let init = ProcessInit {
+            elf: elf_range,
+            name_addr: MemoryAddress::new(name_buf.as_ptr() as usize).ok_or(Error::InternalError)?,
+            app_id: AppId::from([0u32; 4]),
+        };
+
+        let startup = self.create_process(init)?;
+        let pid = startup.pid();
+
+        // Grant all syscall permissions
+        self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
+
+        // Map UART MMIO into the new process
+        #[cfg(feature = "platform-qemu-virt")]
+        {
+            const UART_PHYS: usize = 0x0900_0000;
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let process = self.process_mut(pid).expect("spawned process");
+                process.mapping.map_page(
+                    mm,
+                    UART_PHYS,
+                    crate::arch::boot::SHELL_UART_VA as *mut usize,
+                    xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                    true,
+                ).ok();
+            });
+        }
+
+        // Copy argv data and map into new process
+        let actual_argv_len = if argv_ptr != 0 && argv_len > 0 {
+            let clamped_len = argv_len.min(beetos::ARGV_MAX_LEN);
+
+            // Copy argv from caller's address space into a kernel buffer.
+            // The caller's TTBR0 is still active, so we can read from
+            // their VA through the physical mapping.
+            let mut argv_buf = [0u8; 256]; // stack buffer for small args
+            let use_len = clamped_len.min(argv_buf.len());
+
+            // Read through the caller's page tables: translate VA → PA → kernel VA
+            let caller_pid = crate::arch::process::current_pid();
+            let caller_proc = self.process(caller_pid).map_err(|_| Error::InternalError)?;
+            let caller_pa = caller_proc.mapping.virt_to_phys(argv_ptr as *mut usize)
+                .map_err(|_| {
+                    println!("[!] spawn_by_name_with_args: cannot translate argv_ptr {:#x}", argv_ptr);
+                    Error::BadAddress
+                })?;
+            let page_offset = argv_ptr & (beetos::PAGE_SIZE - 1);
+            let kern_va = beetos::phys_to_virt(caller_pa) as *const u8;
+            // Safety: kern_va points to the physical page through TTBR1 linear map.
+            // We only read up to use_len bytes within the page.
+            let bytes_in_page = beetos::PAGE_SIZE - page_offset;
+            let safe_len = use_len.min(bytes_in_page);
+            unsafe {
+                core::ptr::copy_nonoverlapping(kern_va, argv_buf.as_mut_ptr(), safe_len);
+            }
+
+            // Allocate a physical page for the argv data
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let (argv_phys, zeroed) = mm.alloc_range(1, pid)?;
+                if !zeroed {
+                    let p = beetos::phys_to_virt(argv_phys) as *mut u8;
+                    unsafe { core::ptr::write_bytes(p, 0, beetos::PAGE_SIZE); }
+                }
+
+                // Write argv data into the page
+                let argv_page_kern_va = beetos::phys_to_virt(argv_phys) as *mut u8;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(argv_buf.as_ptr(), argv_page_kern_va, safe_len);
+                }
+
+                // Map the argv page read-only into the new process
+                // No W or X flags = read-only (all pages are readable by default)
+                let process = self.process_mut(pid).expect("spawned process");
+                process.mapping.map_page(
+                    mm,
+                    argv_phys,
+                    beetos::ARGV_PAGE_VA as *mut usize,
+                    xous::MemoryFlags::empty(),
+                    true,
+                ).map_err(|_| {
+                    println!("[!] spawn_by_name_with_args: failed to map argv page");
+                    Error::InternalError
+                })?;
+
+                Ok(safe_len)
+            })?
+        } else {
+            0
+        };
+
+        // Set x0 = UART VA, x1 = ARGV_PAGE_VA (or 0), x2 = argv_len
+        {
+            let idx = pid.get() as usize - 1;
+            let argv_va = if actual_argv_len > 0 { beetos::ARGV_PAGE_VA } else { 0 };
+            unsafe {
+                crate::arch::process::set_thread_args(
+                    idx,
+                    crate::arch::boot::SHELL_UART_VA,
+                    argv_va,
+                    actual_argv_len,
+                );
+            }
+        }
+
+        println!("[*] spawn_by_name_with_args: created '{}' as PID {} (argv_len={})",
+            name, pid, actual_argv_len);
+        Ok(pid)
+    }
+
     pub fn pid_from_app_id(&self, app_id: AppId) -> Option<PID> {
         for process in self.processes.iter().flatten() {
             if process.app_id() == app_id {

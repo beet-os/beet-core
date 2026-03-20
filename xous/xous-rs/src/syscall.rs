@@ -413,6 +413,26 @@ pub enum SysCall {
     #[cfg(beetos)]
     SpawnByName(usize /* name arg0 */, usize /* name arg1 */, usize /* name arg2 */, usize /* name arg3 */),
 
+    /// Spawn a new process by name with argv data.
+    /// The name is packed in 2 usize values (max 16 bytes).
+    /// argv_ptr/argv_len point to a buffer in the caller's address space
+    /// containing null-separated argument strings ("arg1\0arg2\0...").
+    ///
+    /// The kernel allocates an argv page, copies the data, maps it
+    /// read-only into the new process at ARGV_PAGE_VA, and sets
+    /// x1 = ARGV_PAGE_VA, x2 = argv_len before first ERET.
+    ///
+    /// # Returns
+    ///
+    /// * **ProcessID(pid)**: The PID of the newly created process
+    #[cfg(beetos)]
+    SpawnByNameWithArgs(
+        usize, /* name arg0 */
+        usize, /* name arg1 */
+        usize, /* argv_ptr (VA in caller's address space) */
+        usize, /* argv_len */
+    ),
+
     /// Wait for a process to exit. Blocks the calling thread until the
     /// target process calls TerminateProcess.
     ///
@@ -490,6 +510,7 @@ pub enum SysCallNumber {
     GetPanicMessage = 56,
     SpawnByName = 57,
     WaitProcess = 58,
+    SpawnByNameWithArgs = 59,
 
     Invalid,
 }
@@ -555,6 +576,7 @@ impl SysCallNumber {
             56 => GetPanicMessage,
             57 => SpawnByName,
             58 => WaitProcess,
+            59 => SpawnByNameWithArgs,
             _ => Invalid,
         }
     }
@@ -875,6 +897,10 @@ impl SysCall {
                 [SysCallNumber::SpawnByName as usize, *a0, *a1, *a2, *a3, 0, 0, 0]
             }
             #[cfg(beetos)]
+            SysCall::SpawnByNameWithArgs(a0, a1, argv_ptr, argv_len) => {
+                [SysCallNumber::SpawnByNameWithArgs as usize, *a0, *a1, *argv_ptr, *argv_len, 0, 0, 0]
+            }
+            #[cfg(beetos)]
             SysCall::WaitProcess(pid) => {
                 [SysCallNumber::WaitProcess as usize, pid.get() as usize, 0, 0, 0, 0, 0, 0]
             }
@@ -1055,6 +1081,8 @@ impl SysCall {
             #[cfg(beetos)]
             SysCallNumber::SpawnByName => SysCall::SpawnByName(a1, a2, a3, a4),
             #[cfg(beetos)]
+            SysCallNumber::SpawnByNameWithArgs => SysCall::SpawnByNameWithArgs(a1, a2, a3, a4),
+            #[cfg(beetos)]
             SysCallNumber::WaitProcess => {
                 SysCall::WaitProcess(PID::new(a1 as _).ok_or(Error::InvalidSyscall)?)
             }
@@ -1067,6 +1095,7 @@ impl SysCall {
             | SysCallNumber::VirtToPhysPid
             | SysCallNumber::InvalidateCache
             | SysCallNumber::SpawnByName
+            | SysCallNumber::SpawnByNameWithArgs
             | SysCallNumber::WaitProcess => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
@@ -2083,6 +2112,33 @@ pub fn spawn_by_name(name: &str) -> core::result::Result<PID, Error> {
     })
 }
 
+/// Spawn a new process by name with argv data.
+///
+/// `name` is the binary name (max 16 bytes). `argv` points to a buffer of
+/// null-separated argument strings in the caller's address space.
+///
+/// The kernel copies `argv` into a page mapped read-only at ARGV_PAGE_VA
+/// in the new process, and sets x1/x2 so the process can read its arguments.
+///
+/// Returns the PID of the newly created process.
+#[cfg(beetos)]
+#[inline]
+pub fn spawn_by_name_with_args(name: &str, argv: &[u8]) -> core::result::Result<PID, Error> {
+    // Pack name into 2 usizes (max 16 bytes)
+    let name_packed = pack_name_short_to_usize(name);
+    let argv_ptr = if argv.is_empty() { 0 } else { argv.as_ptr() as usize };
+    let argv_len = argv.len();
+    rsyscall(SysCall::SpawnByNameWithArgs(name_packed[0], name_packed[1], argv_ptr, argv_len)).and_then(|result| {
+        if let Result::ProcessID(pid) = result {
+            Ok(pid)
+        } else if let Result::Error(e) = result {
+            Err(e)
+        } else {
+            Err(Error::InternalError)
+        }
+    })
+}
+
 /// Wait for a process to exit. Blocks until the target process calls TerminateProcess.
 ///
 /// Returns the exit code of the terminated process.
@@ -2098,6 +2154,23 @@ pub fn wait_process_exit(pid: PID) -> core::result::Result<usize, Error> {
             Err(Error::InternalError)
         }
     })
+}
+
+/// Pack a process name (up to 16 bytes) into 2 usize values for SpawnByNameWithArgs.
+#[cfg(beetos)]
+pub fn pack_name_short_to_usize(name: &str) -> [usize; 2] {
+    let bytes = name.as_bytes();
+    let mut result = [0usize; 2];
+    let word_size = core::mem::size_of::<usize>();
+    for (i, chunk) in bytes.chunks(word_size).enumerate() {
+        if i >= 2 {
+            break;
+        }
+        let mut buf = [0u8; core::mem::size_of::<usize>()];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        result[i] = usize::from_le_bytes(buf);
+    }
+    result
 }
 
 /// Pack a process name (up to 32 bytes) into 4 usize values for syscall arguments.

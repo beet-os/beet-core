@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 xous = { path = "../../xous/xous-rs" }
+beetos = { path = "../../beetos" }
 beetos-api-console = { path = "../../api/console" }
 beetos-api-procman = { path = "../../api/procman" }
 beetos-api-fs = { path = "../../api/fs" }

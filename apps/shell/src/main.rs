@@ -145,7 +145,7 @@ fn execute_line(line: &[u8]) {
         "mem" => cmd_mem(),
 
         // External programs (spawned via procman)
-        _ => try_spawn_via_procman(cmd),
+        _ => try_spawn_via_procman(cmd, cmd_args),
     }
 }
 
@@ -381,33 +381,94 @@ fn get_procman_cid() -> u32 {
     }
 }
 
-fn try_spawn_via_procman(cmd: &str) {
+fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
     let cid = get_procman_cid();
     if cid == 0 {
         let _ = write!(UartWriter, "bsh: {}: procman not available\n", cmd);
         return;
     }
 
-    let name_packed = beetos_api_procman::pack_name(cmd);
-    let result = xous::rsyscall(xous::SysCall::SendMessage(
-        cid,
-        xous::Message::BlockingScalar(xous::ScalarMessage {
-            id: beetos_api_procman::ProcManOp::SpawnAndWait as usize,
-            arg1: name_packed[0], arg2: name_packed[1],
-            arg3: name_packed[2], arg4: name_packed[3],
-        }),
-    ));
-
-    match result {
-        Ok(xous::Result::Scalar1(exit_code)) | Ok(xous::Result::Scalar2(exit_code, _)) => {
-            if exit_code == usize::MAX {
-                let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
-            } else {
-                let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
+    if args.is_empty() {
+        // No args — use the simple scalar path (SpawnAndWait)
+        let name_packed = beetos_api_procman::pack_name(cmd);
+        let result = xous::rsyscall(xous::SysCall::SendMessage(
+            cid,
+            xous::Message::BlockingScalar(xous::ScalarMessage {
+                id: beetos_api_procman::ProcManOp::SpawnAndWait as usize,
+                arg1: name_packed[0], arg2: name_packed[1],
+                arg3: name_packed[2], arg4: name_packed[3],
+            }),
+        ));
+        match result {
+            Ok(xous::Result::Scalar1(exit_code)) | Ok(xous::Result::Scalar2(exit_code, _)) => {
+                if exit_code == usize::MAX {
+                    let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
+                } else if exit_code != 0 {
+                    let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
+                }
             }
+            Err(_) => { let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd); }
+            _ => { let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd); }
         }
-        Err(_) => { let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd); }
-        _ => { let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd); }
+    } else {
+        // Has args — allocate a page and send via MutableBorrow
+        let page_size = xous::MemorySize::new(beetos::PAGE_SIZE);
+        let page = if let Some(size) = page_size {
+            xous::rsyscall(xous::SysCall::MapMemory(
+                None, None, size, xous::MemoryFlags::W,
+            ))
+        } else {
+            let _ = write!(UartWriter, "bsh: {}: internal error\n", cmd);
+            return;
+        };
+
+        let buf = match page {
+            Ok(xous::Result::MemoryRange(range)) => range,
+            _ => {
+                let _ = write!(UartWriter, "bsh: {}: out of memory\n", cmd);
+                return;
+            }
+        };
+
+        // Format the command line into the page: "name\0arg1\0arg2\0..."
+        let page_slice = unsafe {
+            core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len())
+        };
+        let valid_len = beetos_api_procman::format_cmdline(page_slice, cmd, args);
+
+        // Send MutableBorrow to procman
+        let valid = xous::MemorySize::new(valid_len);
+        let result = xous::rsyscall(xous::SysCall::SendMessage(
+            cid,
+            xous::Message::MutableBorrow(xous::MemoryMessage {
+                id: beetos_api_procman::ProcManOp::SpawnAndWaitWithArgs as usize,
+                buf,
+                offset: None,
+                valid,
+            }),
+        ));
+
+        // Read exit code from the returned buffer (first usize)
+        match result {
+            Ok(xous::Result::MemoryReturned(_, _)) | Ok(xous::Result::Ok) => {
+                let exit_code = usize::from_le_bytes({
+                    let mut b = [0u8; core::mem::size_of::<usize>()];
+                    let slice = unsafe { core::slice::from_raw_parts(buf.as_ptr(), b.len()) };
+                    b.copy_from_slice(slice);
+                    b
+                });
+                if exit_code == usize::MAX {
+                    let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
+                } else if exit_code != 0 {
+                    let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
+                }
+            }
+            Err(_) => { let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd); }
+            _ => { let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd); }
+        }
+
+        // Free the page
+        xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
     }
 }
 
