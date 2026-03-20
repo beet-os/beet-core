@@ -453,14 +453,33 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             Ok(Result::Ok)
         }),
         SysCall::IncreaseHeap(size) => {
-            MemoryManager::with_mut(|mm| {
+            #[cfg(feature = "platform-qemu-virt")]
+            crate::platform::qemu_virt::uart::puts("[IncreaseHeap] called\n");
+            let result = MemoryManager::with_mut(|mm| {
                 if size.get() & (PAGE_SIZE - 1) != 0 {
+                    #[cfg(feature = "platform-qemu-virt")]
+                    crate::platform::qemu_virt::uart::puts("[IncreaseHeap] BadAlignment\n");
                     return Err(Error::BadAlignment);
                 }
 
                 let range = mm.map_range(0, core::ptr::null_mut(), size.get(), MemoryFlags::POPULATE | MemoryFlags::W, true)?;
+                #[cfg(feature = "platform-qemu-virt")]
+                {
+                    use core::fmt::Write;
+                    let _ = write!(
+                        crate::platform::qemu_virt::uart::UartWriter,
+                        "[IncreaseHeap] OK addr={:#x} size={:#x}\n",
+                        range.as_ptr() as usize,
+                        range.len(),
+                    );
+                }
                 Ok(Result::MemoryRange(range))
-            })
+            });
+            #[cfg(feature = "platform-qemu-virt")]
+            if result.is_err() {
+                crate::platform::qemu_virt::uart::puts("[IncreaseHeap] map_range failed\n");
+            }
+            result
         }
         SysCall::ClaimInterrupt(no, callback, arg) => {
             if let Ok(no) = no.try_into() {

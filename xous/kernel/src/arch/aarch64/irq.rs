@@ -283,6 +283,12 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
 
     let args = (*frame).get_args();
 
+    // Debug: log IncreaseHeap (10)
+    #[cfg(feature = "platform-qemu-virt")]
+    if args[0] == 10 {
+        crate::platform::qemu_virt::uart::puts("[SVC10]\n");
+    }
+
     // Parse the raw register values into a typed SysCall enum.
     let call = match SysCall::from_args(
         args[0], args[1], args[2], args[3],
@@ -290,6 +296,15 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
     ) {
         Ok(call) => call,
         Err(_e) => {
+            #[cfg(feature = "platform-qemu-virt")]
+            {
+                use core::fmt::Write;
+                let _ = write!(
+                    crate::platform::qemu_virt::uart::UartWriter,
+                    "[SVC] InvalidSyscall a0={} pid={}\n",
+                    args[0], caller_pid.get(),
+                );
+            }
             let result = XousResult::Error(xous::Error::InvalidSyscall);
             (*frame).set_args(&result.to_args());
             return;
