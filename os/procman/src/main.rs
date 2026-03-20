@@ -176,30 +176,30 @@ fn handle_scalar(sender: xous::MessageSender, scalar: xous::ScalarMessage) {
 fn handle_mutable_borrow_ref(sender: xous::MessageSender, mem: &xous::MemoryMessage) {
     match mem.id {
         id if id == ProcManOp::SpawnAndWaitWithArgs as usize => {
-            let valid_len = mem.valid.map(|v| v.get()).unwrap_or(0);
-            let buf = unsafe {
-                core::slice::from_raw_parts(mem.buf.as_ptr(), mem.buf.len())
-            };
-            let (name, args_start, args_len) = beetos_api_procman::parse_cmdline(buf, valid_len);
-
-            // Prepare argv data (portion after the name)
-            let argv_data = if args_len > 0 {
-                &buf[args_start..args_start + args_len]
-            } else {
-                &[]
-            };
+            // Parse the command line and copy what we need to stack locals
+            // BEFORE any mutable access to the buffer. This avoids aliasing UB.
+            let name_packed: [usize; 2];
+            let argv_ptr: usize;
+            let argv_len: usize;
+            {
+                let valid_len = mem.valid.map(|v| v.get()).unwrap_or(0);
+                let buf = unsafe {
+                    core::slice::from_raw_parts(mem.buf.as_ptr(), mem.buf.len())
+                };
+                let (name, args_start, args_len) = beetos_api_procman::parse_cmdline(buf, valid_len);
+                name_packed = beetos_api_procman::pack_name_short(name);
+                argv_ptr = if args_len > 0 { buf[args_start..].as_ptr() as usize } else { 0 };
+                argv_len = args_len;
+                // `buf` and `name` borrows end here
+            }
 
             // Call SpawnByNameWithArgs syscall
-            let name_packed = beetos_api_procman::pack_name_short(name);
-            let argv_ptr = if argv_data.is_empty() { 0 } else { argv_data.as_ptr() as usize };
             let spawn_result = xous::rsyscall(xous::SysCall::SpawnByNameWithArgs(
-                name_packed[0], name_packed[1], argv_ptr, argv_data.len(),
+                name_packed[0], name_packed[1], argv_ptr, argv_len,
             ));
 
-            // Write the exit code into the buffer's first usize (so caller can read it)
             let exit_code = match spawn_result {
                 Ok(xous::Result::ProcessID(pid)) => {
-                    // Wait for the process to exit
                     let wait_result = xous::rsyscall(xous::SysCall::WaitProcess(pid));
                     match wait_result {
                         Ok(xous::Result::Scalar1(code)) => code,
@@ -207,26 +207,23 @@ fn handle_mutable_borrow_ref(sender: xous::MessageSender, mem: &xous::MemoryMess
                     }
                 }
                 Err(_e) => {
-                    let _ = write!(UartWriter, "[procman] spawn failed for '{}'\n", name);
+                    puts("[procman] spawn failed\n");
                     usize::MAX
                 }
                 _ => usize::MAX,
             };
 
-            // Write exit code into the buffer so the caller can read it
+            // Now safe to write — no immutable borrows alive
             let buf_mut = unsafe {
                 core::slice::from_raw_parts_mut(mem.buf.as_mut_ptr(), mem.buf.len())
             };
             if buf_mut.len() >= core::mem::size_of::<usize>() {
-                let exit_bytes = exit_code.to_le_bytes();
-                buf_mut[..exit_bytes.len()].copy_from_slice(&exit_bytes);
+                buf_mut[..core::mem::size_of::<usize>()].copy_from_slice(&exit_code.to_le_bytes());
             }
 
-            // Return the memory to unblock the caller
             xous::return_memory_offset_valid(sender, mem.buf, None, None).ok();
         }
         _ => {
-            // Unknown opcode — just return memory
             xous::return_memory_offset_valid(sender, mem.buf, None, None).ok();
         }
     }

@@ -72,10 +72,22 @@ fn put_usize(mut n: usize) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // x0 = UART MMIO base VA (set by kernel before ERET)
+    // Read boot parameters from registers BEFORE any function call or syscall.
+    // The kernel sets x0=uart_va, x1=argv_ptr, x2=argv_len before ERET.
+    // Any syscall (including GetProcessId) will clobber x0-x7.
     let uart_base: usize;
+    let argv_ptr: usize;
+    let argv_len: usize;
     unsafe {
-        core::arch::asm!("mov {}, x0", out(reg) uart_base, options(nomem, nostack));
+        core::arch::asm!(
+            "mov {0}, x0",
+            "mov {1}, x1",
+            "mov {2}, x2",
+            out(reg) uart_base,
+            out(reg) argv_ptr,
+            out(reg) argv_len,
+            options(nomem, nostack),
+        );
         UART_BASE = uart_base;
     }
 
@@ -90,14 +102,6 @@ pub extern "C" fn _start() -> ! {
         loop {
             xous::yield_slice();
         }
-    }
-
-    // Read argv: x1 = argv_ptr, x2 = argv_len (set by kernel if spawned with args)
-    let argv_ptr: usize;
-    let argv_len: usize;
-    unsafe {
-        core::arch::asm!("mov {}, x1", out(reg) argv_ptr, options(nomem, nostack));
-        core::arch::asm!("mov {}, x2", out(reg) argv_len, options(nomem, nostack));
     }
 
     // Otherwise, we were spawned as "hello" — print greeting and exit
