@@ -46,6 +46,19 @@ pub enum SysCall {
     /// * **BadAddress**: A page in the range was not mapped
     UnmapMemory(MemoryRange),
 
+    /// Increase the heap by `size` bytes. Xous-compatible alias for
+    /// MapMemory with phys=None, virt=None, flags=R|W.
+    ///
+    /// # Returns
+    ///
+    /// * **MemoryRange**: The newly allocated region.
+    ///
+    /// # Errors
+    ///
+    /// * **BadAlignment**: The size is not page-aligned.
+    /// * **OutOfMemory**: No memory available.
+    IncreaseHeap(MemorySize),
+
     /// Set the specified flags on the virtual address range. This can be used
     /// to REMOVE flags on a memory region, for example to mark it as no-execute
     /// after writing program data.
@@ -461,7 +474,7 @@ pub enum SysCallNumber {
     FutexWait = 7,
     FutexWake = 8,
     // 9 is unused
-    // 10 is unused
+    IncreaseHeap = 10,
     // 11 is unused
     UpdateMemoryFlags = 12,
     // 13 is unused
@@ -528,7 +541,7 @@ impl SysCallNumber {
             7 => FutexWait,
             8 => FutexWake,
             // 9 is unused
-            // 10 is unused
+            10 => IncreaseHeap,
             // 11 is unused
             12 => UpdateMemoryFlags,
             14 => CreateServerWithAddress,
@@ -612,6 +625,9 @@ impl SysCall {
             ],
             SysCall::UnmapMemory(range) => {
                 [SysCallNumber::UnmapMemory as usize, range.as_ptr() as usize, range.len(), 0, 0, 0, 0, 0]
+            }
+            SysCall::IncreaseHeap(size) => {
+                [SysCallNumber::IncreaseHeap as usize, size.get(), 0, 0, 0, 0, 0, 0]
             }
             SysCall::Yield => [SysCallNumber::Yield as usize, 0, 0, 0, 0, 0, 0, 0],
             SysCall::SetThreadPriority(priority) => {
@@ -951,6 +967,9 @@ impl SysCall {
             SysCallNumber::FutexWait => SysCall::FutexWait(a1, a2),
             #[cfg(beetos)]
             SysCallNumber::FutexWake => SysCall::FutexWake(a1, a2),
+            SysCallNumber::IncreaseHeap => {
+                SysCall::IncreaseHeap(MemorySize::new(a1).ok_or(Error::InvalidSyscall)?)
+            }
             SysCallNumber::UpdateMemoryFlags => SysCall::UpdateMemoryFlags(
                 unsafe { MemoryRange::new(a1, a2) }?,
                 MemoryFlags::from_bits(a3),

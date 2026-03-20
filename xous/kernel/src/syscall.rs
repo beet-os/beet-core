@@ -351,7 +351,7 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         SysCall::CreateServerWithAddress(..) => Ok(()),
 
         // Memory mapping has its own, more granular permission system
-        SysCall::MapMemory(..) | SysCall::UnmapMemory(..) | SysCall::UpdateMemoryFlags(..) => Ok(()),
+        SysCall::MapMemory(..) | SysCall::UnmapMemory(..) | SysCall::UpdateMemoryFlags(..) | SysCall::IncreaseHeap(..) => Ok(()),
 
         // XXX: This is somewhat sensitive, because it allows us to inject arbitrary contents (at a
         // non-controllable position) into the address space of the target PID.
@@ -452,6 +452,16 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             mm.unmap_range(range.as_ptr(), range.len())?;
             Ok(Result::Ok)
         }),
+        SysCall::IncreaseHeap(size) => {
+            MemoryManager::with_mut(|mm| {
+                if size.get() & (PAGE_SIZE - 1) != 0 {
+                    return Err(Error::BadAlignment);
+                }
+
+                let range = mm.map_range(0, core::ptr::null_mut(), size.get(), MemoryFlags::POPULATE | MemoryFlags::W, true)?;
+                Ok(Result::MemoryRange(range))
+            })
+        }
         SysCall::ClaimInterrupt(no, callback, arg) => {
             if let Ok(no) = no.try_into() {
                 interrupt_claim_user(no, current_pid(), callback, arg).map(|_| Result::Ok)
