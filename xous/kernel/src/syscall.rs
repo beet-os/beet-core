@@ -9,6 +9,8 @@ use xous::{
 };
 
 use crate::irq::{interrupt_claim_user, interrupt_free};
+#[cfg(beetos)]
+use crate::kfuture::KernelFuture;
 use crate::mem::{MemoryManager, PAGE_SIZE};
 use crate::process::{current_pid, ConnectionSlot, ThreadState, IRQ_TID};
 use crate::scheduler::Scheduler;
@@ -20,6 +22,20 @@ use crate::services::SystemServices;
 enum ExecutionType {
     Blocking,
     NonBlocking,
+}
+
+/// Suspend the current thread with a kernel future.
+///
+/// Stores `future` on the thread and parks it via `WaitEvent { mask }`.
+/// When the kernel posts matching notification bits, the thread is woken
+/// and `activate_current` polls the future to produce the syscall result.
+///
+/// This is the single suspension primitive for all async syscalls.
+#[cfg(beetos)]
+fn suspend_with_future(ss: &mut SystemServices, tid: TID, future: KernelFuture, mask: usize) {
+    let process = ss.current_process_mut();
+    process.set_kernel_future(tid, future);
+    process.set_thread_state(tid, ThreadState::WaitEvent { mask });
 }
 
 #[allow(dead_code)]
@@ -312,15 +328,13 @@ fn receive_message(tid: TID, sid: SID, blocking: ExecutionType) -> SysCallResult
         // There is no pending message — suspend the thread.
         klog!("did not have any waiting messages -- suspending thread {}", tid);
 
-        // On hardware: store a kernel future and suspend via WaitEvent.
-        // The scheduler polls the future when the thread is woken.
+        // On hardware: suspend with a kernel future.
         #[cfg(beetos)]
-        {
-            use crate::kfuture::{KernelFuture, EVENT_SERVER_MSG};
-            let process = ss.current_process_mut();
-            process.set_kernel_future(tid, KernelFuture::ReceiveMessage { sidx });
-            process.set_thread_state(tid, ThreadState::WaitEvent { mask: EVENT_SERVER_MSG });
-        }
+        suspend_with_future(
+            ss, tid,
+            KernelFuture::ReceiveMessage { sidx },
+            crate::kfuture::EVENT_SERVER_MSG,
+        );
 
         // In hosted mode: use legacy WaitReceive state.
         #[cfg(not(beetos))]
