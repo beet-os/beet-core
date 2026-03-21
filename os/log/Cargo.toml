@@ -1,0 +1,16 @@
+[package]
+name = "log"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "BeetOS log server — forwards stdout/stderr/panic to UART"
+
+[[bin]]
+name = "log"
+path = "src/main.rs"
+
+[dependencies]
+xous = { path = "../../xous/xous-rs" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }

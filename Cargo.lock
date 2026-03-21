@@ -69,11 +69,16 @@ name = "beetos-api-procman"
 version = "0.1.0"
 
 [[package]]
+name = "beetos-api-storage"
+version = "0.1.0"
+
+[[package]]
 name = "beetos-kernel"
 version = "0.1.0"
 dependencies = [
  "beetos",
  "beetos-api-console",
+ "beetos-api-storage",
  "bitflags",
  "bitvec",
  "crossbeam-channel",

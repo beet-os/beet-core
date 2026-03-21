@@ -86,10 +86,10 @@ fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
     let target_dir = ws_target.join("aarch64-unknown-none/debug");
 
     // Build all app/service crates (excluded from workspace, so use --manifest-path)
-    for app in &["hello", "shell", "procman", "fs"] {
+    for app in &["hello", "shell", "procman", "fs", "log"] {
         println!("Building app: {app}");
-        // procman and fs live in os/, everything else in apps/
-        let manifest = if *app == "procman" || *app == "fs" {
+        // procman, fs, and log live in os/, everything else in apps/
+        let manifest = if *app == "procman" || *app == "fs" || *app == "log" {
             root.join(format!("os/{app}/Cargo.toml"))
         } else {
             root.join(format!("apps/{app}/Cargo.toml"))

@@ -316,6 +316,11 @@ static PROCMAN_ELF: &[u8] = include_bytes!(
 static FS_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/fs.stripped")
 );
+/// Log server: forwards stdout/stderr/panic IPC messages to the UART.
+/// Must be launched before any std process that calls println!.
+static LOG_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/log.stripped")
+);
 /// hello-std: compiled with Rust std (aarch64-unknown-beetos), stripped to same dir by xtask.
 static HELLO_STD_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/hello-std.stripped")
@@ -324,6 +329,7 @@ static HELLO_STD_ELF: &[u8] = include_bytes!(
 /// The kernel holds these via include_bytes! — no filesystem needed.
 /// Used by SpawnByName syscall to create processes by name.
 static BINARY_TABLE: &[(&str, &[u8])] = &[
+    ("log", LOG_ELF),
     ("idle", HELLO_ELF),
     ("hello", HELLO_STD_ELF),
     ("hello-nostd", HELLO_ELF),
@@ -412,32 +418,36 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         );
     }
 
-    // Create the idle process first (PID 2)
-    let idle_pid = PID::new(2).unwrap();
+    // PID 2: log server — must be first so println! works in all std processes.
+    let log_pid = PID::new(2).unwrap();
+    create_elf_process(log_pid, LOG_ELF, b"log");
+
+    // PID 3: idle placeholder
+    let idle_pid = PID::new(3).unwrap();
     create_elf_process(idle_pid, HELLO_ELF, b"idle");
 
-    // Create the procman process (PID 3)
-    let procman_pid = PID::new(3).unwrap();
+    // PID 4: process manager
+    let procman_pid = PID::new(4).unwrap();
     create_elf_process(procman_pid, PROCMAN_ELF, b"procman");
 
-    // Create the shell process (PID 4)
-    let shell_pid = PID::new(4).unwrap();
+    // PID 5: shell
+    let shell_pid = PID::new(5).unwrap();
     create_elf_process(shell_pid, SHELL_ELF, b"shell");
 
-    // Create the filesystem service (PID 5)
-    let fs_pid = PID::new(5).unwrap();
+    // PID 6: filesystem service
+    let fs_pid = PID::new(6).unwrap();
     create_elf_process(fs_pid, FS_ELF, b"fs");
 
-    // Create hello-std demo process (PID 6)
-    let hello_pid = PID::new(6).unwrap();
+    // PID 7: hello-std demo
+    let hello_pid = PID::new(7).unwrap();
     create_elf_process(hello_pid, HELLO_STD_ELF, b"hello");
 
-    // Map UART MMIO into procman, shell, fs, and hello-std for direct output.
+    // Map UART MMIO into log, procman, shell, fs, and hello-std for direct output.
     #[cfg(feature = "platform-qemu-virt")]
     {
         crate::services::SystemServices::with_mut(|ss| {
             crate::mem::MemoryManager::with_mut(|mm| {
-                for &pid in &[procman_pid, shell_pid, fs_pid, hello_pid] {
+                for &pid in &[log_pid, procman_pid, shell_pid, fs_pid, hello_pid] {
                     let process = ss.process_mut(pid).expect("process for UART map");
                     process.mapping.map_page(
                         mm,
@@ -532,8 +542,12 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let (disk_va, disk_size) = (0usize, 0usize);
 
     // Pass boot parameters via registers:
-    //   procman/shell: x0 = UART VA (no disk access)
-    //   fs service:    x0 = UART VA, x1 = disk VA, x2 = disk size
+    //   log/procman/shell/hello: x0 = UART VA
+    //   fs service:              x0 = UART VA, x1 = disk VA, x2 = disk size
+    {
+        let idx = log_pid.get() as usize - 1;
+        super::process::set_thread_arg0(idx, SHELL_UART_VA);
+    }
     {
         let idx = procman_pid.get() as usize - 1;
         super::process::set_thread_arg0(idx, SHELL_UART_VA);
