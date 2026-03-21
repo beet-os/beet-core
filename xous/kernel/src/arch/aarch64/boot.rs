@@ -338,7 +338,7 @@ static TEST_ELF: &[u8] = include_bytes!(
 static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("log", LOG_ELF),
     ("idle", HELLO_ELF),
-    ("hello", HELLO_STD_ELF),
+    ("hello-std", HELLO_STD_ELF),
     ("hello-nostd", HELLO_ELF),
     ("shell", SHELL_ELF),
     ("procman", PROCMAN_ELF),
@@ -456,19 +456,22 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let fs_pid = PID::new(6).unwrap();
     create_elf_process(fs_pid, FS_ELF, b"fs");
 
-    // PID 7: hello-std demo or beetos-test (in test-mode)
+    // PID 7: beetos-test in test-mode only (hello-std is spawnable from the shell).
+    #[cfg(feature = "test-mode")]
     let app_pid = PID::new(7).unwrap();
-    #[cfg(not(feature = "test-mode"))]
-    create_elf_process(app_pid, HELLO_STD_ELF, b"hello");
     #[cfg(feature = "test-mode")]
     create_elf_process(app_pid, TEST_ELF, b"beetos-test");
 
-    // Map UART MMIO into log, procman, shell, fs, and the user app for direct output.
+    // Map UART MMIO into log, procman, shell, fs (and beetos-test in test-mode).
     #[cfg(feature = "platform-qemu-virt")]
     {
+        #[cfg(not(feature = "test-mode"))]
+        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid];
+        #[cfg(feature = "test-mode")]
+        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid, app_pid];
         crate::services::SystemServices::with_mut(|ss| {
             crate::mem::MemoryManager::with_mut(|mm| {
-                for &pid in &[log_pid, procman_pid, shell_pid, fs_pid, app_pid] {
+                for &pid in uart_pids {
                     let process = ss.process_mut(pid).expect("process for UART map");
                     process.mapping.map_page(
                         mm,
@@ -581,6 +584,7 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         let idx = fs_pid.get() as usize - 1;
         super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
     }
+    #[cfg(feature = "test-mode")]
     {
         let idx = app_pid.get() as usize - 1;
         super::process::set_thread_arg0(idx, SHELL_UART_VA);
