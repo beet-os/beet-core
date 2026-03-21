@@ -31,11 +31,22 @@
 
 #![no_std]
 
-/// Apple Silicon uses 16KB pages.
+/// AArch64 translation granule — set by the `page-4k` / `page-16k` / `page-64k` feature.
+/// Exactly one feature must be enabled. Default: `page-16k` (Apple Silicon).
+#[cfg(feature = "page-4k")]
+pub const PAGE_SIZE: usize = 4096;
+#[cfg(feature = "page-16k")]
 pub const PAGE_SIZE: usize = 16384;
+#[cfg(feature = "page-64k")]
+pub const PAGE_SIZE: usize = 65536;
 
-/// Log2 of PAGE_SIZE (14 for 16KB).
+/// Log2 of PAGE_SIZE (12 / 14 / 16 for 4KB / 16KB / 64KB).
+#[cfg(feature = "page-4k")]
+pub const PAGE_SHIFT: usize = 12;
+#[cfg(feature = "page-16k")]
 pub const PAGE_SHIFT: usize = 14;
+#[cfg(feature = "page-64k")]
+pub const PAGE_SHIFT: usize = 16;
 
 // ======================== User-accessible addresses (EL0, TTBR0) ========================
 //

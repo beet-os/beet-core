@@ -9,13 +9,22 @@ license = "MIT OR Apache-2.0"
 core = { version = '1.0.0', optional = true, package = 'rustc-std-workspace-core' }
 
 [features]
-default = []
+default = ["page-16k"]
 # This is being built as part of libstd
 rustc-dep-of-std = ['core']
 # Platform selection — affects RAM base address and max RAM size
 platform-qemu-virt = []
 platform-bcm2712 = []
 platform-apple-t8103 = []
+# AArch64 translation granule (TCR_EL1.TG0).
+# All three are supported by the ISA; hardware support varies.
+# - page-4k:  4KB  (shift=12) — universal, all AArch64 cores
+# - page-16k: 16KB (shift=14) — Apple Silicon, RPi4/5 (optional)
+# - page-64k: 64KB (shift=16) — server chips (Ampere Altra, ThunderX)
+# Exactly one must be selected. Default: page-16k (Apple Silicon target).
+page-4k  = []
+page-16k = []
+page-64k = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }
