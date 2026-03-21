@@ -30,6 +30,7 @@ exclude = [
     "os/fs",
     "os/log",
     "apps/coreutils",
+    "apps/beetos-test",
 ]
 
 [workspace.dependencies]

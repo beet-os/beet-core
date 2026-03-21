@@ -15,6 +15,7 @@ debug-print = []
 log-serial = []
 production = []
 integration-test = []
+test-mode = []
 platform-qemu-virt = ["beetos/platform-qemu-virt"]
 platform-bcm2712 = ["beetos/platform-bcm2712"]
 platform-apple-t8103 = ["beetos/platform-apple-t8103"]
@@ -44,4 +45,4 @@ xous = { path = "../xous-rs", features = [
 ] }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)', 'cfg(feature, values("trace-systemview", "platform-qemu-virt", "platform-bcm2712", "platform-apple-t8103"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)', 'cfg(feature, values("trace-systemview", "platform-qemu-virt", "platform-bcm2712", "platform-apple-t8103", "test-mode"))'] }

@@ -10,6 +10,7 @@ fn main() -> anyhow::Result<()> {
         Some("build") => build(&args[1..])?,
         Some("qemu") => qemu(&args[1..])?,
         Some("rpi5") => rpi5()?,
+        Some("test") => test()?,
         Some(cmd) => anyhow::bail!("unknown command: {cmd}"),
         None => {
             println!("BeetOS xtask build system");
@@ -20,6 +21,7 @@ fn main() -> anyhow::Result<()> {
             println!("  check              Check all workspace crates (hosted mode)");
             println!("  build [--platform]  Cross-compile for aarch64-unknown-none");
             println!("  qemu               Build and run on QEMU virt");
+            println!("  test               Build and run self-test suite on QEMU (CI)");
             println!();
             println!("Platforms:");
             println!("  qemu-virt          QEMU virt machine (default)");
@@ -72,6 +74,24 @@ fn find_stage1_rustc(root: &std::path::Path) -> Option<PathBuf> {
         let rustc = rust_root.join(format!("build/{host}/stage1/bin/rustc"));
         if rustc.exists() {
             return Some(rustc);
+        }
+    }
+    None
+}
+
+/// Find the rust-lld binary for linking aarch64-unknown-beetos binaries.
+///
+/// The stage1 compiler directory often lacks rust-lld; it lives in stage0 or
+/// stage0-sysroot instead. Returns the directory containing rust-lld so the
+/// caller can prepend it to PATH.
+fn find_rust_lld_dir(root: &std::path::Path) -> Option<PathBuf> {
+    let rust_root = root.parent()?.join("rust");
+    for host in &["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin"] {
+        for stage in &["stage1", "stage0-sysroot", "stage0"] {
+            let lld = rust_root.join(format!("build/{host}/{stage}/lib/rustlib/{host}/bin/rust-lld"));
+            if lld.exists() {
+                return lld.parent().map(|p| p.to_path_buf());
+            }
         }
     }
     None
@@ -144,19 +164,26 @@ fn build_std_app(
         .parent().expect("no grandparent for rustc");
     let sysroot_arg = format!("--sysroot={}", sysroot.display());
 
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--manifest-path",
-            manifest.to_str().expect("non-UTF8 path"),
-            "--target-dir",
-            ws_target.to_str().expect("non-UTF8 path"),
-            "--target",
-            "aarch64-unknown-beetos",
-        ])
-        .env("RUSTC", stage1_rustc)
-        .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1 {sysroot_arg}"))
-        .status()?;
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "--manifest-path",
+        manifest.to_str().expect("non-UTF8 path"),
+        "--target-dir",
+        ws_target.to_str().expect("non-UTF8 path"),
+        "--target",
+        "aarch64-unknown-beetos",
+    ])
+    .env("RUSTC", stage1_rustc)
+    .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1 {sysroot_arg}"));
+
+    // rust-lld may only exist in stage0; prepend its directory to PATH.
+    if let Some(lld_dir) = find_rust_lld_dir(root) {
+        let path = format!("{}:{}", lld_dir.display(), env::var("PATH").unwrap_or_default());
+        cmd.env("PATH", path);
+    }
+
+    let status = cmd.status()?;
     anyhow::ensure!(status.success(), "building app 'hello-std' failed");
 
     // Strip and copy to the no_std target dir so include_bytes! can find it
@@ -357,4 +384,181 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the beetos-test binary using the custom stage1 rustc.
+fn build_test_app(
+    root: &std::path::Path,
+    stage1_rustc: &std::path::Path,
+    user_linker: &std::path::Path,
+    ws_target: &std::path::Path,
+) -> anyhow::Result<()> {
+    println!("Building app: beetos-test (with std, aarch64-unknown-beetos)");
+    let manifest = root.join("apps/beetos-test/Cargo.toml");
+    let linker_arg = format!("-Clink-arg=-T{}", user_linker.display());
+
+    let sysroot = stage1_rustc
+        .parent().expect("no parent for rustc")
+        .parent().expect("no grandparent for rustc");
+    let sysroot_arg = format!("--sysroot={}", sysroot.display());
+
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "--manifest-path",
+        manifest.to_str().expect("non-UTF8 path"),
+        "--target-dir",
+        ws_target.to_str().expect("non-UTF8 path"),
+        "--target",
+        "aarch64-unknown-beetos",
+    ])
+    .env("RUSTC", stage1_rustc)
+    .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1 {sysroot_arg}"));
+
+    // rust-lld may only exist in stage0; prepend its directory to PATH.
+    if let Some(lld_dir) = find_rust_lld_dir(root) {
+        let path = format!("{}:{}", lld_dir.display(), env::var("PATH").unwrap_or_default());
+        cmd.env("PATH", path);
+    }
+
+    let status = cmd.status()?;
+    anyhow::ensure!(status.success(), "building app 'beetos-test' failed");
+
+    // Strip and copy to the no_std target dir so include_bytes! can find it
+    let std_target_dir = ws_target.join("aarch64-unknown-beetos/debug");
+    let nostd_target_dir = ws_target.join("aarch64-unknown-none/debug");
+    let elf = std_target_dir.join("beetos-test");
+    let stripped = nostd_target_dir.join("beetos-test.stripped");
+    strip_binary(&elf, &stripped)?;
+
+    let size = std::fs::metadata(&stripped)?.len();
+    println!("  beetos-test.stripped: {size} bytes");
+    Ok(())
+}
+
+/// Build the kernel with platform-qemu-virt + test-mode features.
+fn build_test_kernel(root: &std::path::Path) -> anyhow::Result<()> {
+    let linker_script = root.join("xous/kernel/link-qemu-virt.x");
+    let linker_arg = format!("-Clink-arg=-T{}", linker_script.display());
+
+    println!("Building test kernel (platform-qemu-virt + test-mode)...");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--package",
+            "beetos-kernel",
+            "--target",
+            "aarch64-unknown-none",
+            "--features",
+            "platform-qemu-virt,test-mode",
+        ])
+        .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1"))
+        .status()?;
+    anyhow::ensure!(status.success(), "test kernel build failed");
+    Ok(())
+}
+
+/// Build the test binary + kernel, launch QEMU with piped stdout, parse results.
+///
+/// Exits with code 0 if all tests pass, 1 if any fail or the timeout is reached.
+fn test() -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let root = workspace_root();
+    let user_linker = root.join("apps/link-user.x");
+    let ws_target = root.join("target");
+
+    // Build beetos-test first so include_bytes! in the kernel can find it.
+    let stage1_rustc = find_stage1_rustc(&root)
+        .ok_or_else(|| anyhow::anyhow!("stage1 rustc not found — build ../rust first"))?;
+    build_test_app(&root, &stage1_rustc, &user_linker, &ws_target)?;
+
+    // Build all other apps (kernel embeds them all).
+    build_apps(&root)?;
+
+    // Build the kernel with test-mode enabled.
+    build_test_kernel(&root)?;
+
+    let kernel = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel.exists(), "kernel binary not found at {}", kernel.display());
+
+    let disk_img = create_test_disk(&root)?;
+
+    println!();
+    println!("Launching QEMU for tests (timeout: 60s)...");
+    println!();
+
+    let mut qemu_args = vec![
+        "-machine".to_string(), "virt,gic-version=3".to_string(),
+        "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-m".to_string(), "2G".to_string(),
+        "-nographic".to_string(),
+        "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
+    ];
+
+    if disk_img.exists() {
+        qemu_args.extend_from_slice(&[
+            "-drive".to_string(),
+            format!("file={},format=raw,if=none,id=disk0", disk_img.display()),
+            "-device".to_string(),
+            "virtio-blk-device,drive=disk0".to_string(),
+        ]);
+    }
+
+    let mut child = Command::new("qemu-system-aarch64")
+        .args(&qemu_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let stdout = child.stdout.take().expect("piped stdout missing");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().flatten() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut all_passed = false;
+    let mut some_failed = false;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                println!("  {line}");
+                if line.contains("ALL TESTS PASSED") {
+                    all_passed = true;
+                    break;
+                }
+                if line.contains("SOME TESTS FAILED") {
+                    some_failed = true;
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    println!();
+    if all_passed {
+        println!("Result: ALL TESTS PASSED");
+        Ok(())
+    } else if some_failed {
+        anyhow::bail!("Result: SOME TESTS FAILED");
+    } else {
+        anyhow::bail!("Result: TIMEOUT — test sentinel not seen within 60s");
+    }
 }
