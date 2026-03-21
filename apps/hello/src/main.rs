@@ -7,7 +7,7 @@
 //! when no other process is ready.
 //!
 //! When spawned by name as "hello": prints a greeting with its PID,
-//! then exits cleanly via TerminateProcess(0).
+//! tests heap allocation (Box, Vec, String), then exits cleanly.
 //!
 //! The kernel determines the behavior by checking the process name.
 //! Both cases use the same binary — the name is set during create_process.
@@ -15,7 +15,101 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::panic::PanicInfo;
+
+// ============================================================================
+// Heap allocator — uses Xous IncreaseHeap syscall
+// ============================================================================
+
+mod heap {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Simple bump allocator backed by IncreaseHeap syscall.
+    ///
+    /// Allocates 16KB pages from the kernel on demand. Does not support
+    /// deallocation (freed memory is leaked). Sufficient for demos and
+    /// short-lived processes.
+    pub struct BumpAllocator {
+        /// Current allocation pointer (bumps upward).
+        next: AtomicUsize,
+        /// End of the current heap region.
+        end: AtomicUsize,
+    }
+
+    impl BumpAllocator {
+        pub const fn new() -> Self {
+            Self {
+                next: AtomicUsize::new(0),
+                end: AtomicUsize::new(0),
+            }
+        }
+
+        fn grow(&self, min_bytes: usize) -> bool {
+            let page_size = 16384; // beetos::PAGE_SIZE
+            let pages_needed = (min_bytes + page_size - 1) / page_size;
+            let size = pages_needed * page_size;
+
+            let size_nz = match core::num::NonZeroUsize::new(size) {
+                Some(s) => s,
+                None => return false,
+            };
+
+            match xous::rsyscall(xous::SysCall::IncreaseHeap(size_nz)) {
+                Ok(xous::Result::MemoryRange(range)) => {
+                    let base = range.as_ptr() as usize;
+                    let len = range.len();
+                    // If current heap is empty or exhausted, reset to new region.
+                    // Note: this is a simple approach — non-contiguous regions
+                    // waste the gap, but for demos this is fine.
+                    self.next.store(base, Ordering::SeqCst);
+                    self.end.store(base + len, Ordering::SeqCst);
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    unsafe impl GlobalAlloc for BumpAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            loop {
+                let next = self.next.load(Ordering::SeqCst);
+                let end = self.end.load(Ordering::SeqCst);
+
+                let aligned = (next + layout.align() - 1) & !(layout.align() - 1);
+                let new_next = aligned + layout.size();
+
+                if new_next <= end {
+                    // Try to bump the pointer
+                    if self.next.compare_exchange(
+                        next, new_next, Ordering::SeqCst, Ordering::SeqCst,
+                    ).is_ok() {
+                        return aligned as *mut u8;
+                    }
+                    // CAS failed — another allocation raced us, retry
+                    continue;
+                }
+
+                // Need more memory
+                if !self.grow(layout.size() + layout.align()) {
+                    return core::ptr::null_mut();
+                }
+                // Retry with the new region
+            }
+        }
+
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+            // Bump allocator does not reclaim memory.
+        }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: heap::BumpAllocator = heap::BumpAllocator::new();
 
 // ============================================================================
 // UART output
@@ -45,6 +139,14 @@ fn putc(c: u8) {
 fn puts(s: &str) {
     for b in s.bytes() {
         putc(b);
+    }
+}
+
+fn put_hex(n: usize) {
+    puts("0x");
+    for i in (0..16).rev() {
+        let d = ((n >> (i * 4)) & 0xf) as u8;
+        putc(if d < 10 { b'0' + d } else { b'a' + d - 10 });
     }
 }
 
@@ -129,6 +231,38 @@ pub extern "C" fn _start() -> ! {
         }
         puts("]\n");
     }
+
+    // Test heap allocation
+    puts("Creating Box<u64>...\n");
+    let b: Box<u64> = Box::new(42);
+    puts("Box = ");
+    put_usize(*b as usize);
+    puts(" at ");
+    put_hex(&*b as *const u64 as usize);
+    puts("\n");
+
+    puts("Creating Vec...\n");
+    let v: Vec<u32> = vec![1, 2, 3, 4, 5];
+    puts("Vec len=");
+    put_usize(v.len());
+    puts(" [");
+    for (i, val) in v.iter().enumerate() {
+        if i > 0 { puts(", "); }
+        put_usize(*val as usize);
+    }
+    puts("]\n");
+
+    puts("Creating String...\n");
+    let s = String::from("alloc works on BeetOS!");
+    puts(&s);
+    puts("\n");
+
+    puts("Testing format!...\n");
+    let msg = format!("{} + {} = {}", 40, 2, 40 + 2);
+    puts(&msg);
+    puts("\n");
+
+    puts("[done]\n");
 
     // Clean exit
     xous::terminate_process(0);

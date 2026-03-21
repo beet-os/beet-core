@@ -453,33 +453,13 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             Ok(Result::Ok)
         }),
         SysCall::IncreaseHeap(size) => {
-            #[cfg(feature = "platform-qemu-virt")]
-            crate::platform::qemu_virt::uart::puts("[IncreaseHeap] called\n");
-            let result = MemoryManager::with_mut(|mm| {
+            MemoryManager::with_mut(|mm| {
                 if size.get() & (PAGE_SIZE - 1) != 0 {
-                    #[cfg(feature = "platform-qemu-virt")]
-                    crate::platform::qemu_virt::uart::puts("[IncreaseHeap] BadAlignment\n");
                     return Err(Error::BadAlignment);
                 }
-
                 let range = mm.map_range(0, core::ptr::null_mut(), size.get(), MemoryFlags::POPULATE | MemoryFlags::W, true)?;
-                #[cfg(feature = "platform-qemu-virt")]
-                {
-                    use core::fmt::Write;
-                    let _ = write!(
-                        crate::platform::qemu_virt::uart::UartWriter,
-                        "[IncreaseHeap] OK addr={:#x} size={:#x}\n",
-                        range.as_ptr() as usize,
-                        range.len(),
-                    );
-                }
                 Ok(Result::MemoryRange(range))
-            });
-            #[cfg(feature = "platform-qemu-virt")]
-            if result.is_err() {
-                crate::platform::qemu_virt::uart::puts("[IncreaseHeap] map_range failed\n");
-            }
-            result
+            })
         }
         SysCall::ClaimInterrupt(no, callback, arg) => {
             if let Ok(no) = no.try_into() {
@@ -583,16 +563,15 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         SysCall::GetThreadId => Ok(Result::ThreadID(tid)),
 
         SysCall::Connect(sid) => {
-            let result = SystemServices::with_mut(|ss| {
+            // In BeetOS, Connect behaves like TryConnect: return ServerNotFound
+            // immediately instead of blocking the thread forever. The original
+            // Xous behavior (retry until the server appears) requires a name
+            // server and full service infrastructure that BeetOS doesn't have yet.
+            // Without this, any process whose std runtime connects to a missing
+            // server (e.g. xous-name-server) will hang permanently.
+            SystemServices::with_mut(|ss| {
                 ss.connect_to_server(current_pid(), sid).map(Result::ConnectionID)
-            });
-            match result {
-                Ok(o) => Ok(o),
-                Err(Error::ServerNotFound) => SystemServices::with_mut(|ss| {
-                    ss.retry_syscall(tid, ThreadState::RetryConnect { sid_hash: sid.quick_hash() })
-                }),
-                Err(e) => Err(e),
-            }
+            })
         }
         SysCall::ConnectForProcess(pid, sid) => {
             SystemServices::with_mut(|ss| ss.connect_to_server(pid, sid).map(Result::ConnectionID))

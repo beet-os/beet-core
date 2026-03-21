@@ -326,6 +326,7 @@ static HELLO_STD_ELF: &[u8] = include_bytes!(
 static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("idle", HELLO_ELF),
     ("hello", HELLO_STD_ELF),
+    ("hello-nostd", HELLO_ELF),
     ("shell", SHELL_ELF),
     ("procman", PROCMAN_ELF),
     ("fs", FS_ELF),

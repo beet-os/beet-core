@@ -283,17 +283,6 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
 
     let args = (*frame).get_args();
 
-    // Debug: log all syscalls from PID 6 (hello-std) to diagnose hang
-    #[cfg(feature = "platform-qemu-virt")]
-    if caller_pid.get() == 6 {
-        use core::fmt::Write;
-        let _ = write!(
-            crate::platform::qemu_virt::uart::UartWriter,
-            "[SVC] pid={} x0={} x1={:#x}\n",
-            caller_pid.get(), args[0], args[1],
-        );
-    }
-
     // Parse the raw register values into a typed SysCall enum.
     let call = match SysCall::from_args(
         args[0], args[1], args[2], args[3],
