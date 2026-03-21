@@ -83,7 +83,7 @@ pub fn tick(tick_count: u64) {
 
     // DHCP state machine retransmission.
     unsafe {
-        let s = &mut STATE;
+        let s = &mut *(&raw mut STATE);
         match s.dhcp_state {
             DhcpState::Init => {}
             DhcpState::Discovering => {
@@ -349,7 +349,7 @@ fn handle_dhcp(server_ip: [u8; 4], dhcp: &[u8]) {
     }
 
     unsafe {
-        let s = &mut STATE;
+        let s = &mut *(&raw mut STATE);
         match (s.dhcp_state, msg_type) {
             (DhcpState::Discovering, DHCP_MSG_OFFER) => {
                 // Got OFFER — record offered config and send REQUEST.

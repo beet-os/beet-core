@@ -9,7 +9,7 @@
 //!
 //! Reference: virtio spec v1.2, section 5.2 (Block Device).
 
-use super::virtio::{self, Virtqueue, VirtqDesc, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use super::virtio::{self, Virtqueue, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use core::sync::atomic::{fence, Ordering};
 
 /// Block sector size (always 512 bytes for virtio-blk).
@@ -17,6 +17,7 @@ pub const SECTOR_SIZE: usize = 512;
 
 /// virtio-blk request types.
 const VIRTIO_BLK_T_IN: u32 = 0;   // read
+#[allow(dead_code)]
 const VIRTIO_BLK_T_OUT: u32 = 1;  // write
 
 /// virtio-blk status codes.
@@ -97,7 +98,7 @@ pub fn probe_and_init(virtio_base_va: usize) {
 /// Returns the block device capacity in 512-byte sectors, or 0 if no device.
 pub fn capacity() -> u64 {
     unsafe {
-        match &BLK_DEV {
+        match (*(&raw const BLK_DEV)).as_ref() {
             Some(dev) => dev.capacity,
             None => 0,
         }
@@ -106,7 +107,7 @@ pub fn capacity() -> u64 {
 
 /// Returns true if a block device is available.
 pub fn is_available() -> bool {
-    unsafe { BLK_DEV.is_some() }
+    unsafe { (*(&raw const BLK_DEV)).is_some() }
 }
 
 /// Read sectors from the block device.
@@ -122,7 +123,7 @@ pub fn read_sectors(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
     }
 
     let dev = unsafe {
-        match &mut BLK_DEV {
+        match (*(&raw mut BLK_DEV)).as_mut() {
             Some(d) => d,
             None => return Err(BlkError::NoDevice),
         }
@@ -141,6 +142,7 @@ pub fn read_sectors(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
 }
 
 /// Write sectors to the block device.
+#[allow(dead_code)]
 pub fn write_sectors(lba: u64, buf: &[u8]) -> Result<(), BlkError> {
     let count = buf.len() / SECTOR_SIZE;
     if buf.len() % SECTOR_SIZE != 0 || count == 0 {
@@ -148,7 +150,7 @@ pub fn write_sectors(lba: u64, buf: &[u8]) -> Result<(), BlkError> {
     }
 
     let dev = unsafe {
-        match &mut BLK_DEV {
+        match (*(&raw mut BLK_DEV)).as_mut() {
             Some(d) => d,
             None => return Err(BlkError::NoDevice),
         }
@@ -178,6 +180,7 @@ pub enum BlkError {
 /// Implements `beetos_api_storage::BlockDevice` so the filesystem service
 /// and any other consumer can depend on the platform-agnostic trait rather
 /// than calling `blk::read_sectors()` / `blk::write_sectors()` directly.
+#[allow(dead_code)]
 pub struct VirtioBlk;
 
 impl beetos_api_storage::BlockDevice for VirtioBlk {
@@ -205,7 +208,7 @@ impl beetos_api_storage::BlockDevice for VirtioBlk {
 /// Handle a virtio-blk interrupt. Called from the IRQ handler.
 pub fn handle_irq() {
     unsafe {
-        if let Some(dev) = &BLK_DEV {
+        if let Some(dev) = (*(&raw const BLK_DEV)).as_ref() {
             virtio::ack_interrupt(dev.base_va);
         }
     }
@@ -213,7 +216,7 @@ pub fn handle_irq() {
 
 /// Return the IRQ number for the block device, if present.
 pub fn irq_number() -> Option<u32> {
-    unsafe { BLK_DEV.as_ref().map(|d| d.irq) }
+    unsafe { (*(&raw const BLK_DEV)).as_ref().map(|d| d.irq) }
 }
 
 // ============================================================================
@@ -235,12 +238,16 @@ fn init_block_device(base_va: usize, transport_idx: usize) -> bool {
     }
 
     // Initialize the virtqueue buffer.
-    let buf_va = unsafe { &mut VQUEUE_BUF.data[0] as *mut u8 as usize };
+    let buf_va = unsafe { (*(&raw mut VQUEUE_BUF)).data.as_mut_ptr() as usize };
     let buf_pa = beetos::virt_to_phys(buf_va);
 
     // Zero the buffer.
     unsafe {
-        core::ptr::write_bytes(buf_va as *mut u8, 0, VQUEUE_BUF.data.len());
+        core::ptr::write_bytes(
+            buf_va as *mut u8,
+            0,
+            virtio::Virtqueue::size_bytes(QUEUE_SIZE as usize, beetos::PAGE_SIZE),
+        );
     }
 
     let queue = unsafe {

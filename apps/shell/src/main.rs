@@ -151,7 +151,7 @@ fn process_char(c: u8) {
             0x03 => { puts("^C\n"); SHELL.pos = 0; prompt(); }
             0x04 => {
                 if SHELL.pos == 0 {
-                    puts("\n(use 'reboot' to restart)\n");
+                    puts("\n(type 'reboot' to restart)\n");
                     prompt();
                 }
             }
@@ -193,6 +193,7 @@ fn execute_line(line: &[u8]) {
         "pwd" => cmd_pwd(),
         "cd" => cmd_cd(cmd_args),
         "programs" => cmd_programs(),
+        "reboot" => cmd_reboot(),
 
         // FS operations (via IPC to fs service)
         "ls" => cmd_ls(cmd_args),
@@ -222,6 +223,7 @@ fn cmd_help() {
     puts("  pwd               Print working directory\n");
     puts("  cd [path]         Change directory (default: /)\n");
     puts("  programs          List spawnable programs\n");
+    puts("  reboot            Reboot the system\n");
     puts("  ls [path]         List directory (ramfs or /disk/)\n");
     puts("  cat <path>        Display file contents\n");
     puts("  write <path> <text>  Write text to a file (ramfs only)\n");
@@ -274,6 +276,10 @@ fn cmd_programs() {
             _ => break,
         }
     }
+}
+
+fn cmd_reboot() {
+    xous::rsyscall(xous::SysCall::Shutdown(0)).ok();
 }
 
 fn cmd_pwd() {

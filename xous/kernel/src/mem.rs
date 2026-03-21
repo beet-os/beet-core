@@ -497,7 +497,7 @@ impl MemoryManager {
         let mut current_mapping = crate::arch::mem::MemoryMapping::current();
         let virt = self.find_virtual_address(&current_mapping, virt_ptr, size)?;
         #[cfg(beetos)]
-        let mut zero_after_alloc =
+        let mut _zero_after_alloc =
             beetos::is_address_in_plaintext_dram(phys) || beetos::is_address_encrypted(phys);
 
         if flags.is_set(MemoryFlags::POPULATE) {
@@ -510,14 +510,14 @@ impl MemoryManager {
             #[cfg(beetos)]
             {
                 let (allocated, zeroed) = self.alloc_range(size / PAGE_SIZE, current_mapping.get_pid())?;
-                zero_after_alloc = !zeroed;
+                _zero_after_alloc = !zeroed;
                 if flags.is_set(MemoryFlags::PLAINTEXT)
                     || flags.is_set(MemoryFlags::NO_CACHE)
                     || flags.is_set(MemoryFlags::DEV)
                 {
                     // Pages are "encrypted zeroed". If we read them as plaintext, they would be garbage, so
                     // we need to zero it again.
-                    zero_after_alloc = true;
+                    _zero_after_alloc = true;
                     phys = to_plaintext_phys_addr(allocated)
                 } else {
                     phys = allocated;

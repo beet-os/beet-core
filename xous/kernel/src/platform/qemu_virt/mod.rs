@@ -51,11 +51,16 @@ pub fn init() {
     net_stack::init();
 }
 
-/// Halt the system.
+/// Reboot the system via PSCI SYSTEM_RESET (HVC #0).
 pub fn shutdown() -> ! {
-    uart::puts("System halted.\n");
-    loop {
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    uart::puts("Rebooting...\n");
+    unsafe {
+        core::arch::asm!(
+            "movz x0, #9",              // PSCI SYSTEM_RESET = 0x84000009
+            "movk x0, #0x8400, lsl #16",
+            "hvc #0",
+            options(nomem, nostack, noreturn),
+        );
     }
 }
 

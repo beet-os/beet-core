@@ -180,6 +180,7 @@ impl BumpAllocator {
     }
 
     /// Allocate one zeroed 16KB page. Returns the high VA of the page.
+    #[allow(dead_code)]
     fn alloc_page(&mut self) -> usize {
         let page = self.next;
         self.next += PAGE_SIZE;

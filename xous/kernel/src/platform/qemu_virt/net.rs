@@ -94,23 +94,23 @@ pub fn probe_and_init(virtio_base_va: usize) {
 
 /// Returns true if a network device was found and initialized.
 pub fn is_available() -> bool {
-    unsafe { NET_DEV.is_some() }
+    unsafe { (*(&raw const NET_DEV)).is_some() }
 }
 
 /// Returns the device MAC address, or None if not initialized.
 pub fn get_mac() -> Option<[u8; 6]> {
-    unsafe { NET_DEV.as_ref().map(|d| d.mac) }
+    unsafe { (*(&raw const NET_DEV)).as_ref().map(|d| d.mac) }
 }
 
 /// Returns the GIC IRQ number for the network device, or None if not initialized.
 pub fn irq_number() -> Option<u32> {
-    unsafe { NET_DEV.as_ref().map(|d| d.irq) }
+    unsafe { (*(&raw const NET_DEV)).as_ref().map(|d| d.irq) }
 }
 
 /// Acknowledge and clear a virtio-net interrupt. Called from the IRQ handler.
 pub fn handle_irq() {
     unsafe {
-        if let Some(dev) = &NET_DEV {
+        if let Some(dev) = (*(&raw const NET_DEV)).as_ref() {
             virtio::ack_interrupt(dev.base_va);
         }
     }
@@ -125,7 +125,7 @@ pub fn handle_irq() {
 /// make the buffer available to the device again.
 pub fn poll_recv() -> Option<(u16, usize)> {
     unsafe {
-        let dev = NET_DEV.as_mut()?;
+        let dev = (*(&raw mut NET_DEV)).as_mut()?;
         loop {
             let (desc_head, len) = dev.rx_queue.pop_used()?;
             let frame_len = (len as usize).saturating_sub(VNET_HDR_SIZE);
@@ -147,7 +147,7 @@ pub fn poll_recv() -> Option<(u16, usize)> {
 /// Only one RX descriptor should be "live" at a time (single-threaded kernel).
 pub fn get_rx_frame(desc_head: u16, frame_len: usize) -> &'static [u8] {
     unsafe {
-        let dev = NET_DEV.as_ref().expect("net not initialized");
+        let dev = (*(&raw const NET_DEV)).as_ref().expect("net not initialized");
         let buf_idx = dev.rx_desc_to_buf[desc_head as usize];
         &RX_BUFS[buf_idx].0[VNET_HDR_SIZE..VNET_HDR_SIZE + frame_len]
     }
@@ -156,7 +156,7 @@ pub fn get_rx_frame(desc_head: u16, frame_len: usize) -> &'static [u8] {
 /// Return an RX buffer to the RX queue after the caller has finished processing.
 pub fn return_rx_buffer(desc_head: u16) {
     unsafe {
-        if let Some(dev) = NET_DEV.as_mut() {
+        if let Some(dev) = (*(&raw mut NET_DEV)).as_mut() {
             resubmit_rx_desc(dev, desc_head);
         }
     }
@@ -171,7 +171,7 @@ pub fn send_packet(frame: &[u8]) {
         return;
     }
     unsafe {
-        let dev = match NET_DEV.as_mut() {
+        let dev = match (*(&raw mut NET_DEV)).as_mut() {
             Some(d) => d,
             None => return,
         };
@@ -193,7 +193,7 @@ pub fn send_packet(frame: &[u8]) {
         }
         TX_BUF[VNET_HDR_SIZE..VNET_HDR_SIZE + frame.len()].copy_from_slice(frame);
 
-        let tx_pa = beetos::virt_to_phys(TX_BUF.as_ptr() as usize);
+        let tx_pa = beetos::virt_to_phys((&raw const TX_BUF) as usize);
         {
             let d = &mut *dev.tx_queue.desc.add(desc as usize);
             d.addr = tx_pa as u64;
@@ -245,15 +245,27 @@ fn init_net_device(base_va: usize, transport_idx: usize) -> bool {
     };
 
     // Initialize RX virtqueue.
-    let rx_va = unsafe { RX_VQ_BUF.0.as_mut_ptr() as usize };
+    let rx_va = unsafe { (*(&raw mut RX_VQ_BUF)).0.as_mut_ptr() as usize };
     let rx_pa = beetos::virt_to_phys(rx_va);
-    unsafe { core::ptr::write_bytes(rx_va as *mut u8, 0, RX_VQ_BUF.0.len()) };
+    unsafe {
+        core::ptr::write_bytes(
+            rx_va as *mut u8,
+            0,
+            virtio::Virtqueue::size_bytes(QUEUE_SIZE as usize, beetos::PAGE_SIZE),
+        )
+    };
     let mut rx_queue = unsafe { Virtqueue::init(rx_va, rx_pa, QUEUE_SIZE, beetos::PAGE_SIZE) };
 
     // Initialize TX virtqueue.
-    let tx_va = unsafe { TX_VQ_BUF.0.as_mut_ptr() as usize };
+    let tx_va = unsafe { (*(&raw mut TX_VQ_BUF)).0.as_mut_ptr() as usize };
     let tx_pa = beetos::virt_to_phys(tx_va);
-    unsafe { core::ptr::write_bytes(tx_va as *mut u8, 0, TX_VQ_BUF.0.len()) };
+    unsafe {
+        core::ptr::write_bytes(
+            tx_va as *mut u8,
+            0,
+            virtio::Virtqueue::size_bytes(QUEUE_SIZE as usize, beetos::PAGE_SIZE),
+        )
+    };
     let tx_queue = unsafe { Virtqueue::init(tx_va, tx_pa, QUEUE_SIZE, beetos::PAGE_SIZE) };
 
     // Register both queues with the device.

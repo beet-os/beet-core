@@ -15,6 +15,7 @@ use core::sync::atomic::{fence, Ordering};
 // MMIO register offsets (legacy / version 1)
 // ============================================================================
 
+#[allow(dead_code)]
 pub mod regs {
     pub const MAGIC_VALUE: usize = 0x000;
     pub const VERSION: usize = 0x004;
@@ -129,6 +130,7 @@ pub struct VirtqUsedElem {
 // ============================================================================
 
 /// Maximum queue size we support. Keeps memory usage bounded.
+#[allow(dead_code)]
 pub const MAX_QUEUE_SIZE: usize = 128;
 
 /// A virtqueue with its descriptor table, available ring, and used ring
@@ -303,6 +305,7 @@ pub fn probe_transport(base_va: usize) -> Option<u32> {
 }
 
 /// Reset a virtio device.
+#[allow(dead_code)]
 pub fn reset_device(base_va: usize) {
     unsafe {
         write_reg(base_va, regs::STATUS, 0);
