@@ -192,6 +192,7 @@ fn execute_line(line: &[u8]) {
         "pid" => cmd_pid(),
         "pwd" => cmd_pwd(),
         "cd" => cmd_cd(cmd_args),
+        "programs" => cmd_programs(),
 
         // FS operations (via IPC to fs service)
         "ls" => cmd_ls(cmd_args),
@@ -220,6 +221,7 @@ fn cmd_help() {
     puts("  pid               Show current process ID\n");
     puts("  pwd               Print working directory\n");
     puts("  cd [path]         Change directory (default: /)\n");
+    puts("  programs          List spawnable programs\n");
     puts("  ls [path]         List directory (ramfs or /disk/)\n");
     puts("  cat <path>        Display file contents\n");
     puts("  write <path> <text>  Write text to a file (ramfs only)\n");
@@ -250,6 +252,13 @@ fn cmd_pid() {
     match xous::rsyscall(xous::SysCall::GetProcessId) {
         Ok(xous::Result::Scalar1(pid)) => { let _ = write!(UartWriter, "PID: {}\n", pid); }
         _ => puts("pid: syscall failed\n"),
+    }
+}
+
+fn cmd_programs() {
+    for name in beetos_api_procman::PROGRAMS {
+        puts(name);
+        putc(b'\n');
     }
 }
 
