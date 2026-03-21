@@ -72,6 +72,10 @@ static mut SHELL: Shell = Shell {
 static mut CWD_BUF: [u8; MAX_PATH] = [0u8; MAX_PATH];
 static mut CWD_LEN: usize = 0;
 
+// Previous working directory (for `cd -`)
+static mut PREV_BUF: [u8; MAX_PATH] = [0u8; MAX_PATH];
+static mut PREV_LEN: usize = 0;
+
 fn cwd_str() -> &'static str {
     unsafe { core::str::from_utf8(&CWD_BUF[..CWD_LEN]).unwrap_or("/") }
 }
@@ -256,13 +260,28 @@ fn cmd_pwd() {
 
 fn cmd_cd(args: &[&str]) {
     let target = if args.is_empty() { "/" } else { args[0] };
+
+    // `cd -` switches to the previous directory
     let mut buf = [0u8; MAX_PATH];
-    let resolved = resolve_path(target, &mut buf);
+    let resolved = if target == "-" {
+        let prev_len = unsafe { PREV_LEN };
+        if prev_len == 0 {
+            puts("cd: no previous directory\n");
+            return;
+        }
+        unsafe { core::str::from_utf8(&PREV_BUF[..prev_len]).unwrap_or("/") }
+    } else {
+        resolve_path(target, &mut buf)
+    };
 
     let packed = beetos_api_fs::pack_path(resolved);
     match fs_scalar(FsOp::IsDir, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {
             unsafe {
+                // Save current CWD as previous
+                PREV_BUF[..CWD_LEN].copy_from_slice(&CWD_BUF[..CWD_LEN]);
+                PREV_LEN = CWD_LEN;
+                // Update CWD
                 let bytes = resolved.as_bytes();
                 let len = bytes.len().min(MAX_PATH);
                 CWD_BUF[..len].copy_from_slice(&bytes[..len]);
