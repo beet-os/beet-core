@@ -330,6 +330,9 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         #[cfg(beetos)]
         SysCall::NetGetInfo => Ok(()),
 
+        #[cfg(beetos)]
+        SysCall::GetBinaryName(_) => Ok(()),
+
         // Messaging-related calls
         SysCall::CreateServer
         | SysCall::CreateServerId
@@ -581,6 +584,30 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             // No network stack on this platform yet.
             Ok(Result::Scalar5(0, 0, 0, 0, 0))
         }
+
+        #[cfg(beetos)]
+        SysCall::GetBinaryName(index) => {
+            use crate::arch::boot;
+
+            match boot::get_user_binary_at(index) {
+                Some(name) => {
+                    let bytes = name.as_bytes();
+                    let mut words = [0usize; 4];
+                    let ws = core::mem::size_of::<usize>();
+
+                    for (i, chunk) in bytes.chunks(ws).enumerate() {
+                        if i >= 4 { break; }
+                        let mut buf = [0u8; 8];
+                        buf[..chunk.len()].copy_from_slice(chunk);
+                        words[i] = usize::from_le_bytes(buf);
+                    }
+
+                    Ok(Result::Scalar5(words[0], words[1], words[2], words[3], 0))
+                }
+                None => Err(Error::ProcessNotFound),
+            }
+        }
+
         SysCall::GetThreadId => Ok(Result::ThreadID(tid)),
 
         SysCall::Connect(sid) => {

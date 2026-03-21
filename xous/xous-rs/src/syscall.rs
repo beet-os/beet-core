@@ -470,6 +470,9 @@ pub enum SysCall {
     #[cfg(beetos)]
     NetGetInfo,
 
+    #[cfg(beetos)]
+    GetBinaryName(usize /* index */),
+
     /// This syscall does not exist. It captures all possible
     /// arguments so detailed analysis can be performed.
     Invalid(usize, usize, usize, usize, usize, usize, usize),
@@ -536,6 +539,7 @@ pub enum SysCallNumber {
     WaitProcess = 58,
     SpawnByNameWithArgs = 59,
     NetGetInfo = 60,
+    GetBinaryName = 61,
 
     Invalid,
 }
@@ -603,6 +607,7 @@ impl SysCallNumber {
             58 => WaitProcess,
             59 => SpawnByNameWithArgs,
             60 => NetGetInfo,
+            61 => GetBinaryName,
             _ => Invalid,
         }
     }
@@ -937,6 +942,10 @@ impl SysCall {
             SysCall::NetGetInfo => {
                 [SysCallNumber::NetGetInfo as usize, 0, 0, 0, 0, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::GetBinaryName(index) => {
+                [SysCallNumber::GetBinaryName as usize, *index, 0, 0, 0, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1124,6 +1133,8 @@ impl SysCall {
             }
             #[cfg(beetos)]
             SysCallNumber::NetGetInfo => SysCall::NetGetInfo,
+            #[cfg(beetos)]
+            SysCallNumber::GetBinaryName => SysCall::GetBinaryName(a1),
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1135,7 +1146,8 @@ impl SysCall {
             | SysCallNumber::SpawnByName
             | SysCallNumber::SpawnByNameWithArgs
             | SysCallNumber::WaitProcess
-            | SysCallNumber::NetGetInfo => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::NetGetInfo
+            | SysCallNumber::GetBinaryName => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }

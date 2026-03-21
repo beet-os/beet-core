@@ -23,14 +23,6 @@
 /// Well-known Server ID for the Process Manager service.
 pub const PROCMAN_SID: [u32; 4] = [0x5052_4F43, 0x4D41_4E00, 0, 0]; // "PROCMAN\0"
 
-/// User-spawnable programs embedded in the kernel binary table.
-/// Internal services (log, idle, shell, procman, fs) are excluded.
-/// Keep in sync with BINARY_TABLE in xous/kernel/src/arch/aarch64/boot.rs.
-pub const PROGRAMS: &[&str] = &[
-    "hello-nostd",
-    "hello-std",
-];
-
 /// Opcodes for procman service IPC messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]

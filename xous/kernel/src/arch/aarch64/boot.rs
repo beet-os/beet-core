@@ -366,6 +366,25 @@ pub fn lookup_binary(name: &str) -> Option<&'static [u8]> {
     None
 }
 
+const INTERNAL_SERVICES: &[&str] = &["log", "idle", "shell", "procman", "fs", "beetos-test"];
+
+/// Return the nth user-spawnable program name (skipping internal services).
+/// Returns None when index is out of range.
+pub fn get_user_binary_at(index: usize) -> Option<&'static str> {
+    let mut user_idx = 0;
+
+    for &(name, _) in BINARY_TABLE {
+        if !INTERNAL_SERVICES.contains(&name) {
+            if user_idx == index {
+                return Some(name);
+            }
+            user_idx += 1;
+        }
+    }
+
+    None
+}
+
 /// UART MMIO physical address on QEMU virt.
 /// The shell process gets this mapped into its address space for direct output.
 #[cfg(feature = "platform-qemu-virt")]

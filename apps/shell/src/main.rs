@@ -256,9 +256,23 @@ fn cmd_pid() {
 }
 
 fn cmd_programs() {
-    for name in beetos_api_procman::PROGRAMS {
-        puts(name);
-        putc(b'\n');
+    let mut index = 0usize;
+
+    loop {
+        match xous::rsyscall(xous::SysCall::GetBinaryName(index)) {
+            Ok(xous::Result::Scalar5(w0, w1, w2, w3, _)) => {
+                let packed = [w0, w1, w2, w3];
+                let name = beetos_api_procman::unpack_name(&packed);
+
+                if !name.is_empty() {
+                    puts(name);
+                    putc(b'\n');
+                }
+
+                index += 1;
+            }
+            _ => break,
+        }
     }
 }
 
