@@ -613,10 +613,8 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let uart_base: usize;
+pub extern "C" fn _start(uart_base: usize) -> ! {
     unsafe {
-        core::arch::asm!("mov {}, x0", out(reg) uart_base, options(nomem, nostack));
         UART_BASE = uart_base;
         CWD_BUF[0] = b'/';
         CWD_LEN = 1;
