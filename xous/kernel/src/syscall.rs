@@ -327,6 +327,9 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         | SysCall::GetAppId(..)
         | SysCall::AppIdToPid(..) => Ok(()),
 
+        #[cfg(beetos)]
+        SysCall::NetGetInfo => Ok(()),
+
         // Messaging-related calls
         SysCall::CreateServer
         | SysCall::CreateServerId
@@ -560,6 +563,24 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         }),
         SysCall::Shutdown(_) => SystemServices::with_mut(|ss| ss.shutdown().map(|_| Result::Ok)),
         SysCall::GetProcessId => Ok(Result::ProcessID(current_pid())),
+
+        #[cfg(beetos)]
+        SysCall::NetGetInfo => {
+            use crate::platform::qemu_virt::net_stack;
+            use crate::platform::qemu_virt::net;
+            let ip = net_stack::get_ip();
+            let ip_u32 = u32::from_be_bytes(ip);
+            let mac = net::get_mac().unwrap_or([0u8; 6]);
+            let mac_hi = u32::from_be_bytes([mac[0], mac[1], mac[2], mac[3]]);
+            let mac_lo = u32::from_be_bytes([mac[4], mac[5], 0, 0]);
+            Ok(Result::Scalar5(
+                ip_u32 as usize,
+                mac_hi as usize,
+                mac_lo as usize,
+                0,
+                0,
+            ))
+        }
         SysCall::GetThreadId => Ok(Result::ThreadID(tid)),
 
         SysCall::Connect(sid) => {

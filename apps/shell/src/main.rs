@@ -143,6 +143,7 @@ fn execute_line(line: &[u8]) {
         "mkdir" => cmd_mkdir(cmd_args),
         "blkinfo" => cmd_blkinfo(),
         "mem" => cmd_mem(),
+        "ifconfig" => cmd_ifconfig(),
 
         // External programs (spawned via procman)
         _ => try_spawn_via_procman(cmd, cmd_args),
@@ -166,6 +167,7 @@ fn cmd_help() {
     puts("  mkdir <path>      Create a directory\n");
     puts("  blkinfo           Block device info\n");
     puts("  mem               Filesystem statistics\n");
+    puts("  ifconfig          Show network interface configuration\n");
 }
 
 fn cmd_echo(args: &[&str]) {
@@ -346,6 +348,42 @@ fn cmd_blkinfo() {
             }
         }
         None => puts("blkinfo: fs service not available\n"),
+    }
+}
+
+fn cmd_ifconfig() {
+    match xous::rsyscall(xous::SysCall::NetGetInfo) {
+        Ok(xous::Result::Scalar5(ip_u32, mac_hi, mac_lo, _, _)) => {
+            let ip = [
+                ((ip_u32 >> 24) & 0xFF) as u8,
+                ((ip_u32 >> 16) & 0xFF) as u8,
+                ((ip_u32 >> 8) & 0xFF) as u8,
+                (ip_u32 & 0xFF) as u8,
+            ];
+            let mac = [
+                ((mac_hi >> 24) & 0xFF) as u8,
+                ((mac_hi >> 16) & 0xFF) as u8,
+                ((mac_hi >> 8) & 0xFF) as u8,
+                (mac_hi & 0xFF) as u8,
+                ((mac_lo >> 24) & 0xFF) as u8,
+                ((mac_lo >> 16) & 0xFF) as u8,
+            ];
+            let _ = write!(
+                UartWriter,
+                "eth0: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            );
+            if ip == [0, 0, 0, 0] {
+                puts("      inet: (no address — DHCP pending)\n");
+            } else {
+                let _ = write!(
+                    UartWriter,
+                    "      inet: {}.{}.{}.{}\n",
+                    ip[0], ip[1], ip[2], ip[3],
+                );
+            }
+        }
+        _ => puts("ifconfig: NetGetInfo syscall failed\n"),
     }
 }
 

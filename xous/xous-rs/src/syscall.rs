@@ -459,6 +459,17 @@ pub enum SysCall {
     #[cfg(beetos)]
     WaitProcess(PID),
 
+    /// Query the kernel's network stack for the current IP and MAC address.
+    ///
+    /// # Returns
+    ///
+    /// * **Scalar5(ip_u32, mac_hi, mac_lo, 0, 0)** where:
+    ///   - `ip_u32`: IPv4 address as a big-endian u32 (0 if DHCP not yet complete)
+    ///   - `mac_hi`: MAC bytes [0..3] packed as big-endian u32
+    ///   - `mac_lo`: MAC bytes [4..5] packed as u16 in the low 16 bits
+    #[cfg(beetos)]
+    NetGetInfo,
+
     /// This syscall does not exist. It captures all possible
     /// arguments so detailed analysis can be performed.
     Invalid(usize, usize, usize, usize, usize, usize, usize),
@@ -524,6 +535,7 @@ pub enum SysCallNumber {
     SpawnByName = 57,
     WaitProcess = 58,
     SpawnByNameWithArgs = 59,
+    NetGetInfo = 60,
 
     Invalid,
 }
@@ -590,6 +602,7 @@ impl SysCallNumber {
             57 => SpawnByName,
             58 => WaitProcess,
             59 => SpawnByNameWithArgs,
+            60 => NetGetInfo,
             _ => Invalid,
         }
     }
@@ -920,6 +933,10 @@ impl SysCall {
             SysCall::WaitProcess(pid) => {
                 [SysCallNumber::WaitProcess as usize, pid.get() as usize, 0, 0, 0, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::NetGetInfo => {
+                [SysCallNumber::NetGetInfo as usize, 0, 0, 0, 0, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1105,6 +1122,8 @@ impl SysCall {
             SysCallNumber::WaitProcess => {
                 SysCall::WaitProcess(PID::new(a1 as _).ok_or(Error::InvalidSyscall)?)
             }
+            #[cfg(beetos)]
+            SysCallNumber::NetGetInfo => SysCall::NetGetInfo,
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1115,7 +1134,8 @@ impl SysCall {
             | SysCallNumber::InvalidateCache
             | SysCallNumber::SpawnByName
             | SysCallNumber::SpawnByNameWithArgs
-            | SysCallNumber::WaitProcess => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::WaitProcess
+            | SysCallNumber::NetGetInfo => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }
