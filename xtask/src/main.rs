@@ -79,6 +79,30 @@ fn find_stage1_rustc(root: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
+/// Write a shell-script RUSTC_WRAPPER that dispatches to stage1 for the
+/// aarch64-unknown-beetos target and to the system rustc for everything else
+/// (notably build scripts, which compile for the host and need host std).
+///
+/// Using RUSTC_WRAPPER instead of RUSTC keeps build-script compilation on the
+/// host rustc while still routing target crate compilation through stage1.
+/// Target-specific flags (sysroot, linker script) are passed separately via
+/// CARGO_TARGET_AARCH64_UNKNOWN_BEETOS_RUSTFLAGS, which Cargo does not forward
+/// to build scripts.
+fn write_rustc_wrapper(stage1_rustc: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let wrapper = std::env::temp_dir().join("beetos-rustc-wrapper");
+    let script = format!(
+        "#!/bin/sh\nORIGINAL_RUSTC=\"$1\"\nshift\ncase \"$*\" in\n  *aarch64-unknown-beetos*)\n    exec '{}' \"$@\" ;;\n  *)\n    exec \"$ORIGINAL_RUSTC\" \"$@\" ;;\nesac\n",
+        stage1_rustc.display()
+    );
+    std::fs::write(&wrapper, &script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(wrapper)
+}
+
 /// Find the rust-lld binary for linking aarch64-unknown-beetos binaries.
 ///
 /// The stage1 compiler directory often lacks rust-lld; it lives in stage0 or
@@ -164,6 +188,13 @@ fn build_std_app(
         .parent().expect("no grandparent for rustc");
     let sysroot_arg = format!("--sysroot={}", sysroot.display());
 
+    // RUSTC_WRAPPER dispatches beetos-target builds to stage1 while keeping
+    // build-script compilation on the system rustc (which has host std).
+    // Target-specific flags go in CARGO_TARGET_AARCH64_UNKNOWN_BEETOS_RUSTFLAGS
+    // so build scripts never see the beetos sysroot or linker script.
+    let wrapper = write_rustc_wrapper(stage1_rustc)?;
+    let target_rustflags = format!("{sysroot_arg} {linker_arg} -Ccodegen-units=1");
+
     let mut cmd = Command::new("cargo");
     cmd.args([
         "build",
@@ -174,8 +205,8 @@ fn build_std_app(
         "--target",
         "aarch64-unknown-beetos",
     ])
-    .env("RUSTC", stage1_rustc)
-    .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1 {sysroot_arg}"));
+    .env("RUSTC_WRAPPER", &wrapper)
+    .env("CARGO_TARGET_AARCH64_UNKNOWN_BEETOS_RUSTFLAGS", &target_rustflags);
 
     // rust-lld may only exist in stage0; prepend its directory to PATH.
     if let Some(lld_dir) = find_rust_lld_dir(root) {
@@ -184,6 +215,7 @@ fn build_std_app(
     }
 
     let status = cmd.status()?;
+    let _ = std::fs::remove_file(&wrapper);
     anyhow::ensure!(status.success(), "building app 'hello-std' failed");
 
     // Strip and copy to the no_std target dir so include_bytes! can find it
@@ -402,6 +434,9 @@ fn build_test_app(
         .parent().expect("no grandparent for rustc");
     let sysroot_arg = format!("--sysroot={}", sysroot.display());
 
+    let wrapper = write_rustc_wrapper(stage1_rustc)?;
+    let target_rustflags = format!("{sysroot_arg} {linker_arg} -Ccodegen-units=1");
+
     let mut cmd = Command::new("cargo");
     cmd.args([
         "build",
@@ -412,8 +447,8 @@ fn build_test_app(
         "--target",
         "aarch64-unknown-beetos",
     ])
-    .env("RUSTC", stage1_rustc)
-    .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1 {sysroot_arg}"));
+    .env("RUSTC_WRAPPER", &wrapper)
+    .env("CARGO_TARGET_AARCH64_UNKNOWN_BEETOS_RUSTFLAGS", &target_rustflags);
 
     // rust-lld may only exist in stage0; prepend its directory to PATH.
     if let Some(lld_dir) = find_rust_lld_dir(root) {
@@ -422,6 +457,7 @@ fn build_test_app(
     }
 
     let status = cmd.status()?;
+    let _ = std::fs::remove_file(&wrapper);
     anyhow::ensure!(status.success(), "building app 'beetos-test' failed");
 
     // Strip and copy to the no_std target dir so include_bytes! can find it

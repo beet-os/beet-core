@@ -6,5 +6,9 @@ fn main() {
         println!("cargo:rustc-cfg=beetos");
     }
 
+    // Declare "beetos" as a known target_os value so rustc doesn't warn on
+    // cfg(target_os = "beetos") when compiling for other targets.
+    println!("cargo:rustc-check-cfg=cfg(target_os, values(\"beetos\"))");
+
     println!("cargo:rerun-if-changed=build.rs");
 }
