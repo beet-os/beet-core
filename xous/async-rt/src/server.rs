@@ -4,6 +4,7 @@
 //! incoming messages are buffered and the waiting task is woken
 //! efficiently — no busy-poll, no extra threads.
 
+use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -11,6 +12,31 @@ use core::task::{Context, Poll};
 use xous::{MessageEnvelope, SID};
 
 use crate::reactor;
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Error returned by [`RecvFuture`] when the server is no longer available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvError {
+    /// The server slot was unregistered (server destroyed or handle dropped
+    /// while a `next()` future was still alive — shouldn't happen in
+    /// normal use).
+    ServerGone,
+}
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RecvError::ServerGone => f.write_str("server no longer registered with reactor"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AsyncServer
+// ---------------------------------------------------------------------------
 
 /// Async handle to a Xous server.
 ///
@@ -28,7 +54,7 @@ use crate::reactor;
 /// ```rust,ignore
 /// let mut server = AsyncServer::new(sid);
 /// loop {
-///     let msg = server.next().await;
+///     let msg = server.next().await?;
 ///     handle(msg);
 /// }
 /// ```
@@ -49,11 +75,8 @@ impl AsyncServer {
 
     /// Wait for the next message.
     ///
-    /// Returns a future that resolves when a message arrives on this
-    /// server's SID.  The future first checks the reactor's buffer
-    /// (fast path), then falls back to a direct `try_receive_message`,
-    /// and finally yields `Pending` — the reactor will wake us on the
-    /// next successful poll.
+    /// Returns `Ok(envelope)` when a message arrives, or `Err(RecvError)`
+    /// if the server slot is no longer active.
     pub fn next(&mut self) -> RecvFuture<'_> {
         RecvFuture { server: self }
     }
@@ -70,20 +93,29 @@ impl Drop for AsyncServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RecvFuture
+// ---------------------------------------------------------------------------
+
 /// Future returned by [`AsyncServer::next`].
 pub struct RecvFuture<'a> {
     server: &'a mut AsyncServer,
 }
 
 impl Future for RecvFuture<'_> {
-    type Output = MessageEnvelope;
+    type Output = Result<MessageEnvelope, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
+        // Check the slot is still alive.
+        if !reactor::server_active(this.server.slot) {
+            return Poll::Ready(Err(RecvError::ServerGone));
+        }
+
         // Fast path: buffered message or direct non-blocking receive.
         if let Some(msg) = reactor::try_recv(this.server.slot) {
-            return Poll::Ready(msg);
+            return Poll::Ready(Ok(msg));
         }
 
         // Slow path: register waker so the reactor wakes us when a

@@ -7,6 +7,8 @@
 //!   waiting task.
 //! * Timers register a deadline (in reactor ticks); the reactor wakes
 //!   them when the tick count passes the deadline.
+//! * The spawn queue lets tasks submit new futures at runtime via
+//!   [`Spawner`](crate::Spawner).
 //!
 //! # Thread safety
 //!
@@ -14,9 +16,12 @@
 //! `RefCell` and is only ever accessed from the executor's `run()` loop
 //! and from futures polled **by that same loop**.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::future::Future;
+use core::pin::Pin;
 use core::task::Waker;
 
 use xous::{MessageEnvelope, SID};
@@ -48,6 +53,7 @@ struct ReactorInner {
     servers: Vec<ServerSlot>,
     timers: Vec<TimerSlot>,
     tick: u64,
+    spawn_queue: Vec<Pin<Box<dyn Future<Output = ()>>>>,
 }
 
 impl ReactorInner {
@@ -56,6 +62,7 @@ impl ReactorInner {
             servers: Vec::new(),
             timers: Vec::new(),
             tick: 0,
+            spawn_queue: Vec::new(),
         }
     }
 
@@ -106,6 +113,11 @@ impl ReactorInner {
             Ok(Some(msg)) => Some(msg),
             _ => None,
         }
+    }
+
+    /// Check if a server slot is still active (server hasn't been destroyed).
+    fn server_active(&self, id: SlotId) -> bool {
+        self.servers.get(id).map_or(false, |s| s.active)
     }
 
     fn set_server_waker(&mut self, id: SlotId, waker: Waker) {
@@ -192,6 +204,16 @@ impl ReactorInner {
         }
         woke_any
     }
+
+    // -- Spawn queue --------------------------------------------------------
+
+    fn enqueue_spawn(&mut self, future: Pin<Box<dyn Future<Output = ()>>>) {
+        self.spawn_queue.push(future);
+    }
+
+    fn drain_spawns(&mut self) -> Vec<Pin<Box<dyn Future<Output = ()>>>> {
+        core::mem::take(&mut self.spawn_queue)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +254,9 @@ pub(crate) fn unregister_server(id: SlotId) {
 pub(crate) fn try_recv(id: SlotId) -> Option<MessageEnvelope> {
     with(|r| r.try_recv(id))
 }
+pub(crate) fn server_active(id: SlotId) -> bool {
+    with(|r| r.server_active(id))
+}
 pub(crate) fn set_server_waker(id: SlotId, waker: Waker) {
     with(|r| r.set_server_waker(id, waker))
 }
@@ -249,6 +274,15 @@ pub(crate) fn timer_expired(id: SlotId) -> bool {
 pub(crate) fn set_timer_waker(id: SlotId, waker: Waker) {
     with(|r| r.set_timer_waker(id, waker))
 }
+
+// Spawn queue
+pub(crate) fn enqueue_spawn(future: Pin<Box<dyn Future<Output = ()>>>) {
+    with(|r| r.enqueue_spawn(future))
+}
+pub(crate) fn drain_spawns() -> Vec<Pin<Box<dyn Future<Output = ()>>>> {
+    with(|r| r.drain_spawns())
+}
+
 // Tick
 pub(crate) fn poll_all() -> bool {
     with(|r| {

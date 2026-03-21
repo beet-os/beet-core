@@ -17,6 +17,7 @@
 //! │  │              Reactor                      ││
 //! │  │  servers: [SID_A, SID_B, ...]             ││
 //! │  │  timers:  [deadline_1, deadline_2, ...]   ││
+//! │  │  spawn_queue: [new tasks from Spawner]    ││
 //! │  │                                           ││
 //! │  │  poll_all():                              ││
 //! │  │    try_receive_message(SID_A) → wake T1   ││
@@ -34,12 +35,15 @@
 //! let mut exec = Executor::new();
 //! let sid = xous::create_server().unwrap();
 //!
+//! // Spawn a task that can itself spawn more tasks
+//! let spawner = exec.spawner();
 //! exec.spawn(async move {
 //!     let mut server = AsyncServer::new(sid);
 //!     loop {
 //!         match select(server.next(), Timer::after(1000)).await {
-//!             Either::Left(msg) => { /* handle message */ }
-//!             Either::Right(()) => { /* timeout */ }
+//!             Either::Left(Ok(msg))  => { /* handle message */ }
+//!             Either::Left(Err(_))   => break, // server gone
+//!             Either::Right(())      => { /* timeout */ }
 //!         }
 //!     }
 //! });
@@ -58,7 +62,10 @@ mod server;
 mod timer;
 mod waker;
 
-pub use combinators::{join, join3, select, Either, Join, Join3, Select};
-pub use executor::Executor;
-pub use server::{AsyncServer, RecvFuture};
+#[cfg(test)]
+mod tests;
+
+pub use combinators::{join, join3, join_all, select, BoxFuture, Either, Join, Join3, JoinAll, Select};
+pub use executor::{Executor, Spawner};
+pub use server::{AsyncServer, RecvError, RecvFuture};
 pub use timer::Timer;

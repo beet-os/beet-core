@@ -1,8 +1,10 @@
-//! Async combinators: `join` and `select`.
+//! Async combinators: `join`, `join3`, `join_all`, and `select`.
 //!
-//! Both work with `!Unpin` futures (i.e. any `async` block) — no boxing
-//! or `pin!()` required at the call site.
+//! All combinators work with `!Unpin` futures (i.e. any `async` block) —
+//! no boxing or `pin!()` required at the call site.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -139,6 +141,76 @@ impl<FA: Future, FB: Future, FC: Future> Future for Join3<FA, FB, FC> {
                 Poll::Ready((a, b, c))
             }
             _ => Poll::Pending,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// join_all — dynamic number of boxed futures
+// ---------------------------------------------------------------------------
+
+/// Drive a `Vec` of boxed futures to completion, returning all results.
+///
+/// ```rust,ignore
+/// let futures: Vec<_> = sids.iter()
+///     .map(|sid| Box::pin(async move { do_work(sid).await }) as BoxFuture<_>)
+///     .collect();
+/// let results = join_all(futures).await;
+/// ```
+pub fn join_all<T>(futures: Vec<BoxFuture<T>>) -> JoinAll<T> {
+    let slots = futures
+        .into_iter()
+        .map(|f| JoinAllSlot::Pending(f))
+        .collect();
+    JoinAll { slots }
+}
+
+/// Type alias for a heap-allocated, pinned, `!Unpin`-safe future.
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T>>>;
+
+enum JoinAllSlot<T> {
+    Pending(BoxFuture<T>),
+    Done(T),
+    Taken,
+}
+
+/// Future returned by [`join_all`].
+pub struct JoinAll<T> {
+    slots: Vec<JoinAllSlot<T>>,
+}
+
+impl<T> Future for JoinAll<T> {
+    type Output = Vec<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: We only access the inner boxed futures through Pin,
+        // and they're already heap-allocated (Pin<Box<…>>), so moving
+        // the outer Vec is safe.
+        let this = unsafe { self.get_unchecked_mut() };
+
+        let mut all_done = true;
+        for slot in this.slots.iter_mut() {
+            if let JoinAllSlot::Pending(ref mut f) = slot {
+                if let Poll::Ready(val) = f.as_mut().poll(cx) {
+                    *slot = JoinAllSlot::Done(val);
+                } else {
+                    all_done = false;
+                }
+            }
+        }
+
+        if all_done {
+            let results = this
+                .slots
+                .iter_mut()
+                .map(|slot| match core::mem::replace(slot, JoinAllSlot::Taken) {
+                    JoinAllSlot::Done(v) => v,
+                    _ => unreachable!(),
+                })
+                .collect();
+            Poll::Ready(results)
+        } else {
+            Poll::Pending
         }
     }
 }
