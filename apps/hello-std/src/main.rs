@@ -3,7 +3,6 @@
 
 //! BeetOS "hello-std" — proof that Rust std works on BeetOS.
 
-#![feature(restricted_std)]
 #![no_main]
 
 const UART_VA: usize = 0x0000_0010_0100_0000;
