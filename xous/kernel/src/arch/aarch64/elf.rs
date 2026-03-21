@@ -212,7 +212,7 @@ pub unsafe fn load_elf(
 
     // Apply relocations for PIE
     if header.e_type == ET_DYN {
-        apply_relocations(base, &header, phdr_base, aslr_slide)?;
+        apply_relocations(base, len, &header, phdr_base, aslr_slide, mapping)?;
     }
 
     Ok(ElfLoadResult {
@@ -221,12 +221,35 @@ pub unsafe fn load_elf(
     })
 }
 
+/// Convert a virtual address to a file offset using PT_LOAD segments.
+///
+/// Returns None if the VA is not covered by any PT_LOAD segment.
+unsafe fn va_to_file_offset(
+    va: u64,
+    phdr_base: *const Elf64Phdr,
+    phnum: u16,
+) -> Option<usize> {
+    for i in 0..phnum as usize {
+        let phdr = core::ptr::read_unaligned(phdr_base.add(i));
+        if phdr.p_type == PT_LOAD && va >= phdr.p_vaddr && va < phdr.p_vaddr + phdr.p_filesz {
+            return Some((phdr.p_offset + (va - phdr.p_vaddr)) as usize);
+        }
+    }
+    None
+}
+
 /// Apply R_AARCH64_RELATIVE relocations.
+///
+/// Reads relocation entries from the ELF data in kernel memory (not user VA).
+/// Writes relocated values through kernel VA (phys_to_virt) by walking the
+/// process's page tables.
 unsafe fn apply_relocations(
     base: *const u8,
+    elf_len: usize,
     header: &Elf64Header,
     phdr_base: *const Elf64Phdr,
     slide: usize,
+    mapping: &MemoryMapping,
 ) -> Result<(), Error> {
     // Find PT_DYNAMIC
     let mut rela_addr: Option<u64> = None;
@@ -251,19 +274,33 @@ unsafe fn apply_relocations(
         }
     }
 
-    if let Some(rela_offset) = rela_addr {
+    if let Some(rela_va) = rela_addr {
         if rela_ent == 0 {
             return Ok(());
         }
+        // Convert DT_RELA from VA to file offset so we read from kernel memory
+        let rela_file_off = va_to_file_offset(rela_va, phdr_base, header.e_phnum)
+            .ok_or(Error::BadAddress)?;
+        if rela_file_off >= elf_len {
+            return Err(Error::BadAddress);
+        }
+
         let count = rela_size / rela_ent;
-        let rela_base = (rela_offset as usize + slide) as *const Elf64Rela;
+        let rela_base = base.add(rela_file_off) as *const Elf64Rela;
         for i in 0..count as usize {
             let rela = core::ptr::read_unaligned(rela_base.add(i));
             let rtype = (rela.r_info & 0xFFFF_FFFF) as u32;
             if rtype == R_AARCH64_RELATIVE {
-                let target = (rela.r_offset as usize + slide) as *mut u64;
+                // Target user VA after slide
+                let target_user_va = rela.r_offset as usize + slide;
                 let value = (rela.r_addend as usize).wrapping_add(slide) as u64;
-                core::ptr::write_unaligned(target, value);
+
+                // Walk the process's page tables to find the physical page,
+                // then write through the kernel's linear map.
+                let phys = mapping.virt_to_phys(target_user_va as *const usize)
+                    .map_err(|_| Error::BadAddress)?;
+                let kern_va = beetos::phys_to_virt(phys) as *mut u64;
+                core::ptr::write_unaligned(kern_va, value);
             }
         }
     }

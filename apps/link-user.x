@@ -39,7 +39,7 @@ SECTIONS
         *(.data .data.*)
     } > CODE
 
-    .bss (NOLOAD) : ALIGN(0x4000)
+    .bss : ALIGN(0x4000)
     {
         *(.bss .bss.*)
         *(COMMON)

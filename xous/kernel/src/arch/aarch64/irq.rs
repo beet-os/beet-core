@@ -283,10 +283,15 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
 
     let args = (*frame).get_args();
 
-    // Debug: log IncreaseHeap (10)
+    // Debug: log all syscalls from PID 6 (hello-std) to diagnose hang
     #[cfg(feature = "platform-qemu-virt")]
-    if args[0] == 10 {
-        crate::platform::qemu_virt::uart::puts("[SVC10]\n");
+    if caller_pid.get() == 6 {
+        use core::fmt::Write;
+        let _ = write!(
+            crate::platform::qemu_virt::uart::UartWriter,
+            "[SVC] pid={} x0={} x1={:#x}\n",
+            caller_pid.get(), args[0], args[1],
+        );
     }
 
     // Parse the raw register values into a typed SysCall enum.
@@ -333,7 +338,13 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
 }
 
 /// Handle a data or instruction abort.
-unsafe fn _handle_abort(_context: *mut u8, esr: u64, is_instruction: bool) {
+///
+/// Instead of freezing the entire system (which happens if we loop with wfe
+/// while IRQs are masked), we terminate the faulting process and let the
+/// scheduler pick the next runnable process.
+unsafe fn _handle_abort(context: *mut u8, esr: u64, is_instruction: bool) {
+    use super::process::{Process, Thread};
+
     let far: u64;
     core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
 
@@ -355,14 +366,21 @@ unsafe fn _handle_abort(_context: *mut u8, esr: u64, is_instruction: bool) {
         );
     }
 
-    // TODO: Determine fault type from ISS:
-    //   - Translation fault (DFSC 0x04..0x07) → allocate page (demand paging)
-    //   - Permission fault (DFSC 0x0C..0x0F) → check if COW, else kill process
-    //   - Alignment fault (DFSC 0x21) → kill process
-    // For now, halt the process by looping forever.
-    loop {
-        core::arch::asm!("wfe", options(nomem, nostack));
-    }
+    // Terminate the faulting process and switch to the next runnable one.
+    // This prevents a single user fault from freezing the entire system.
+    let frame = context as *mut Thread;
+    let caller_proc = Process::current();
+    let caller_tid = caller_proc.current_tid();
+    caller_proc.save_context_to_table(caller_tid, frame);
+
+    let _ = crate::services::SystemServices::with_mut(|ss| {
+        ss.terminate_current_process(1)
+    });
+
+    // Load the next process's context so restore_context + ERET runs it.
+    let resume_proc = Process::current();
+    let resume_tid = resume_proc.current_tid();
+    resume_proc.load_context_from_table(resume_tid, frame);
 }
 
 /// Handle an unknown exception type.
