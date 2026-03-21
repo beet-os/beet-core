@@ -99,6 +99,20 @@ pub enum PollResult {
 // ── Poll implementation ──────────────────────────────────────────────
 
 impl KernelFuture {
+    /// Return the `WaitEvent` mask that should be used when suspending
+    /// a thread for this future, and restored when re-parking after a
+    /// `Pending` poll result.
+    pub fn suspension_mask(&self) -> usize {
+        match self {
+            // Woken by a server message arriving.
+            KernelFuture::ReceiveMessage { .. } | KernelFuture::WaitBlocking => EVENT_SERVER_MSG,
+            // Woken by a kernel event (process/thread exit, futex wake).
+            KernelFuture::WaitProcessExit { .. }
+            | KernelFuture::WaitJoin { .. }
+            | KernelFuture::WaitFutex { .. } => EVENT_KERNEL,
+        }
+    }
+
     /// Poll this future against the current kernel state.
     ///
     /// This is NOT `core::future::Future::poll` — there is no `Waker`

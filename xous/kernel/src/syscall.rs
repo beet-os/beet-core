@@ -983,6 +983,12 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             if bits == 0 {
                 return Ok(Result::Ok);
             }
+            // Access control: a process may only post notification bits to
+            // itself.  The kernel posts to other processes directly via
+            // post_notification_bits() without going through this syscall.
+            if target_pid != current_pid() {
+                return Err(Error::AccessDenied);
+            }
             SystemServices::with_mut(|ss| {
                 let process = ss.process_mut(target_pid)?;
                 if let Some((woken_tid, fired_bits)) = process.post_notification_bits(bits) {

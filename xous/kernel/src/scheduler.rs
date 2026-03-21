@@ -207,7 +207,7 @@ impl Scheduler {
 
     #[cfg(beetos)]
     pub fn activate_current(&mut self, services: &mut SystemServices) -> SysCallResult {
-        use crate::kfuture::{PollResult, EVENT_SERVER_MSG};
+        use crate::kfuture::PollResult;
         use crate::process::ThreadState;
 
         if self.in_irq_handler {
@@ -223,8 +223,14 @@ impl Scheduler {
         // If the future is still Pending, re-park the thread and pick
         // another one.
         loop {
-            let (next_pid, next_tid) =
-                self.queue_heads[self.highest_ready_priority].expect("Highest prio head was empty");
+            // If all ready threads were re-parked as Pending, the queue
+            // drains to None.  Break instead of panicking; the caller
+            // returns ResumeProcess and the CPU will reach an idle/wfi path.
+            let Some((next_pid, next_tid)) =
+                self.queue_heads[self.highest_ready_priority]
+            else {
+                break;
+            };
 
             // Take the future out (avoids borrow conflict with services).
             let future = services
@@ -240,13 +246,15 @@ impl Scheduler {
                         // Fall through to normal activation.
                     }
                     PollResult::Pending => {
-                        // Not ready yet — put the future back, re-park the
-                        // thread, and try the next thread in the queue.
+                        // Not ready yet — put the future back and re-park with
+                        // the correct mask for this future type (not always
+                        // EVENT_SERVER_MSG — e.g. WaitFutex needs EVENT_KERNEL).
+                        let mask = kf.suspension_mask();
                         let process = services.process_mut(next_pid).expect("process missing");
                         process.set_kernel_future(next_tid, kf);
                         process.set_thread_state(
                             next_tid,
-                            ThreadState::WaitEvent { mask: EVENT_SERVER_MSG },
+                            ThreadState::WaitEvent { mask },
                         );
                         continue;
                     }
@@ -278,5 +286,8 @@ impl Scheduler {
             let _ = ArchProcess::current().set_tid(next_tid);
             return Ok(xous::Result::ResumeProcess);
         }
+        // All ready threads had Pending futures and were re-parked.
+        // Return ResumeProcess; the CPU will reach an idle/wfi path.
+        Ok(xous::Result::ResumeProcess)
     }
 }
