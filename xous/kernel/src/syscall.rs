@@ -24,6 +24,38 @@ enum ExecutionType {
     NonBlocking,
 }
 
+/// Wake a blocked thread and deliver a result.
+///
+/// On hardware: if the thread has a kernel future, deposits the result
+/// in its mailbox (the future polls it in `activate_current`).
+/// Otherwise (or in hosted mode): sets the result directly via
+/// `set_thread_result`.
+///
+/// In both cases, the thread state is set to `Ready`.
+#[allow(dead_code)]
+pub(crate) fn wake_thread_with_result(
+    ss: &mut SystemServices,
+    pid: xous::PID,
+    tid: TID,
+    result: Result,
+) {
+    #[cfg(beetos)]
+    {
+        if let Ok(process) = ss.process_mut(pid) {
+            if process.has_kernel_future(tid) {
+                process.set_mailbox(tid, result);
+                process.set_thread_state(tid, ThreadState::Ready);
+                return;
+            }
+        }
+    }
+    // Legacy path (hosted mode or no kernel future).
+    ss.process_mut(pid)
+        .map(|p| p.set_thread_state(tid, ThreadState::Ready))
+        .ok();
+    ss.set_thread_result(pid, tid, result).ok();
+}
+
 /// Suspend the current thread with a kernel future.
 ///
 /// Stores `future` on the thread and parks it via `WaitEvent { mask }`.
@@ -32,7 +64,7 @@ enum ExecutionType {
 ///
 /// This is the single suspension primitive for all async syscalls.
 #[cfg(beetos)]
-fn suspend_with_future(ss: &mut SystemServices, tid: TID, future: KernelFuture, mask: usize) {
+pub(crate) fn suspend_with_future(ss: &mut SystemServices, tid: TID, future: KernelFuture, mask: usize) {
     let process = ss.current_process_mut();
     process.set_kernel_future(tid, future);
     process.set_thread_state(tid, ThreadState::WaitEvent { mask });
@@ -62,6 +94,15 @@ pub(crate) fn send_message(sender_tid: TID, cid: CID, message: Message) -> SysCa
         send_message_inner(ss, sender_tid, sidx, message)?;
 
         if blocking {
+            // On hardware: use kernel future + mailbox.
+            #[cfg(beetos)]
+            suspend_with_future(
+                ss, sender_tid,
+                KernelFuture::WaitBlocking,
+                crate::kfuture::EVENT_KERNEL,
+            );
+            // In hosted mode: legacy WaitBlocking state.
+            #[cfg(not(beetos))]
             ss.current_process_mut().set_thread_state(sender_tid, ThreadState::WaitBlocking { sidx });
         } else {
             ss.set_thread_result(current_pid(), sender_tid, Result::Ok)?;
@@ -225,8 +266,7 @@ fn return_memory(
                 ss.return_memory(buf.as_ptr() as _, pid, tid, client_addr.get() as _, buf.len())?;
 
                 let return_value = Result::MemoryReturned(offset, valid);
-                ss.process_mut(pid).unwrap().set_thread_state(tid, ThreadState::Ready);
-                ss.set_thread_result(pid, tid, return_value)?;
+                wake_thread_with_result(ss, pid, tid, return_value);
             }
             WaitingMessage::ForgetMemory(range) => {
                 MemoryManager::with_mut(|mm| mm.unmap_range(range.as_ptr(), range.len()))?;
@@ -262,8 +302,7 @@ fn return_result(server_tid: TID, sender: MessageSender, return_value: Result) -
         }
         match result {
             WaitingMessage::ScalarMessage { pid, tid } => {
-                ss.process_mut(pid).unwrap().set_thread_state(tid, ThreadState::Ready);
-                ss.set_thread_result(pid, tid, return_value)?;
+                wake_thread_with_result(ss, pid, tid, return_value);
             }
             WaitingMessage::ScalarMessageTerminated => {}
             WaitingMessage::ForgetMemory(_) => {
@@ -539,6 +578,19 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             }
             SystemServices::with_mut(|ss| {
                 ss.set_thread_result(current_pid(), tid, xous::Result::Ok)?;
+                // On hardware: use kernel future + mailbox.
+                #[cfg(beetos)]
+                {
+                    suspend_with_future(
+                        ss, tid,
+                        KernelFuture::WaitFutex,
+                        crate::kfuture::EVENT_KERNEL,
+                    );
+                    // Keep WaitFutex state for scan by FutexWake.
+                    ss.current_process_mut()
+                        .set_thread_state(tid, ThreadState::WaitFutex { addr });
+                }
+                #[cfg(not(beetos))]
                 ss.current_process_mut().set_thread_state(tid, ThreadState::WaitFutex { addr });
                 Scheduler::with_mut(|s| s.activate_current(ss))
             })
@@ -546,7 +598,20 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         #[cfg(beetos)]
         SysCall::FutexWake(addr, n) => {
             SystemServices::with_mut(|ss| {
-                ss.current_process_mut().wake_threads_with_state(ThreadState::WaitFutex { addr }, n)
+                let process = ss.current_process_mut();
+                let mut remaining = n;
+                for wake_tid in 1..crate::process::MAX_THREAD_COUNT {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if process.thread_state(wake_tid) == (ThreadState::WaitFutex { addr }) {
+                        if process.has_kernel_future(wake_tid) {
+                            process.set_mailbox(wake_tid, xous::Result::Ok);
+                        }
+                        process.set_thread_state(wake_tid, ThreadState::Ready);
+                        remaining -= 1;
+                    }
+                }
             });
             Ok(Result::Ok)
         }
@@ -854,17 +919,27 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         }
         #[cfg(beetos)]
         SysCall::WaitProcess(target_pid) => SystemServices::with_mut(|ss| {
-            // Park the thread FIRST, then check if process still exists.
-            // This avoids a race where the process exits between our check
-            // and the park — which would leave us blocked forever.
-            ss.set_thread_result(current_pid(), tid, Result::Ok)?;
-            ss.current_process_mut().set_thread_state(tid, ThreadState::WaitProcess { pid: target_pid });
-
-            // Now check: if the process already exited, wake immediately.
+            // If the process already exited, return immediately.
             if ss.process(target_pid).is_err() {
-                ss.current_process_mut().set_thread_state(tid, ThreadState::Ready);
-                ss.set_thread_result(current_pid(), tid, Result::Scalar1(0))?;
+                return Ok(Result::Scalar1(0));
             }
+
+            // Suspend with a kernel future — the wake path deposits
+            // the exit code into the thread's result mailbox.
+            suspend_with_future(
+                ss, tid,
+                KernelFuture::WaitProcessExit,
+                crate::kfuture::EVENT_KERNEL,
+            );
+            // Tag: store target PID in the mailbox as a sentinel so
+            // the wake path in terminate_current_process can find us.
+            // We use WaitProcess ThreadState for the scan, then the
+            // future for the actual result delivery.
+            // Actually, we still need the WaitProcess { pid } state
+            // for the scan in services.rs.  So we set the state AFTER
+            // suspend_with_future (which sets WaitEvent).
+            ss.current_process_mut()
+                .set_thread_state(tid, ThreadState::WaitProcess { pid: target_pid });
 
             Scheduler::with_mut(|s| s.activate_current(ss))
         }),

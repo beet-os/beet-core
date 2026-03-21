@@ -714,8 +714,10 @@ impl SystemServices {
 
             for waiting_tid in 0..MAX_THREAD_COUNT {
                 if (self.current_process().thread_state(waiting_tid) == ThreadState::WaitJoin { tid }) {
-                    self.current_process_mut().set_thread_state(waiting_tid, ThreadState::Ready);
-                    self.set_thread_result(current_pid(), waiting_tid, xous::Result::Scalar1(return_value))?;
+                    crate::syscall::wake_thread_with_result(
+                        self, current_pid(), waiting_tid,
+                        xous::Result::Scalar1(return_value),
+                    );
                 }
             }
         }
@@ -733,6 +735,18 @@ impl SystemServices {
         }
 
         if process.thread_state(join_tid) != ThreadState::Free {
+            #[cfg(beetos)]
+            {
+                crate::syscall::suspend_with_future(
+                    self, tid,
+                    crate::kfuture::KernelFuture::WaitJoin,
+                    crate::kfuture::EVENT_KERNEL,
+                );
+                // Keep WaitJoin state for scan in thread_exited.
+                self.current_process_mut()
+                    .set_thread_state(tid, ThreadState::WaitJoin { tid: join_tid });
+            }
+            #[cfg(not(beetos))]
             process.set_thread_state(tid, ThreadState::WaitJoin { tid: join_tid });
             Scheduler::with_mut(|s| s.activate_current(self))
         } else {
@@ -979,6 +993,20 @@ impl SystemServices {
             // Now wake all collected waiters
             for i in 0..waiter_count {
                 let (waiter_pid, tid) = waiters[i];
+
+                // On hardware: if the thread has a kernel future, deposit
+                // the result in the mailbox (the future will poll it).
+                // Otherwise (hosted mode): set the result directly.
+                #[cfg(beetos)]
+                {
+                    if let Ok(process) = self.process_mut(waiter_pid) {
+                        if process.has_kernel_future(tid) {
+                            process.set_mailbox(tid, xous::Result::Scalar1(exit_code));
+                            process.set_thread_state(tid, ThreadState::Ready);
+                            continue;
+                        }
+                    }
+                }
                 self.set_thread_result(waiter_pid, tid, xous::Result::Scalar1(exit_code))
                     .ok();
                 self.process_mut(waiter_pid)

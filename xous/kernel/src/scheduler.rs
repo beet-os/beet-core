@@ -233,7 +233,7 @@ impl Scheduler {
                 .take_kernel_future(next_tid);
 
             if let Some(kf) = future {
-                match kf.poll(services, next_pid) {
+                match kf.poll(services, next_pid, next_tid) {
                     PollResult::Ready(result) => {
                         // Future completed — deliver the result to the thread.
                         services.set_thread_result(next_pid, next_tid, result?).ok();

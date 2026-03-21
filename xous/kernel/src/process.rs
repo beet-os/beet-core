@@ -81,6 +81,17 @@ pub struct Process {
     /// in `ThreadState`.  The scheduler polls the future when the
     /// thread is woken.
     kernel_futures: [Option<KernelFuture>; MAX_THREAD_COUNT],
+
+    /// Per-thread result mailbox for kernel futures.
+    ///
+    /// For futures where the waker produces the result (WaitBlocking,
+    /// WaitProcess, WaitJoin), the waker writes the result here.
+    /// The future's `poll()` checks the mailbox and returns Ready
+    /// when a result is present.
+    ///
+    /// For queue-based futures (ReceiveMessage), the mailbox is unused —
+    /// the future polls the server queue directly.
+    result_mailbox: [Option<xous::Result>; MAX_THREAD_COUNT],
 }
 
 #[derive(Debug, Default)]
@@ -159,6 +170,7 @@ impl Process {
             aslr_slide: 0,
             notification_bits: 0,
             kernel_futures: [const { None }; MAX_THREAD_COUNT],
+            result_mailbox: [const { None }; MAX_THREAD_COUNT],
         }
     }
 
@@ -179,6 +191,7 @@ impl Process {
         for tid in 1..MAX_THREAD_COUNT {
             self.set_thread_state(tid, ThreadState::Free);
             self.kernel_futures[tid] = None;
+            self.result_mailbox[tid] = None;
         }
 
         // Free all associated memory pages
@@ -343,6 +356,22 @@ impl Process {
     /// Check if the given thread has a pending kernel future.
     pub fn has_kernel_future(&self, tid: TID) -> bool {
         tid < MAX_THREAD_COUNT && self.kernel_futures[tid].is_some()
+    }
+
+    /// Deposit a result into the thread's mailbox (used by wakers).
+    pub fn set_mailbox(&mut self, tid: TID, result: xous::Result) {
+        if tid < MAX_THREAD_COUNT {
+            self.result_mailbox[tid] = Some(result);
+        }
+    }
+
+    /// Take (read and clear) the result from the thread's mailbox.
+    pub fn take_mailbox(&mut self, tid: TID) -> Option<xous::Result> {
+        if tid < MAX_THREAD_COUNT {
+            self.result_mailbox[tid].take()
+        } else {
+            None
+        }
     }
 
     /// Read and clear all pending notification bits.
