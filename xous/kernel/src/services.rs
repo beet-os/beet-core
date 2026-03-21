@@ -1127,6 +1127,7 @@ impl SystemServices {
                     }
                     ThreadState::WaitFutex { addr: _addr } => writeln!(output, "WaitFutex({_addr:08x})").ok(),
                     ThreadState::WaitProcess { pid: _pid } => writeln!(output, "WaitProcess({})", _pid).ok(),
+                    ThreadState::WaitEvent { mask: _mask } => writeln!(output, "WaitEvent({_mask:#x})").ok(),
                 };
                 write!(output, "{:?}", arch_process.thread(tid)).ok();
             }

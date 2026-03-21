@@ -69,6 +69,10 @@ pub struct Process {
     #[cfg(beetos)]
     #[allow(dead_code)]
     pub(crate) aslr_slide: usize,
+
+    /// Pending notification bits (posted via PostEvent, consumed via WaitEvent/PollEvent).
+    /// Bits are OR'd in by PostEvent and atomically cleared by WaitEvent/PollEvent.
+    notification_bits: usize,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +120,8 @@ pub enum ThreadState {
     /// Retrying a send() call because the server's queue was full. PC is on the SWI instruction, so once
     /// it's marked ready, the connect() syscall will be executed again.
     RetryQueueFull { sidx: usize },
+    /// Waiting on WaitEvent(mask) — blocked until notification_bits & mask != 0.
+    WaitEvent { mask: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +149,7 @@ impl Process {
             next_mirror_address: MEMORY_MIRROR_AREA_VIRT,
             #[cfg(beetos)]
             aslr_slide: 0,
+            notification_bits: 0,
         }
     }
 
@@ -305,6 +312,40 @@ impl Process {
 
     pub fn get_event_handler(&self, event: SystemEvent) -> Option<(SID, MessageId)> {
         self.event_handlers[event as usize].as_ref().map(|e| (e.sid, e.message_id))
+    }
+
+    /// Read and clear all pending notification bits.
+    pub fn take_notification_bits(&mut self) -> usize {
+        let bits = self.notification_bits;
+        self.notification_bits = 0;
+        bits
+    }
+
+    /// Read and clear only the notification bits that match `mask`.
+    pub fn take_notification_bits_masked(&mut self, mask: usize) -> usize {
+        let fired = self.notification_bits & mask;
+        self.notification_bits &= !mask;
+        fired
+    }
+
+    /// OR notification bits into the pending word.
+    /// Finds the first thread blocked in WaitEvent with a matching mask,
+    /// consumes the matched bits, wakes the thread, and returns `Some((tid, fired_bits))`
+    /// so the caller can set the thread result.
+    /// Returns `None` if no thread was woken.
+    pub fn post_notification_bits(&mut self, bits: usize) -> Option<(usize, usize)> {
+        self.notification_bits |= bits;
+        for tid in 1..MAX_THREAD_COUNT {
+            if let ThreadState::WaitEvent { mask } = self.thread_state(tid) {
+                let fired = self.notification_bits & mask;
+                if fired != 0 {
+                    self.notification_bits &= !fired;
+                    self.set_thread_state(tid, ThreadState::Ready);
+                    return Some((tid, fired));
+                }
+            }
+        }
+        None
     }
 
     pub fn wake_threads_with_state(&mut self, state: ThreadState, mut n: usize) {

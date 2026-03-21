@@ -170,6 +170,14 @@ pub(crate) fn send_message_inner(
         // Add this message to the queue.  If the queue is full, this returns an error.
         let _queue_idx = ss.queue_server_message(sidx, sender_pid, sender_tid, message, client_address)?;
         klog!("queued into index {:x}", _queue_idx);
+
+        // Post a notification to the server process so that any thread
+        // blocked in WaitEvent (e.g. the async-rt reactor) is woken up.
+        // Bit 0 = "server message available".
+        let process = ss.process_mut(server_pid).expect("server process missing");
+        if let Some((woken_tid, fired_bits)) = process.post_notification_bits(1) {
+            ss.set_thread_result(server_pid, woken_tid, Result::Scalar1(fired_bits)).ok();
+        }
     };
     Ok(())
 }
@@ -329,6 +337,10 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
 
         #[cfg(beetos)]
         SysCall::NetGetInfo => Ok(()),
+
+        // Notification syscalls
+        #[cfg(beetos)]
+        SysCall::WaitEvent(..) | SysCall::PollEvent | SysCall::PostEvent(..) => Ok(()),
 
         // Messaging-related calls
         SysCall::CreateServer
@@ -822,6 +834,45 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
 
             Scheduler::with_mut(|s| s.activate_current(ss))
         }),
+
+        #[cfg(beetos)]
+        SysCall::WaitEvent(mask) => {
+            if mask == 0 {
+                return Err(Error::InvalidArguments);
+            }
+            SystemServices::with_mut(|ss| {
+                let process = ss.current_process_mut();
+                let fired = process.take_notification_bits_masked(mask);
+                if fired != 0 {
+                    // Bits already pending — return immediately.
+                    return Ok(Result::Scalar1(fired));
+                }
+                // No matching bits — block the thread.
+                ss.set_thread_result(current_pid(), tid, Result::Ok)?;
+                ss.current_process_mut().set_thread_state(tid, ThreadState::WaitEvent { mask });
+                Scheduler::with_mut(|s| s.activate_current(ss))
+            })
+        }
+        #[cfg(beetos)]
+        SysCall::PollEvent => {
+            SystemServices::with_mut(|ss| {
+                let bits = ss.current_process_mut().take_notification_bits();
+                Ok(Result::Scalar1(bits))
+            })
+        }
+        #[cfg(beetos)]
+        SysCall::PostEvent(target_pid, bits) => {
+            if bits == 0 {
+                return Ok(Result::Ok);
+            }
+            SystemServices::with_mut(|ss| {
+                let process = ss.process_mut(target_pid)?;
+                if let Some((woken_tid, fired_bits)) = process.post_notification_bits(bits) {
+                    ss.set_thread_result(target_pid, woken_tid, Result::Scalar1(fired_bits)).ok();
+                }
+                Ok(Result::Ok)
+            })
+        }
 
         _ => Err(Error::UnhandledSyscall),
     };

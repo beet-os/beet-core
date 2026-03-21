@@ -132,7 +132,16 @@ impl Executor {
 
             // ── Phase 3: idle ─────────────────────────────────────────
             if !made_progress {
-                xous::yield_slice();
+                // On hardware, block until a server message notification
+                // arrives (bit 0) instead of busy-polling with yield_slice.
+                #[cfg(beetos)]
+                {
+                    let _ = xous::wait_event(0x1);
+                }
+                #[cfg(not(beetos))]
+                {
+                    xous::yield_slice();
+                }
             }
         }
 
