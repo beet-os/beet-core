@@ -1,0 +1,12 @@
+[package]
+name = "async-demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+xous = { path = "../../xous/xous-rs" }
+xous-async-rt = { path = "../../xous/async-rt" }
+log = "0.4"
+
+[lints]
+workspace = true

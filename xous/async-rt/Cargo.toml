@@ -1,0 +1,11 @@
+[package]
+name = "xous-async-rt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+xous = { path = "../xous-rs" }
+log = "0.4"
+
+[lints]
+workspace = true
