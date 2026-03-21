@@ -713,7 +713,16 @@ impl SystemServices {
             }
 
             for waiting_tid in 0..MAX_THREAD_COUNT {
-                if (self.current_process().thread_state(waiting_tid) == ThreadState::WaitJoin { tid }) {
+                #[cfg(beetos)]
+                let is_joiner = matches!(
+                    self.current_process().kernel_future(waiting_tid),
+                    Some(crate::kfuture::KernelFuture::WaitJoin { target_tid })
+                        if *target_tid == tid
+                );
+                #[cfg(not(beetos))]
+                let is_joiner = self.current_process().thread_state(waiting_tid)
+                    == (ThreadState::WaitJoin { tid });
+                if is_joiner {
                     crate::syscall::wake_thread_with_result(
                         self, current_pid(), waiting_tid,
                         xous::Result::Scalar1(return_value),
@@ -736,16 +745,11 @@ impl SystemServices {
 
         if process.thread_state(join_tid) != ThreadState::Free {
             #[cfg(beetos)]
-            {
-                crate::syscall::suspend_with_future(
-                    self, tid,
-                    crate::kfuture::KernelFuture::WaitJoin,
-                    crate::kfuture::EVENT_KERNEL,
-                );
-                // Keep WaitJoin state for scan in thread_exited.
-                self.current_process_mut()
-                    .set_thread_state(tid, ThreadState::WaitJoin { tid: join_tid });
-            }
+            crate::syscall::suspend_with_future(
+                self, tid,
+                crate::kfuture::KernelFuture::WaitJoin { target_tid: join_tid },
+                crate::kfuture::EVENT_KERNEL,
+            );
             #[cfg(not(beetos))]
             process.set_thread_state(tid, ThreadState::WaitJoin { tid: join_tid });
             Scheduler::with_mut(|s| s.activate_current(self))
@@ -966,52 +970,41 @@ impl SystemServices {
         }
 
         // Wake all threads waiting on this process via WaitProcess syscall.
+        // On hardware: scan kernel futures for WaitProcessExit { target_pid }.
+        // In hosted mode: scan ThreadState for WaitProcess { pid }.
         // Collect waiters first to avoid borrow conflicts.
         {
             let dying_pid = pid;
             let exit_code = ret as usize;
-            // Stack-allocated buffer for waiters (pid, tid pairs).
-            // 64 entries should be more than enough — typical case is 1 waiter.
             let mut waiters = [(xous::PID::new(1).unwrap(), 0usize); 64];
             let mut waiter_count = 0;
 
             for pidx in 0..self.processes.len() {
                 let Some(process) = &self.processes[pidx] else { continue };
                 let waiter_pid = process.pid;
-                for tid in 1..crate::arch::process::MAX_THREAD_COUNT {
-                    if process.thread_state(tid)
-                        == (ThreadState::WaitProcess { pid: dying_pid })
-                    {
-                        if waiter_count < waiters.len() {
-                            waiters[waiter_count] = (waiter_pid, tid);
-                            waiter_count += 1;
-                        }
+                for wt in 1..crate::arch::process::MAX_THREAD_COUNT {
+                    #[cfg(beetos)]
+                    let is_waiter = matches!(
+                        process.kernel_future(wt),
+                        Some(crate::kfuture::KernelFuture::WaitProcessExit { target_pid })
+                            if *target_pid == dying_pid
+                    );
+                    #[cfg(not(beetos))]
+                    let is_waiter = process.thread_state(wt)
+                        == (ThreadState::WaitProcess { pid: dying_pid });
+                    if is_waiter && waiter_count < waiters.len() {
+                        waiters[waiter_count] = (waiter_pid, wt);
+                        waiter_count += 1;
                     }
                 }
             }
 
-            // Now wake all collected waiters
             for i in 0..waiter_count {
-                let (waiter_pid, tid) = waiters[i];
-
-                // On hardware: if the thread has a kernel future, deposit
-                // the result in the mailbox (the future will poll it).
-                // Otherwise (hosted mode): set the result directly.
-                #[cfg(beetos)]
-                {
-                    if let Ok(process) = self.process_mut(waiter_pid) {
-                        if process.has_kernel_future(tid) {
-                            process.set_mailbox(tid, xous::Result::Scalar1(exit_code));
-                            process.set_thread_state(tid, ThreadState::Ready);
-                            continue;
-                        }
-                    }
-                }
-                self.set_thread_result(waiter_pid, tid, xous::Result::Scalar1(exit_code))
-                    .ok();
-                self.process_mut(waiter_pid)
-                    .map(|p| p.set_thread_state(tid, ThreadState::Ready))
-                    .ok();
+                let (waiter_pid, wt) = waiters[i];
+                crate::syscall::wake_thread_with_result(
+                    self, waiter_pid, wt,
+                    xous::Result::Scalar1(exit_code),
+                );
             }
         }
 

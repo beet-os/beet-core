@@ -56,19 +56,27 @@ pub enum KernelFuture {
 
     /// Waiting for a blocking IPC reply.
     /// Mailbox-based.  Replaces `ThreadState::WaitBlocking`.
+    /// No scan key needed — woken directly by return_result/return_memory
+    /// which already know the (pid, tid) from the WaitingMessage.
     WaitBlocking,
 
     /// Waiting for a process to exit.
     /// Mailbox-based.  Replaces `ThreadState::WaitProcess`.
-    WaitProcessExit,
+    /// `target_pid` is the scan key: terminate_current_process scans
+    /// all kernel futures for matching target_pid.
+    WaitProcessExit { target_pid: xous::PID },
 
     /// Waiting for a thread to finish (join).
     /// Mailbox-based.  Replaces `ThreadState::WaitJoin`.
-    WaitJoin,
+    /// `target_tid` is the scan key: thread_exited scans the current
+    /// process's kernel futures for matching target_tid.
+    WaitJoin { target_tid: usize },
 
     /// Waiting on a futex.
     /// Mailbox-based.  Replaces `ThreadState::WaitFutex`.
-    WaitFutex,
+    /// `addr` is the scan key: FutexWake scans the current process's
+    /// kernel futures for matching addr.
+    WaitFutex { addr: usize },
 }
 
 // SAFETY: All fields are plain data (usize).  The Send bound is the
@@ -114,9 +122,9 @@ impl KernelFuture {
 
             // ── Mailbox-based ────────────────────────────────────
             KernelFuture::WaitBlocking
-            | KernelFuture::WaitProcessExit
-            | KernelFuture::WaitJoin
-            | KernelFuture::WaitFutex => {
+            | KernelFuture::WaitProcessExit { .. }
+            | KernelFuture::WaitJoin { .. }
+            | KernelFuture::WaitFutex { .. } => {
                 poll_mailbox(ss, pid, tid)
             }
         }

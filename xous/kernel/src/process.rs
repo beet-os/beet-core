@@ -119,10 +119,24 @@ pub enum ConnectionSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ThreadState {
+    // ── Universal (used on both hosted and hardware) ─────────────
     /// Unallocated
     Free,
     /// Either running or ready to run immediately
     Ready,
+    /// Retrying a connect() call because the server does not exist (yet).
+    RetryConnect { sid_hash: u32 },
+    /// Retrying a send() call because the server's queue was full.
+    RetryQueueFull { sidx: usize },
+    /// Waiting on WaitEvent(mask) — blocked until notification_bits & mask != 0.
+    /// On hardware, this is the universal "parked" state: a KernelFuture
+    /// holds the syscall-specific details.
+    WaitEvent { mask: usize },
+
+    // ── Hosted mode only ─────────────────────────────────────────
+    // On hardware, these are replaced by KernelFuture variants stored
+    // per-thread.  The kernel future holds the scan key (target_pid,
+    // target_tid, addr) and the result mailbox handles wake delivery.
     /// Waiting on join_thread()
     WaitJoin { tid: usize },
     /// Waiting on a blocking message send() to return
@@ -133,14 +147,6 @@ pub enum ThreadState {
     WaitFutex { addr: usize },
     /// Waiting for a process to exit via WaitProcess syscall
     WaitProcess { pid: PID },
-    /// Retrying a connect() call because the server does not exist (yet). PC is on the SWI instruction, so
-    /// once it's marked ready, the connect() syscall will be executed again.
-    RetryConnect { sid_hash: u32 },
-    /// Retrying a send() call because the server's queue was full. PC is on the SWI instruction, so once
-    /// it's marked ready, the connect() syscall will be executed again.
-    RetryQueueFull { sidx: usize },
-    /// Waiting on WaitEvent(mask) — blocked until notification_bits & mask != 0.
-    WaitEvent { mask: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +375,15 @@ impl Process {
     pub fn take_mailbox(&mut self, tid: TID) -> Option<xous::Result> {
         if tid < MAX_THREAD_COUNT {
             self.result_mailbox[tid].take()
+        } else {
+            None
+        }
+    }
+
+    /// Read-only access to the kernel future for a given thread (for scanning).
+    pub fn kernel_future(&self, tid: TID) -> Option<&KernelFuture> {
+        if tid < MAX_THREAD_COUNT {
+            self.kernel_futures[tid].as_ref()
         } else {
             None
         }

@@ -578,18 +578,12 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             }
             SystemServices::with_mut(|ss| {
                 ss.set_thread_result(current_pid(), tid, xous::Result::Ok)?;
-                // On hardware: use kernel future + mailbox.
                 #[cfg(beetos)]
-                {
-                    suspend_with_future(
-                        ss, tid,
-                        KernelFuture::WaitFutex,
-                        crate::kfuture::EVENT_KERNEL,
-                    );
-                    // Keep WaitFutex state for scan by FutexWake.
-                    ss.current_process_mut()
-                        .set_thread_state(tid, ThreadState::WaitFutex { addr });
-                }
+                suspend_with_future(
+                    ss, tid,
+                    KernelFuture::WaitFutex { addr },
+                    crate::kfuture::EVENT_KERNEL,
+                );
                 #[cfg(not(beetos))]
                 ss.current_process_mut().set_thread_state(tid, ThreadState::WaitFutex { addr });
                 Scheduler::with_mut(|s| s.activate_current(ss))
@@ -599,15 +593,18 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         SysCall::FutexWake(addr, n) => {
             SystemServices::with_mut(|ss| {
                 let process = ss.current_process_mut();
+                use crate::kfuture::KernelFuture;
                 let mut remaining = n;
                 for wake_tid in 1..crate::process::MAX_THREAD_COUNT {
                     if remaining == 0 {
                         break;
                     }
-                    if process.thread_state(wake_tid) == (ThreadState::WaitFutex { addr }) {
-                        if process.has_kernel_future(wake_tid) {
-                            process.set_mailbox(wake_tid, xous::Result::Ok);
-                        }
+                    let is_futex_waiter = matches!(
+                        process.kernel_future(wake_tid),
+                        Some(KernelFuture::WaitFutex { addr: a }) if *a == addr
+                    );
+                    if is_futex_waiter {
+                        process.set_mailbox(wake_tid, xous::Result::Ok);
                         process.set_thread_state(wake_tid, ThreadState::Ready);
                         remaining -= 1;
                     }
@@ -924,22 +921,15 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
                 return Ok(Result::Scalar1(0));
             }
 
-            // Suspend with a kernel future — the wake path deposits
-            // the exit code into the thread's result mailbox.
+            // Suspend with a kernel future. The wake path in
+            // terminate_current_process scans kernel_futures for
+            // WaitProcessExit { target_pid } and deposits the exit
+            // code into the mailbox.
             suspend_with_future(
                 ss, tid,
-                KernelFuture::WaitProcessExit,
+                KernelFuture::WaitProcessExit { target_pid },
                 crate::kfuture::EVENT_KERNEL,
             );
-            // Tag: store target PID in the mailbox as a sentinel so
-            // the wake path in terminate_current_process can find us.
-            // We use WaitProcess ThreadState for the scan, then the
-            // future for the actual result delivery.
-            // Actually, we still need the WaitProcess { pid } state
-            // for the scan in services.rs.  So we set the state AFTER
-            // suspend_with_future (which sets WaitEvent).
-            ss.current_process_mut()
-                .set_thread_state(tid, ThreadState::WaitProcess { pid: target_pid });
 
             Scheduler::with_mut(|s| s.activate_current(ss))
         }),
