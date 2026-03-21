@@ -9,6 +9,7 @@ use xous::{AppId, Error, MessageId, SystemEvent, ThreadPriority, CID, NUM_SYSTEM
 use crate::arch::mem::MemoryMapping;
 pub use crate::arch::process::Process as ArchProcess;
 pub use crate::arch::process::{current_pid, MAX_THREAD_COUNT};
+use crate::kfuture::KernelFuture;
 use crate::scheduler::Scheduler;
 use crate::server::MessagePermissions;
 #[cfg(beetos)]
@@ -69,6 +70,28 @@ pub struct Process {
     #[cfg(beetos)]
     #[allow(dead_code)]
     pub(crate) aslr_slide: usize,
+
+    /// Pending notification bits (posted via PostEvent, consumed via WaitEvent/PollEvent).
+    /// Bits are OR'd in by PostEvent and atomically cleared by WaitEvent/PollEvent.
+    notification_bits: usize,
+
+    /// Per-thread kernel futures for in-flight async syscalls.
+    /// When a thread blocks on a syscall (e.g. ReceiveMessage), a
+    /// `KernelFuture` is stored here instead of encoding the state
+    /// in `ThreadState`.  The scheduler polls the future when the
+    /// thread is woken.
+    kernel_futures: [Option<KernelFuture>; MAX_THREAD_COUNT],
+
+    /// Per-thread result mailbox for kernel futures.
+    ///
+    /// For futures where the waker produces the result (WaitBlocking,
+    /// WaitProcess, WaitJoin), the waker writes the result here.
+    /// The future's `poll()` checks the mailbox and returns Ready
+    /// when a result is present.
+    ///
+    /// For queue-based futures (ReceiveMessage), the mailbox is unused —
+    /// the future polls the server queue directly.
+    result_mailbox: [Option<xous::Result>; MAX_THREAD_COUNT],
 }
 
 #[derive(Debug, Default)]
@@ -100,22 +123,14 @@ pub enum ThreadState {
     Free,
     /// Either running or ready to run immediately
     Ready,
-    /// Waiting on join_thread()
-    WaitJoin { tid: usize },
-    /// Waiting on a blocking message send() to return
-    WaitBlocking { sidx: usize },
-    /// Waiting on a receive()
-    WaitReceive { sidx: usize },
-    /// Waiting on futex_wait()
-    WaitFutex { addr: usize },
-    /// Waiting for a process to exit via WaitProcess syscall
-    WaitProcess { pid: PID },
-    /// Retrying a connect() call because the server does not exist (yet). PC is on the SWI instruction, so
-    /// once it's marked ready, the connect() syscall will be executed again.
+    /// Retrying a connect() call because the server does not exist (yet).
     RetryConnect { sid_hash: u32 },
-    /// Retrying a send() call because the server's queue was full. PC is on the SWI instruction, so once
-    /// it's marked ready, the connect() syscall will be executed again.
+    /// Retrying a send() call because the server's queue was full.
     RetryQueueFull { sidx: usize },
+    /// Waiting — blocked until notification_bits & mask != 0.
+    /// A `KernelFuture` stored per-thread holds the syscall-specific
+    /// details (server index, target PID, futex address, etc.).
+    WaitEvent { mask: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +158,9 @@ impl Process {
             next_mirror_address: MEMORY_MIRROR_AREA_VIRT,
             #[cfg(beetos)]
             aslr_slide: 0,
+            notification_bits: 0,
+            kernel_futures: [const { None }; MAX_THREAD_COUNT],
+            result_mailbox: [const { None }; MAX_THREAD_COUNT],
         }
     }
 
@@ -162,6 +180,8 @@ impl Process {
 
         for tid in 1..MAX_THREAD_COUNT {
             self.set_thread_state(tid, ThreadState::Free);
+            self.kernel_futures[tid] = None;
+            self.result_mailbox[tid] = None;
         }
 
         // Free all associated memory pages
@@ -307,6 +327,86 @@ impl Process {
         self.event_handlers[event as usize].as_ref().map(|e| (e.sid, e.message_id))
     }
 
+    /// Store a kernel future on the given thread.
+    pub fn set_kernel_future(&mut self, tid: TID, future: KernelFuture) {
+        if tid < MAX_THREAD_COUNT {
+            self.kernel_futures[tid] = Some(future);
+        }
+    }
+
+    /// Take (remove and return) the kernel future from the given thread.
+    pub fn take_kernel_future(&mut self, tid: TID) -> Option<KernelFuture> {
+        if tid < MAX_THREAD_COUNT {
+            self.kernel_futures[tid].take()
+        } else {
+            None
+        }
+    }
+
+    /// Check if the given thread has a pending kernel future.
+    pub fn has_kernel_future(&self, tid: TID) -> bool {
+        tid < MAX_THREAD_COUNT && self.kernel_futures[tid].is_some()
+    }
+
+    /// Deposit a result into the thread's mailbox (used by wakers).
+    pub fn set_mailbox(&mut self, tid: TID, result: xous::Result) {
+        if tid < MAX_THREAD_COUNT {
+            self.result_mailbox[tid] = Some(result);
+        }
+    }
+
+    /// Take (read and clear) the result from the thread's mailbox.
+    pub fn take_mailbox(&mut self, tid: TID) -> Option<xous::Result> {
+        if tid < MAX_THREAD_COUNT {
+            self.result_mailbox[tid].take()
+        } else {
+            None
+        }
+    }
+
+    /// Read-only access to the kernel future for a given thread (for scanning).
+    pub fn kernel_future(&self, tid: TID) -> Option<&KernelFuture> {
+        if tid < MAX_THREAD_COUNT {
+            self.kernel_futures[tid].as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Read and clear all pending notification bits.
+    pub fn take_notification_bits(&mut self) -> usize {
+        let bits = self.notification_bits;
+        self.notification_bits = 0;
+        bits
+    }
+
+    /// Read and clear only the notification bits that match `mask`.
+    pub fn take_notification_bits_masked(&mut self, mask: usize) -> usize {
+        let fired = self.notification_bits & mask;
+        self.notification_bits &= !mask;
+        fired
+    }
+
+    /// OR notification bits into the pending word.
+    /// Finds the first thread blocked in WaitEvent with a matching mask,
+    /// consumes the matched bits, wakes the thread, and returns `Some((tid, fired_bits))`
+    /// so the caller can set the thread result.
+    /// Returns `None` if no thread was woken.
+    pub fn post_notification_bits(&mut self, bits: usize) -> Option<(usize, usize)> {
+        self.notification_bits |= bits;
+        for tid in 1..MAX_THREAD_COUNT {
+            if let ThreadState::WaitEvent { mask } = self.thread_state(tid) {
+                let fired = self.notification_bits & mask;
+                if fired != 0 {
+                    self.notification_bits &= !fired;
+                    self.set_thread_state(tid, ThreadState::Ready);
+                    return Some((tid, fired));
+                }
+            }
+        }
+        None
+    }
+
     pub fn wake_threads_with_state(&mut self, state: ThreadState, mut n: usize) {
         if n == 0 {
             return;
@@ -390,34 +490,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thread_state_wait_process_equality() {
-        let pid3 = PID::new(3).unwrap();
-        let pid4 = PID::new(4).unwrap();
-        let state_a = ThreadState::WaitProcess { pid: pid3 };
-        let state_b = ThreadState::WaitProcess { pid: pid3 };
-        let state_c = ThreadState::WaitProcess { pid: pid4 };
-
-        assert_eq!(state_a, state_b, "same PID should match");
-        assert_ne!(state_a, state_c, "different PID should not match");
-        assert_ne!(state_a, ThreadState::Ready);
-        assert_ne!(state_a, ThreadState::Free);
-    }
-
-    #[test]
     fn thread_state_variants_are_distinct() {
-        let pid = PID::new(2).unwrap();
         let states = [
             ThreadState::Free,
             ThreadState::Ready,
-            ThreadState::WaitJoin { tid: 1 },
-            ThreadState::WaitBlocking { sidx: 0 },
-            ThreadState::WaitReceive { sidx: 0 },
-            ThreadState::WaitFutex { addr: 0x1000 },
-            ThreadState::WaitProcess { pid },
             ThreadState::RetryConnect { sid_hash: 42 },
             ThreadState::RetryQueueFull { sidx: 0 },
+            ThreadState::WaitEvent { mask: 1 },
         ];
-        // Each variant should be unique
         for (i, a) in states.iter().enumerate() {
             for (j, b) in states.iter().enumerate() {
                 if i != j {
@@ -429,8 +509,7 @@ mod tests {
 
     #[test]
     fn thread_state_copy_semantics() {
-        let pid = PID::new(5).unwrap();
-        let state = ThreadState::WaitProcess { pid };
+        let state = ThreadState::WaitEvent { mask: 0x3 };
         let copied = state; // Copy
         assert_eq!(state, copied);
     }

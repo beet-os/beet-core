@@ -9,6 +9,7 @@ use xous::{
 };
 
 use crate::irq::{interrupt_claim_user, interrupt_free};
+use crate::kfuture::KernelFuture;
 use crate::mem::{MemoryManager, PAGE_SIZE};
 use crate::process::{current_pid, ConnectionSlot, ThreadState, IRQ_TID};
 use crate::scheduler::Scheduler;
@@ -20,6 +21,62 @@ use crate::services::SystemServices;
 enum ExecutionType {
     Blocking,
     NonBlocking,
+}
+
+/// Wake a blocked thread and deliver a result.
+///
+/// On hardware: if the thread has a kernel future, deposits the result
+/// in its mailbox (the future polls it in `activate_current`).
+/// Otherwise (or in hosted mode): sets the result directly via
+/// `set_thread_result`.
+///
+/// In both cases, the thread state is set to `Ready`.
+/// Wake a blocked thread and deliver a result.
+///
+/// If the thread has a kernel future:
+/// - **Hardware**: deposits the result in the thread's mailbox.
+///   `activate_current` will poll the future and deliver the result.
+/// - **Hosted**: consumes the future and delivers the result directly
+///   via `set_thread_result` (no polling needed).
+///
+/// If the thread has no kernel future, delivers the result directly.
+#[allow(dead_code)]
+pub(crate) fn wake_thread_with_result(
+    ss: &mut SystemServices,
+    pid: xous::PID,
+    tid: TID,
+    result: Result,
+) {
+    #[cfg(beetos)]
+    {
+        if let Ok(process) = ss.process_mut(pid) {
+            if process.has_kernel_future(tid) {
+                process.set_mailbox(tid, result);
+                process.set_thread_state(tid, ThreadState::Ready);
+                return;
+            }
+        }
+    }
+    // Hosted mode (or no kernel future): consume future if present,
+    // deliver result directly.
+    if let Ok(process) = ss.process_mut(pid) {
+        process.take_kernel_future(tid);
+        process.set_thread_state(tid, ThreadState::Ready);
+    }
+    ss.set_thread_result(pid, tid, result).ok();
+}
+
+/// Suspend the current thread with a kernel future.
+///
+/// Stores `future` on the thread and parks it via `WaitEvent { mask }`.
+/// When the kernel posts matching notification bits, the thread is woken
+/// and `activate_current` polls the future to produce the syscall result.
+///
+/// This is the single suspension primitive for all async syscalls.
+pub(crate) fn suspend_with_future(ss: &mut SystemServices, tid: TID, future: KernelFuture, mask: usize) {
+    let process = ss.current_process_mut();
+    process.set_kernel_future(tid, future);
+    process.set_thread_state(tid, ThreadState::WaitEvent { mask });
 }
 
 #[allow(dead_code)]
@@ -46,7 +103,11 @@ pub(crate) fn send_message(sender_tid: TID, cid: CID, message: Message) -> SysCa
         send_message_inner(ss, sender_tid, sidx, message)?;
 
         if blocking {
-            ss.current_process_mut().set_thread_state(sender_tid, ThreadState::WaitBlocking { sidx });
+            suspend_with_future(
+                ss, sender_tid,
+                KernelFuture::WaitBlocking,
+                crate::kfuture::EVENT_KERNEL,
+            );
         } else {
             ss.set_thread_result(current_pid(), sender_tid, Result::Ok)?;
         }
@@ -170,6 +231,14 @@ pub(crate) fn send_message_inner(
         // Add this message to the queue.  If the queue is full, this returns an error.
         let _queue_idx = ss.queue_server_message(sidx, sender_pid, sender_tid, message, client_address)?;
         klog!("queued into index {:x}", _queue_idx);
+
+        // Post a notification to the server process so that any thread
+        // blocked in WaitEvent (e.g. the async-rt reactor) is woken up.
+        // Bit 0 = "server message available".
+        let process = ss.process_mut(server_pid).expect("server process missing");
+        if let Some((woken_tid, fired_bits)) = process.post_notification_bits(1) {
+            ss.set_thread_result(server_pid, woken_tid, Result::Scalar1(fired_bits)).ok();
+        }
     };
     Ok(())
 }
@@ -201,8 +270,7 @@ fn return_memory(
                 ss.return_memory(buf.as_ptr() as _, pid, tid, client_addr.get() as _, buf.len())?;
 
                 let return_value = Result::MemoryReturned(offset, valid);
-                ss.process_mut(pid).unwrap().set_thread_state(tid, ThreadState::Ready);
-                ss.set_thread_result(pid, tid, return_value)?;
+                wake_thread_with_result(ss, pid, tid, return_value);
             }
             WaitingMessage::ForgetMemory(range) => {
                 MemoryManager::with_mut(|mm| mm.unmap_range(range.as_ptr(), range.len()))?;
@@ -238,8 +306,7 @@ fn return_result(server_tid: TID, sender: MessageSender, return_value: Result) -
         }
         match result {
             WaitingMessage::ScalarMessage { pid, tid } => {
-                ss.process_mut(pid).unwrap().set_thread_state(tid, ThreadState::Ready);
-                ss.set_thread_result(pid, tid, return_value)?;
+                wake_thread_with_result(ss, pid, tid, return_value);
             }
             WaitingMessage::ScalarMessageTerminated => {}
             WaitingMessage::ForgetMemory(_) => {
@@ -271,35 +338,44 @@ fn receive_message(tid: TID, sid: SID, blocking: ExecutionType) -> SysCallResult
     SystemServices::with_mut(|ss| {
         // See if there is a pending message.  If so, return immediately.
         let sidx = ss.sidx_from_sid(sid, current_pid()).ok_or(Error::ServerNotFound)?;
-        let server = ss.server_from_sidx_mut(sidx).ok_or(Error::ServerNotFound)?;
-        // server.print_queue();
 
-        // Ensure the server is for this PID
-        if server.pid != current_pid() {
-            return Err(Error::ServerNotFound);
-        }
+        {
+            let server = ss.server_from_sidx_mut(sidx).ok_or(Error::ServerNotFound)?;
 
-        let queue_was_full = server.is_queue_full();
-        // If there is a pending message, return it immediately.
-        if let Some(msg) = server.take_next_message(sidx) {
-            klog!("waiting messages found -- returning {:x?}", msg);
-            if queue_was_full && !server.is_queue_full() {
-                ss.wake_threads_with_state(ThreadState::RetryQueueFull { sidx }, usize::MAX);
+            // Ensure the server is for this PID
+            if server.pid != current_pid() {
+                return Err(Error::ServerNotFound);
             }
-            return Ok(Result::MessageEnvelope(msg));
-        }
 
-        if blocking == ExecutionType::NonBlocking {
-            klog!("nonblocking message -- returning None");
-            return Ok(Result::None);
+            let queue_was_full = server.is_queue_full();
+            // If there is a pending message, return it immediately.
+            if let Some(msg) = server.take_next_message(sidx) {
+                klog!("waiting messages found -- returning {:x?}", msg);
+                if queue_was_full && !server.is_queue_full() {
+                    ss.wake_threads_with_state(ThreadState::RetryQueueFull { sidx }, usize::MAX);
+                }
+                return Ok(Result::MessageEnvelope(msg));
+            }
+
+            if blocking == ExecutionType::NonBlocking {
+                klog!("nonblocking message -- returning None");
+                return Ok(Result::None);
+            }
+
+            // In hosted mode: also park thread on the server so
+            // send_message_inner can find it via take_available_thread.
+            #[cfg(not(beetos))]
+            server.park_thread(tid);
         }
-        // There is no pending message, so return control to the parent
-        // process and mark ourselves as awaiting an event.  When a message
-        // arrives, our return value will already be set to the
-        // MessageEnvelope of the incoming message.
-        klog!("did not have any waiting messages -- parking thread {}", tid);
-        server.park_thread(tid);
-        ss.current_process_mut().set_thread_state(tid, ThreadState::WaitReceive { sidx });
+        // `server` borrow released here — safe to borrow `ss` again.
+
+        klog!("did not have any waiting messages -- suspending thread {}", tid);
+        suspend_with_future(
+            ss, tid,
+            KernelFuture::ReceiveMessage { sidx },
+            crate::kfuture::EVENT_SERVER_MSG,
+        );
+
         Scheduler::with_mut(|s| s.activate_current(ss))
     })
 }
@@ -329,6 +405,10 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
 
         #[cfg(beetos)]
         SysCall::NetGetInfo => Ok(()),
+
+        // Notification syscalls
+        #[cfg(beetos)]
+        SysCall::WaitEvent(..) | SysCall::PollEvent | SysCall::PostEvent(..) => Ok(()),
 
         #[cfg(beetos)]
         SysCall::GetBinaryName(_) => Ok(()),
@@ -496,14 +576,34 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             }
             SystemServices::with_mut(|ss| {
                 ss.set_thread_result(current_pid(), tid, xous::Result::Ok)?;
-                ss.current_process_mut().set_thread_state(tid, ThreadState::WaitFutex { addr });
+                suspend_with_future(
+                    ss, tid,
+                    KernelFuture::WaitFutex { addr },
+                    crate::kfuture::EVENT_KERNEL,
+                );
                 Scheduler::with_mut(|s| s.activate_current(ss))
             })
         }),
         #[cfg(beetos)]
         SysCall::FutexWake(addr, n) => {
             SystemServices::with_mut(|ss| {
-                ss.current_process_mut().wake_threads_with_state(ThreadState::WaitFutex { addr }, n)
+                let process = ss.current_process_mut();
+                use crate::kfuture::KernelFuture;
+                let mut remaining = n;
+                for wake_tid in 1..crate::process::MAX_THREAD_COUNT {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let is_futex_waiter = matches!(
+                        process.kernel_future(wake_tid),
+                        Some(KernelFuture::WaitFutex { addr: a }) if *a == addr
+                    );
+                    if is_futex_waiter {
+                        process.set_mailbox(wake_tid, xous::Result::Ok);
+                        process.set_thread_state(wake_tid, ThreadState::Ready);
+                        remaining -= 1;
+                    }
+                }
             });
             Ok(Result::Ok)
         }
@@ -835,20 +935,62 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         }
         #[cfg(beetos)]
         SysCall::WaitProcess(target_pid) => SystemServices::with_mut(|ss| {
-            // Park the thread FIRST, then check if process still exists.
-            // This avoids a race where the process exits between our check
-            // and the park — which would leave us blocked forever.
-            ss.set_thread_result(current_pid(), tid, Result::Ok)?;
-            ss.current_process_mut().set_thread_state(tid, ThreadState::WaitProcess { pid: target_pid });
-
-            // Now check: if the process already exited, wake immediately.
+            // If the process already exited, return immediately.
             if ss.process(target_pid).is_err() {
-                ss.current_process_mut().set_thread_state(tid, ThreadState::Ready);
-                ss.set_thread_result(current_pid(), tid, Result::Scalar1(0))?;
+                return Ok(Result::Scalar1(0));
             }
+
+            // Suspend with a kernel future. The wake path in
+            // terminate_current_process scans kernel_futures for
+            // WaitProcessExit { target_pid } and deposits the exit
+            // code into the mailbox.
+            suspend_with_future(
+                ss, tid,
+                KernelFuture::WaitProcessExit { target_pid },
+                crate::kfuture::EVENT_KERNEL,
+            );
 
             Scheduler::with_mut(|s| s.activate_current(ss))
         }),
+
+        #[cfg(beetos)]
+        SysCall::WaitEvent(mask) => {
+            if mask == 0 {
+                return Err(Error::InvalidArguments);
+            }
+            SystemServices::with_mut(|ss| {
+                let process = ss.current_process_mut();
+                let fired = process.take_notification_bits_masked(mask);
+                if fired != 0 {
+                    // Bits already pending — return immediately.
+                    return Ok(Result::Scalar1(fired));
+                }
+                // No matching bits — block the thread.
+                ss.set_thread_result(current_pid(), tid, Result::Ok)?;
+                ss.current_process_mut().set_thread_state(tid, ThreadState::WaitEvent { mask });
+                Scheduler::with_mut(|s| s.activate_current(ss))
+            })
+        }
+        #[cfg(beetos)]
+        SysCall::PollEvent => {
+            SystemServices::with_mut(|ss| {
+                let bits = ss.current_process_mut().take_notification_bits();
+                Ok(Result::Scalar1(bits))
+            })
+        }
+        #[cfg(beetos)]
+        SysCall::PostEvent(target_pid, bits) => {
+            if bits == 0 {
+                return Ok(Result::Ok);
+            }
+            SystemServices::with_mut(|ss| {
+                let process = ss.process_mut(target_pid)?;
+                if let Some((woken_tid, fired_bits)) = process.post_notification_bits(bits) {
+                    ss.set_thread_result(target_pid, woken_tid, Result::Scalar1(fired_bits)).ok();
+                }
+                Ok(Result::Ok)
+            })
+        }
 
         _ => Err(Error::UnhandledSyscall),
     };

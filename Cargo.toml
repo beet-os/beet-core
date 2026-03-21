@@ -18,6 +18,8 @@ members = [
     "api/fs",
     "api/storage",
     "os/app-manifest",
+    "xous/async-rt",
+    "examples/async-demo",
     "xtask",
     # apps/ and loader are no_std + aarch64 only, excluded from default workspace
 ]

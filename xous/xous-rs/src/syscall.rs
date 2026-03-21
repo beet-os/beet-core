@@ -470,6 +470,43 @@ pub enum SysCall {
     #[cfg(beetos)]
     NetGetInfo,
 
+    /// Block the calling thread until any notification bits matching `mask`
+    /// are set on the current process.  Returns the bits that fired
+    /// (intersection of pending bits and mask) and atomically clears them.
+    ///
+    /// # Returns
+    ///
+    /// * **Scalar1(bits)**: The notification bits that were set
+    ///
+    /// # Errors
+    ///
+    /// * **InvalidArguments**: The mask was zero.
+    #[cfg(beetos)]
+    WaitEvent(usize /* mask */),
+
+    /// Non-blocking check of the current process's notification bits.
+    /// Returns all pending bits and atomically clears them.
+    ///
+    /// # Returns
+    ///
+    /// * **Scalar1(bits)**: The notification bits that were set (0 if none)
+    #[cfg(beetos)]
+    PollEvent,
+
+    /// Post notification bits to a target process.  The bits are OR'd into
+    /// the target's pending notification word.  If any thread in the target
+    /// is blocked in `WaitEvent` with a matching mask, it is woken.
+    ///
+    /// # Returns
+    ///
+    /// * **Ok**: The bits were posted successfully
+    ///
+    /// # Errors
+    ///
+    /// * **ProcessNotFound**: The target PID does not exist
+    #[cfg(beetos)]
+    PostEvent(PID /* target */, usize /* bits */),
+
     #[cfg(beetos)]
     GetBinaryName(usize /* index */),
 
@@ -539,7 +576,10 @@ pub enum SysCallNumber {
     WaitProcess = 58,
     SpawnByNameWithArgs = 59,
     NetGetInfo = 60,
-    GetBinaryName = 61,
+    WaitEvent = 61,
+    PollEvent = 62,
+    PostEvent = 63,
+    GetBinaryName = 64,
 
     Invalid,
 }
@@ -607,7 +647,10 @@ impl SysCallNumber {
             58 => WaitProcess,
             59 => SpawnByNameWithArgs,
             60 => NetGetInfo,
-            61 => GetBinaryName,
+            61 => WaitEvent,
+            62 => PollEvent,
+            63 => PostEvent,
+            64 => GetBinaryName,
             _ => Invalid,
         }
     }
@@ -943,6 +986,18 @@ impl SysCall {
                 [SysCallNumber::NetGetInfo as usize, 0, 0, 0, 0, 0, 0, 0]
             }
             #[cfg(beetos)]
+            SysCall::WaitEvent(mask) => {
+                [SysCallNumber::WaitEvent as usize, *mask, 0, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::PollEvent => {
+                [SysCallNumber::PollEvent as usize, 0, 0, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::PostEvent(pid, bits) => {
+                [SysCallNumber::PostEvent as usize, pid.get() as usize, *bits, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
             SysCall::GetBinaryName(index) => {
                 [SysCallNumber::GetBinaryName as usize, *index, 0, 0, 0, 0, 0, 0]
             }
@@ -1134,6 +1189,14 @@ impl SysCall {
             #[cfg(beetos)]
             SysCallNumber::NetGetInfo => SysCall::NetGetInfo,
             #[cfg(beetos)]
+            SysCallNumber::WaitEvent => SysCall::WaitEvent(a1),
+            #[cfg(beetos)]
+            SysCallNumber::PollEvent => SysCall::PollEvent,
+            #[cfg(beetos)]
+            SysCallNumber::PostEvent => {
+                SysCall::PostEvent(PID::new(a1 as _).ok_or(Error::InvalidSyscall)?, a2)
+            }
+            #[cfg(beetos)]
             SysCallNumber::GetBinaryName => SysCall::GetBinaryName(a1),
 
             #[cfg(not(beetos))]
@@ -1147,6 +1210,9 @@ impl SysCall {
             | SysCallNumber::SpawnByNameWithArgs
             | SysCallNumber::WaitProcess
             | SysCallNumber::NetGetInfo
+            | SysCallNumber::WaitEvent
+            | SysCallNumber::PollEvent
+            | SysCallNumber::PostEvent
             | SysCallNumber::GetBinaryName => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
@@ -1259,6 +1325,16 @@ impl SysCall {
                 | SysCall::MapMemory(_, _, _, _)
                 | SysCall::UnmapMemory(_)
         )
+        // PostEvent and PollEvent are safe from IRQ context (non-blocking).
+        // WaitEvent is blocking and NOT safe from IRQ context.
+        || {
+            #[cfg(beetos)]
+            {
+                matches!(self, SysCall::PostEvent(_, _) | SysCall::PollEvent)
+            }
+            #[cfg(not(beetos))]
+            false
+        }
     }
 }
 
@@ -2251,6 +2327,44 @@ pub fn unpack_name_from_usize(args: &[usize; 4]) -> &[u8] {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, max_len) };
     let len = bytes.iter().position(|&b| b == 0).unwrap_or(max_len);
     &bytes[..len]
+}
+
+/// Block until any notification bits matching `mask` are set on the current
+/// process.  Returns the fired bits and atomically clears them.
+///
+/// If `mask` is 0, returns `InvalidArguments`.
+#[cfg(beetos)]
+#[inline]
+pub fn wait_event(mask: usize) -> core::result::Result<usize, Error> {
+    rsyscall(SysCall::WaitEvent(mask)).and_then(|result| match result {
+        Result::Scalar1(bits) => Ok(bits),
+        Result::Error(e) => Err(e),
+        _ => Err(Error::InternalError),
+    })
+}
+
+/// Non-blocking read of the current process's notification bits.
+/// Returns all pending bits and atomically clears them.
+#[cfg(beetos)]
+#[inline]
+pub fn poll_event() -> core::result::Result<usize, Error> {
+    rsyscall(SysCall::PollEvent).and_then(|result| match result {
+        Result::Scalar1(bits) => Ok(bits),
+        Result::Error(e) => Err(e),
+        _ => Err(Error::InternalError),
+    })
+}
+
+/// Post notification bits to a target process.  The bits are OR'd into
+/// the target's pending notification word and any matching waiters are woken.
+#[cfg(beetos)]
+#[inline]
+pub fn post_event(pid: PID, bits: usize) -> core::result::Result<(), Error> {
+    rsyscall(SysCall::PostEvent(pid, bits)).and_then(|result| match result {
+        Result::Ok => Ok(()),
+        Result::Error(e) => Err(e),
+        _ => Err(Error::InternalError),
+    })
 }
 
 /// Perform a raw syscall and return the result. This will transform
