@@ -79,7 +79,7 @@ pub const USER_IRQ_STACK_PAGE_COUNT: usize = 3;
 
 /// User stack.
 pub const USER_STACK_BOTTOM: usize = 0x0000_6FF0_0000_0000;
-pub const STACK_PAGE_COUNT: usize = 64;
+pub const STACK_PAGE_COUNT: usize = 256; // 4MB — std init + dlmalloc need >1MB
 pub const USER_STACK_TOP_GUARD: usize = USER_STACK_BOTTOM - PAGE_SIZE * (STACK_PAGE_COUNT + 1);
 
 /// End of user-accessible virtual address space.
