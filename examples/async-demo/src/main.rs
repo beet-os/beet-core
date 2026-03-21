@@ -1,67 +1,60 @@
 //! Async service demo for BeetOS.
 //!
-//! Shows how xous-async-rt lets a single thread handle messages from
-//! **two independent servers** concurrently — something impossible with
-//! blocking `xous::receive_message()` without spawning extra threads.
+//! Demonstrates `xous-async-rt` capabilities:
 //!
-//! ## What this demonstrates
-//!
-//! Traditional (blocking) Xous service — one server per thread:
-//!
-//! ```rust,no_run
-//! // Thread 1
-//! loop { let msg = xous::receive_message(server_a)?; handle_a(msg); }
-//! // Thread 2  (needs a whole new stack, PID slot, etc.)
-//! loop { let msg = xous::receive_message(server_b)?; handle_b(msg); }
-//! ```
-//!
-//! Async Xous service — multiple servers, single thread:
-//!
-//! ```rust,no_run
-//! let mut exec = Executor::new();
-//! exec.spawn(async { loop { let msg = server_a.next().await; handle_a(msg); } });
-//! exec.spawn(async { loop { let msg = server_b.next().await; handle_b(msg); } });
-//! exec.run(); // one thread drives both
-//! ```
+//! 1. **Two servers on one thread** — impossible with blocking
+//!    `receive_message` without extra threads/stacks.
+//! 2. **select with timeout** — handle a message OR timeout, whichever
+//!    comes first.
+//! 3. **join** — drive independent operations concurrently.
+//! 4. **Reactor-based scheduling** — only woken tasks are polled,
+//!    idle CPU is yielded to other Xous processes.
+
+use xous_async_rt::{select, AsyncServer, Either, Executor, Timer};
 
 fn main() {
-    // --- Create two independent Xous servers ---
     let sid_a = xous::create_server().expect("create server A");
     let sid_b = xous::create_server().expect("create server B");
 
     println!("async-demo: server A = {:?}", sid_a);
     println!("async-demo: server B = {:?}", sid_b);
 
-    // --- Build the executor and spawn async tasks ---
-    let mut executor = xous_async_rt::Executor::new();
+    let mut executor = Executor::new();
 
-    // Task 1: handle messages on server A
+    // Task 1: handle messages on server A with a timeout
     executor.spawn(async move {
-        let mut server = xous_async_rt::AsyncServer::new(sid_a);
+        let mut server = AsyncServer::new(sid_a);
         loop {
-            let envelope = server.next().await;
-            println!("  [A] received: {:?}", envelope.body);
+            match select(server.next(), Timer::after(500)).await {
+                Either::Left(envelope) => {
+                    println!("  [A] message: {:?}", envelope.body);
+                }
+                Either::Right(()) => {
+                    println!("  [A] timeout — no message in 500 ticks");
+                }
+            }
         }
     });
 
     // Task 2: handle messages on server B
     executor.spawn(async move {
-        let mut server = xous_async_rt::AsyncServer::new(sid_b);
+        let mut server = AsyncServer::new(sid_b);
         loop {
             let envelope = server.next().await;
-            println!("  [B] received: {:?}", envelope.body);
+            println!("  [B] message: {:?}", envelope.body);
         }
     });
 
-    // Task 3: a periodic "heartbeat" using the async timer
+    // Task 3: periodic heartbeat
     executor.spawn(async {
+        let mut count: u64 = 0;
         loop {
-            xous_async_rt::Timer::after_ms(100).await;
-            println!("  [heartbeat] tick");
+            Timer::after(200).await;
+            count += 1;
+            println!("  [heartbeat] tick #{}", count);
         }
     });
 
-    // --- Run the executor (drives all three tasks on one thread) ---
-    println!("async-demo: starting executor with 3 concurrent tasks...");
+    println!("async-demo: starting executor (3 tasks, 1 thread)...");
     executor.run();
 }
