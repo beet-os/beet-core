@@ -5,10 +5,9 @@
 //!
 //! Uses println! via the log server (IPC → UART), no direct UART access.
 
-#![no_main]
+use std::collections::HashMap;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn main() -> u32 {
+fn main() {
     println!("Hello, BeetOS!");
 
     // Test Box
@@ -33,7 +32,6 @@ pub extern "C" fn main() -> u32 {
 
     // Test HashMap
     println!("Creating HashMap...");
-    use std::collections::HashMap;
     let mut map: HashMap<&str, i32> = HashMap::new();
     map.insert("std", 1);
     map.insert("HashMap", 2);
@@ -42,11 +40,9 @@ pub extern "C" fn main() -> u32 {
     map.insert("Vec", 5);
     println!("HashMap len={}", map.len());
 
-    // Collect and sort keys
     let mut keys: Vec<&&str> = map.keys().collect();
     keys.sort();
     println!("Keys: {:?}", keys);
 
     println!("[done]");
-    0
 }
