@@ -167,6 +167,11 @@ fn handle_blocking_scalar(sender: xous::MessageSender, scalar: xous::ScalarMessa
             let disk_files = get_disk_archive().map(|a| a.count()).unwrap_or(0);
             xous::return_scalar5(sender, used, total, bytes, disk_size, disk_files).ok();
         }
+        id if id == FsOp::IsDir as usize => {
+            let path = beetos_api_fs::unpack_path(&args);
+            let result = do_is_dir(path);
+            xous::return_scalar(sender, result as usize).ok();
+        }
         _ => {
             xous::return_scalar(sender, FsError::InvalidPath as usize).ok();
         }
@@ -223,6 +228,21 @@ fn do_cat(path: &str) -> FsError {
         }
         Err(ramfs::FsError::NotFound) => FsError::NotFound,
         Err(ramfs::FsError::IsDirectory) => FsError::IsDirectory,
+        Err(_) => FsError::InvalidPath,
+    }
+}
+
+fn do_is_dir(path: &str) -> FsError {
+    // /disk itself and any disk subpath: directory if disk is present.
+    if is_disk_path(path) {
+        return if get_disk_archive().is_some() { FsError::Ok } else { FsError::NotFound };
+    }
+
+    // Use list with a no-op callback — it returns NotFound or NotDirectory for non-dirs.
+    match ramfs::list(path, |_name, _is_dir, _size| {}) {
+        Ok(()) => FsError::Ok,
+        Err(ramfs::FsError::NotFound) => FsError::NotFound,
+        Err(ramfs::FsError::NotDirectory) => FsError::NotDirectory,
         Err(_) => FsError::InvalidPath,
     }
 }

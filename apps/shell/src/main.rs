@@ -56,6 +56,7 @@ impl Write for UartWriter {
 
 const MAX_LINE: usize = 256;
 const MAX_ARGS: usize = 16;
+const MAX_PATH: usize = 256;
 
 struct Shell {
     line: [u8; MAX_LINE],
@@ -66,6 +67,57 @@ static mut SHELL: Shell = Shell {
     line: [0u8; MAX_LINE],
     pos: 0,
 };
+
+// Current working directory
+static mut CWD_BUF: [u8; MAX_PATH] = [0u8; MAX_PATH];
+static mut CWD_LEN: usize = 0;
+
+fn cwd_str() -> &'static str {
+    unsafe { core::str::from_utf8(&CWD_BUF[..CWD_LEN]).unwrap_or("/") }
+}
+
+/// Resolve `input` against CWD into `buf`, normalizing `.` and `..`.
+fn resolve_path<'a>(input: &str, buf: &'a mut [u8; MAX_PATH]) -> &'a str {
+    let mut tmp = [0u8; MAX_PATH];
+    let mut tlen = 0usize;
+
+    if !input.starts_with('/') {
+        let cwd = unsafe { &CWD_BUF[..CWD_LEN] };
+        let n = cwd.len().min(tmp.len());
+        tmp[..n].copy_from_slice(cwd);
+        tlen = n;
+        if tlen < tmp.len() { tmp[tlen] = b'/'; tlen += 1; }
+    }
+
+    for b in input.bytes() {
+        if tlen < tmp.len() { tmp[tlen] = b; tlen += 1; }
+    }
+
+    // Normalize: build output component by component
+    buf[0] = b'/';
+    let mut olen = 1usize;
+
+    for comp in tmp[..tlen].split(|&b| b == b'/') {
+        match comp {
+            b"" | b"." => {}
+            b".." => {
+                if olen > 1 {
+                    olen -= 1;
+                    while olen > 1 && buf[olen - 1] != b'/' { olen -= 1; }
+                    if olen > 1 { olen -= 1; }
+                }
+            }
+            _ => {
+                if olen > 1 { buf[olen] = b'/'; olen += 1; }
+                let n = comp.len().min(MAX_PATH - olen);
+                buf[olen..olen + n].copy_from_slice(&comp[..n]);
+                olen += n;
+            }
+        }
+    }
+
+    core::str::from_utf8(&buf[..olen]).unwrap_or("/")
+}
 
 fn prompt() { puts("bsh> "); }
 
@@ -134,6 +186,8 @@ fn execute_line(line: &[u8]) {
         "echo" => cmd_echo(cmd_args),
         "info" => cmd_info(),
         "pid" => cmd_pid(),
+        "pwd" => cmd_pwd(),
+        "cd" => cmd_cd(cmd_args),
 
         // FS operations (via IPC to fs service)
         "ls" => cmd_ls(cmd_args),
@@ -160,6 +214,8 @@ fn cmd_help() {
     puts("  echo [text...]    Print text\n");
     puts("  info              System information\n");
     puts("  pid               Show current process ID\n");
+    puts("  pwd               Print working directory\n");
+    puts("  cd [path]         Change directory (default: /)\n");
     puts("  ls [path]         List directory (ramfs or /disk/)\n");
     puts("  cat <path>        Display file contents\n");
     puts("  write <path> <text>  Write text to a file (ramfs only)\n");
@@ -190,6 +246,37 @@ fn cmd_pid() {
     match xous::rsyscall(xous::SysCall::GetProcessId) {
         Ok(xous::Result::Scalar1(pid)) => { let _ = write!(UartWriter, "PID: {}\n", pid); }
         _ => puts("pid: syscall failed\n"),
+    }
+}
+
+fn cmd_pwd() {
+    puts(cwd_str());
+    putc(b'\n');
+}
+
+fn cmd_cd(args: &[&str]) {
+    let target = if args.is_empty() { "/" } else { args[0] };
+    let mut buf = [0u8; MAX_PATH];
+    let resolved = resolve_path(target, &mut buf);
+
+    let packed = beetos_api_fs::pack_path(resolved);
+    match fs_scalar(FsOp::IsDir, packed[0], packed[1], packed[2], packed[3]) {
+        Some(code) if code == FsError::Ok as usize => {
+            unsafe {
+                let bytes = resolved.as_bytes();
+                let len = bytes.len().min(MAX_PATH);
+                CWD_BUF[..len].copy_from_slice(&bytes[..len]);
+                CWD_LEN = len;
+            }
+        }
+        Some(code) if code == FsError::NotFound as usize => {
+            let _ = write!(UartWriter, "cd: {}: no such directory\n", target);
+        }
+        Some(code) if code == FsError::NotDirectory as usize => {
+            let _ = write!(UartWriter, "cd: {}: not a directory\n", target);
+        }
+        None => puts("cd: fs service not available\n"),
+        _ => puts("cd: error\n"),
     }
 }
 
@@ -233,7 +320,12 @@ fn fs_scalar(op: FsOp, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> Op
 static mut LAST_STATS: (usize, usize, usize, usize, usize) = (0, 0, 0, 0, 0);
 
 fn cmd_ls(args: &[&str]) {
-    let path = if args.is_empty() { "/" } else { args[0] };
+    let mut buf = [0u8; MAX_PATH];
+    let path = if args.is_empty() {
+        resolve_path(".", &mut buf)
+    } else {
+        resolve_path(args[0], &mut buf)
+    };
     let packed = beetos_api_fs::pack_path(path);
     match fs_scalar(FsOp::Ls, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {}
@@ -250,7 +342,8 @@ fn cmd_ls(args: &[&str]) {
 
 fn cmd_cat(args: &[&str]) {
     if args.is_empty() { puts("usage: cat <path>\n"); return; }
-    let path = args[0];
+    let mut buf = [0u8; MAX_PATH];
+    let path = resolve_path(args[0], &mut buf);
     let packed = beetos_api_fs::pack_path(path);
     match fs_scalar(FsOp::Cat, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {}
@@ -267,7 +360,8 @@ fn cmd_cat(args: &[&str]) {
 
 fn cmd_write(args: &[&str], full_line: &str) {
     if args.len() < 2 { puts("usage: write <path> <text>\n"); return; }
-    let path = args[0];
+    let mut path_buf = [0u8; MAX_PATH];
+    let path = resolve_path(args[0], &mut path_buf);
     let content = if let Some(pos) = full_line.find(path) {
         let after_path = pos + path.len();
         full_line[after_path..].trim_start()
@@ -302,7 +396,9 @@ fn cmd_write(args: &[&str], full_line: &str) {
 
 fn cmd_mkdir(args: &[&str]) {
     if args.is_empty() { puts("usage: mkdir <path>\n"); return; }
-    let packed = beetos_api_fs::pack_path(args[0]);
+    let mut buf = [0u8; MAX_PATH];
+    let path = resolve_path(args[0], &mut buf);
+    let packed = beetos_api_fs::pack_path(path);
     match fs_scalar(FsOp::Mkdir, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::AlreadyExists as usize => {
@@ -318,7 +414,9 @@ fn cmd_mkdir(args: &[&str]) {
 
 fn cmd_rm(args: &[&str]) {
     if args.is_empty() { puts("usage: rm <path>\n"); return; }
-    let packed = beetos_api_fs::pack_path(args[0]);
+    let mut buf = [0u8; MAX_PATH];
+    let path = resolve_path(args[0], &mut buf);
+    let packed = beetos_api_fs::pack_path(path);
     match fs_scalar(FsOp::Remove, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::NotFound as usize => {
@@ -520,6 +618,8 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         core::arch::asm!("mov {}, x0", out(reg) uart_base, options(nomem, nostack));
         UART_BASE = uart_base;
+        CWD_BUF[0] = b'/';
+        CWD_LEN = 1;
     }
 
     // Print banner

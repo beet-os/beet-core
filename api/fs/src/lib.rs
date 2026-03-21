@@ -58,6 +58,11 @@ pub enum FsOp {
     /// BlockingScalar: arg1-arg4 = 0.
     /// Returns Scalar5(used_files, max_files, used_bytes, disk_size, disk_files).
     Stats = 5,
+
+    /// Check if a path is a directory (used by the shell's `cd` command).
+    /// BlockingScalar: arg1-arg4 = path packed.
+    /// Returns Scalar1(FsError): Ok=directory, NotFound, NotDirectory.
+    IsDir = 6,
 }
 
 /// Error codes returned by the FS service.
