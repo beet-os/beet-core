@@ -65,6 +65,18 @@ fn parse_platform(args: &[String]) -> String {
     "qemu-virt".to_string()
 }
 
+/// Find the stage1 rustc from the Rust fork (for building std-based apps).
+fn find_stage1_rustc(root: &std::path::Path) -> Option<PathBuf> {
+    let rust_root = root.parent()?.join("rust");
+    for host in &["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin"] {
+        let rustc = rust_root.join(format!("build/{host}/stage1/bin/rustc"));
+        if rustc.exists() {
+            return Some(rustc);
+        }
+    }
+    None
+}
+
 /// Build userspace binaries (apps/) for aarch64-unknown-none.
 fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
     let user_linker = root.join("apps/link-user.x");
@@ -74,7 +86,7 @@ fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
     let target_dir = ws_target.join("aarch64-unknown-none/debug");
 
     // Build all app/service crates (excluded from workspace, so use --manifest-path)
-    for app in &["hello", "shell", "procman", "fs", "hello-std"] {
+    for app in &["hello", "shell", "procman", "fs"] {
         println!("Building app: {app}");
         // procman and fs live in os/, everything else in apps/
         let manifest = if *app == "procman" || *app == "fs" {
@@ -105,6 +117,57 @@ fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
         println!("  {app}.stripped: {size} bytes");
     }
 
+    // Build hello-std with the custom stage1 rustc (aarch64-unknown-beetos target)
+    if let Some(stage1_rustc) = find_stage1_rustc(root) {
+        build_std_app(root, &stage1_rustc, &user_linker, &ws_target)?;
+    } else {
+        println!("  [skip] hello-std: stage1 rustc not found (build ../rust first)");
+    }
+
+    Ok(())
+}
+
+/// Build hello-std using the custom stage1 rustc with aarch64-unknown-beetos target.
+fn build_std_app(
+    root: &std::path::Path,
+    stage1_rustc: &std::path::Path,
+    user_linker: &std::path::Path,
+    ws_target: &std::path::Path,
+) -> anyhow::Result<()> {
+    println!("Building app: hello-std (with std, aarch64-unknown-beetos)");
+    let manifest = root.join("apps/hello-std/Cargo.toml");
+    let linker_arg = format!("-Clink-arg=-T{}", user_linker.display());
+
+    // The stage1 sysroot is the parent of bin/rustc (i.e. the stage1 directory)
+    let sysroot = stage1_rustc
+        .parent().expect("no parent for rustc")
+        .parent().expect("no grandparent for rustc");
+    let sysroot_arg = format!("--sysroot={}", sysroot.display());
+
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--manifest-path",
+            manifest.to_str().expect("non-UTF8 path"),
+            "--target-dir",
+            ws_target.to_str().expect("non-UTF8 path"),
+            "--target",
+            "aarch64-unknown-beetos",
+        ])
+        .env("RUSTC", stage1_rustc)
+        .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1 {sysroot_arg}"))
+        .status()?;
+    anyhow::ensure!(status.success(), "building app 'hello-std' failed");
+
+    // Strip and copy to the no_std target dir so include_bytes! can find it
+    let std_target_dir = ws_target.join("aarch64-unknown-beetos/debug");
+    let nostd_target_dir = ws_target.join("aarch64-unknown-none/debug");
+    let elf = std_target_dir.join("hello-std");
+    let stripped = nostd_target_dir.join("hello-std.stripped");
+    strip_binary(&elf, &stripped)?;
+
+    let size = std::fs::metadata(&stripped)?.len();
+    println!("  hello-std.stripped: {size} bytes");
     Ok(())
 }
 
