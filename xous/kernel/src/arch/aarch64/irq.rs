@@ -320,10 +320,39 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
     // Step 3: Load the *current* process's context into the stack frame.
     // After a context switch, CURRENT_PID may differ from caller_pid.
     // This loads the correct process's registers for ERET.
+    idle_wait_then_load(frame);
+}
+
+/// If the scheduler chose PID 1 (kernel idle), wait for IRQs at EL1 until a
+/// real user process becomes runnable, then load its context into `frame`.
+///
+/// Without this, the SVC return path would ERET to EL0 with ELR=0x0 (the
+/// bogus entry point set in `init_pid1`), causing an immediate IABT.
+unsafe fn idle_wait_then_load(frame: *mut super::process::Thread) {
+    use super::process::Process;
+
+    loop {
+        let pid = crate::arch::process::current_pid();
+        if pid.get() != 1 {
+            break;
+        }
+        // Enable IRQs, wait for an interrupt, then re-mask.
+        // The kernel IRQ handler (EL1 SPx) will run and return here.
+        core::arch::asm!(
+            "msr daifclr, #2",
+            "wfi",
+            "msr daifset, #2",
+            options(nomem, nostack),
+        );
+        // Re-run the scheduler: a newly-ready process may now be available.
+        let _ = crate::services::SystemServices::with_mut(|ss| {
+            crate::scheduler::Scheduler::with_mut(|s| s.activate_current(ss))
+        });
+    }
+
     let resume_proc = Process::current();
     let resume_tid = resume_proc.current_tid();
     resume_proc.load_context_from_table(resume_tid, frame);
-
 }
 
 /// Handle a data or instruction abort.
@@ -367,9 +396,7 @@ unsafe fn _handle_abort(context: *mut u8, esr: u64, is_instruction: bool) {
     });
 
     // Load the next process's context so restore_context + ERET runs it.
-    let resume_proc = Process::current();
-    let resume_tid = resume_proc.current_tid();
-    resume_proc.load_context_from_table(resume_tid, frame);
+    idle_wait_then_load(frame);
 }
 
 /// Handle an unknown exception type.
