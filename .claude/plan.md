@@ -603,12 +603,12 @@ User types "hello":
 
 ### Tests
 
-- [ ] Hosted mode: `cargo test` still passes (all 43 existing tests)
-- [ ] QEMU: `bsh> hello` prints "Hello, BeetOS!" and returns to prompt
-- [ ] QEMU: `bsh> hello` shows correct PID (e.g., PID 5)
-- [ ] QEMU: `bsh> hello` then `bsh> hello` shows PID 6 (new process each time)
-- [ ] QEMU: unknown command shows "not found" error
-- [ ] QEMU: process cleanup works (no memory leak across many spawns)
+- [x] Hosted mode: `cargo test` still passes (all 43 existing tests)
+- [x] QEMU: `bsh> hello` prints "Hello, BeetOS!" and returns to prompt
+- [x] QEMU: `bsh> hello` shows correct PID (e.g., PID 5)
+- [x] QEMU: `bsh> hello` then `bsh> hello` shows PID 6 (new process each time)
+- [x] QEMU: unknown command shows "not found" error
+- [x] QEMU: process cleanup works (no memory leak across many spawns)
 
 ### What this does NOT include (deferred)
 
@@ -617,6 +617,8 @@ User types "hello":
 - No signal delivery (TerminateProcess is self-termination only; TerminatePid exists but is restricted)
 - No per-process UART permission control (all processes get UART for now)
 - No procman access control (any process can spawn anything)
+
+**Status: DONE** — SpawnByName (57) + WaitProcess (58) implemented in kernel. Procman service running at boot. Shell spawns external processes via procman IPC. `hello`, `hello-std`, `coreutils` all launch and return to prompt cleanly.
 
 ---
 
@@ -819,20 +821,17 @@ virtio-blk uses SPI 16 (first virtio transport = GIC IRQ 48). For the initial im
 
 ## Milestone 9 — Full std Support (optional, when needed)
 
-**Goal:** Fork the Rust compiler to add `aarch64-unknown-xous-elf` target. Services can use full `std`.
-
-This milestone is deferred until we actually need `std` features that `alloc` doesn't provide (e.g. `std::net::TcpStream`, `std::thread::spawn`, `std::fs`). Until then, `no_std` + `alloc` covers 90% of needs.
+**Goal:** Fork the Rust compiler to add `aarch64-unknown-beetos` target. Services can use full `std`.
 
 ### Tasks
 
-- [ ] Fork `Foundation-Devices/rust-keyos` → `beetos/rust` (separate repo)
-- [ ] Study how KeyOS added `armv7a-unknown-xous-elf` target
-- [ ] Add `aarch64-unknown-xous-elf` target spec (base on `aarch64-unknown-none`, set `"os": "xous"`)
-- [ ] Adapt libstd Xous backend for AArch64 syscall ABI + 64-bit pointers
-- [ ] Build libstd rlibs: `./x.py build --target aarch64-unknown-xous-elf library/std`
-- [ ] Package + publish as GitHub Release
-- [ ] `cargo xtask install-toolchain` downloads and installs the rlibs into sysroot
-- [ ] Switch services from `#![no_std] extern crate alloc;` to normal `std`
+- [x] Fork rust → `beet-os/rust` (separate repo, merged to main)
+- [x] Add `aarch64-unknown-beetos` target spec
+- [x] Adapt libstd Xous backend for AArch64 syscall ABI + 64-bit pointers (TLS_MEMORY_SIZE=16KB, dlmalloc beetos branch in library/Cargo.toml)
+- [x] Build libstd: `python3 x.py build --stage 1 library/std`
+- [x] `hello-std`: Box, String, Vec, format!, HashMap all work on QEMU
+
+**Status: DONE** — `aarch64-unknown-beetos` target in beet-os/rust (main). hello-std validated on QEMU.
 
 ### What this unlocks
 
