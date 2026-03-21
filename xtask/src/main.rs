@@ -407,6 +407,14 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
         ]);
     }
 
+    // Add virtio-net (user-mode networking; QEMU assigns 10.0.2.15 via DHCP)
+    qemu_args.extend_from_slice(&[
+        "-netdev".to_string(),
+        "user,id=net0".to_string(),
+        "-device".to_string(),
+        "virtio-net-device,netdev=net0".to_string(),
+    ]);
+
     let status = Command::new("qemu-system-aarch64")
         .args(&qemu_args)
         .status()?;
@@ -541,6 +549,14 @@ fn test() -> anyhow::Result<()> {
             "virtio-blk-device,drive=disk0".to_string(),
         ]);
     }
+
+    // Add virtio-net (user-mode networking)
+    qemu_args.extend_from_slice(&[
+        "-netdev".to_string(),
+        "user,id=net0".to_string(),
+        "-device".to_string(),
+        "virtio-net-device,netdev=net0".to_string(),
+    ]);
 
     let mut child = Command::new("qemu-system-aarch64")
         .args(&qemu_args)

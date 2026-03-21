@@ -16,6 +16,8 @@
 
 pub mod blk;
 pub mod gic;
+pub mod net;
+pub mod net_stack;
 pub mod timer;
 pub mod uart;
 pub mod virtio;
@@ -45,6 +47,8 @@ pub fn init() {
     uart::puts("Timer: initialized\n");
 
     blk::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
+    net::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
+    net_stack::init();
 }
 
 /// Halt the system.
