@@ -247,15 +247,22 @@ fn send_char_to_console(c: u8) {
             let sender = xous::MessageSender::from_usize(0); // kernel sender
             let envelope = xous::MessageEnvelope { sender, body: msg };
 
-            ss.process_mut(server_pid)
-                .map(|p| p.set_thread_state(server_tid, crate::process::ThreadState::Ready))
-                .ok();
+            if let Ok(p) = ss.process_mut(server_pid) {
+                p.take_kernel_future(server_tid);
+                p.set_thread_state(server_tid, crate::process::ThreadState::Ready);
+            }
             ss.set_thread_result(server_pid, server_tid, xous::Result::MessageEnvelope(envelope))
                 .ok();
         } else {
             // Queue the message for later pickup
             let kernel_pid = xous::PID::new(1).unwrap();
             ss.queue_server_message(sidx, kernel_pid, 1, msg, None).ok();
+            // Wake the server thread so it polls the queue via its kernel future
+            if let Ok(process) = ss.process_mut(server_pid) {
+                if let Some((woken_tid, fired_bits)) = process.post_notification_bits(1) {
+                    ss.set_thread_result(server_pid, woken_tid, xous::Result::Scalar1(fired_bits)).ok();
+                }
+            }
         }
     });
 }

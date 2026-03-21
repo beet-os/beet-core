@@ -223,7 +223,9 @@ pub(crate) fn send_message_inner(
         klog!("server connection data: sidx: {}, idx: {}, server pid: {}", sidx, sender_idx, server_pid);
         let envelope = MessageEnvelope { sender: sender.into(), body: message };
 
-        ss.process_mut(server_pid).unwrap().set_thread_state(server_tid, ThreadState::Ready);
+        let proc = ss.process_mut(server_pid).unwrap();
+        proc.take_kernel_future(server_tid);
+        proc.set_thread_state(server_tid, ThreadState::Ready);
         // This only fails if the PID does not exist, in which case we can just drop the result.
         ss.set_thread_result(server_pid, server_tid, Result::MessageEnvelope(envelope)).ok();
     } else {
@@ -362,9 +364,9 @@ fn receive_message(tid: TID, sid: SID, blocking: ExecutionType) -> SysCallResult
                 return Ok(Result::None);
             }
 
-            // In hosted mode: also park thread on the server so
-            // send_message_inner can find it via take_available_thread.
-            #[cfg(not(beetos))]
+            // Park thread on the server so send_message_inner (and
+            // send_char_to_console on hardware) can find it via
+            // take_available_thread for direct delivery.
             server.park_thread(tid);
         }
         // `server` borrow released here — safe to borrow `ss` again.
