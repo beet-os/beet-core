@@ -14,6 +14,7 @@ mod debug;
 #[cfg(all(test, not(beetos)))]
 mod test;
 
+mod kfuture;
 mod arch;
 
 #[macro_use]

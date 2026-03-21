@@ -279,35 +279,55 @@ fn receive_message(tid: TID, sid: SID, blocking: ExecutionType) -> SysCallResult
     SystemServices::with_mut(|ss| {
         // See if there is a pending message.  If so, return immediately.
         let sidx = ss.sidx_from_sid(sid, current_pid()).ok_or(Error::ServerNotFound)?;
-        let server = ss.server_from_sidx_mut(sidx).ok_or(Error::ServerNotFound)?;
-        // server.print_queue();
 
-        // Ensure the server is for this PID
-        if server.pid != current_pid() {
-            return Err(Error::ServerNotFound);
-        }
+        {
+            let server = ss.server_from_sidx_mut(sidx).ok_or(Error::ServerNotFound)?;
 
-        let queue_was_full = server.is_queue_full();
-        // If there is a pending message, return it immediately.
-        if let Some(msg) = server.take_next_message(sidx) {
-            klog!("waiting messages found -- returning {:x?}", msg);
-            if queue_was_full && !server.is_queue_full() {
-                ss.wake_threads_with_state(ThreadState::RetryQueueFull { sidx }, usize::MAX);
+            // Ensure the server is for this PID
+            if server.pid != current_pid() {
+                return Err(Error::ServerNotFound);
             }
-            return Ok(Result::MessageEnvelope(msg));
+
+            let queue_was_full = server.is_queue_full();
+            // If there is a pending message, return it immediately.
+            if let Some(msg) = server.take_next_message(sidx) {
+                klog!("waiting messages found -- returning {:x?}", msg);
+                if queue_was_full && !server.is_queue_full() {
+                    ss.wake_threads_with_state(ThreadState::RetryQueueFull { sidx }, usize::MAX);
+                }
+                return Ok(Result::MessageEnvelope(msg));
+            }
+
+            if blocking == ExecutionType::NonBlocking {
+                klog!("nonblocking message -- returning None");
+                return Ok(Result::None);
+            }
+
+            // In hosted mode: park thread on the server (legacy path).
+            #[cfg(not(beetos))]
+            server.park_thread(tid);
+        }
+        // `server` borrow released here — safe to borrow `ss` again.
+
+        // There is no pending message — suspend the thread.
+        klog!("did not have any waiting messages -- suspending thread {}", tid);
+
+        // On hardware: store a kernel future and suspend via WaitEvent.
+        // The scheduler polls the future when the thread is woken.
+        #[cfg(beetos)]
+        {
+            use crate::kfuture::{KernelFuture, EVENT_SERVER_MSG};
+            let process = ss.current_process_mut();
+            process.set_kernel_future(tid, KernelFuture::ReceiveMessage { sidx });
+            process.set_thread_state(tid, ThreadState::WaitEvent { mask: EVENT_SERVER_MSG });
         }
 
-        if blocking == ExecutionType::NonBlocking {
-            klog!("nonblocking message -- returning None");
-            return Ok(Result::None);
+        // In hosted mode: use legacy WaitReceive state.
+        #[cfg(not(beetos))]
+        {
+            ss.current_process_mut().set_thread_state(tid, ThreadState::WaitReceive { sidx });
         }
-        // There is no pending message, so return control to the parent
-        // process and mark ourselves as awaiting an event.  When a message
-        // arrives, our return value will already be set to the
-        // MessageEnvelope of the incoming message.
-        klog!("did not have any waiting messages -- parking thread {}", tid);
-        server.park_thread(tid);
-        ss.current_process_mut().set_thread_state(tid, ThreadState::WaitReceive { sidx });
+
         Scheduler::with_mut(|s| s.activate_current(ss))
     })
 }

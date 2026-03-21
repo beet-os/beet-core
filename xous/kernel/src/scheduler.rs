@@ -207,42 +207,76 @@ impl Scheduler {
 
     #[cfg(beetos)]
     pub fn activate_current(&mut self, services: &mut SystemServices) -> SysCallResult {
+        use crate::kfuture::{PollResult, EVENT_SERVER_MSG};
+        use crate::process::ThreadState;
+
         if self.in_irq_handler {
             return Ok(xous::Result::ResumeProcess);
         }
         let current_pid = current_pid();
         let current_tid = ArchProcess::with_current(|p| p.current_tid());
 
-        let (next_pid, next_tid) =
-            self.queue_heads[self.highest_ready_priority].expect("Highest prio head was empty");
+        // ── Poll kernel futures on the selected thread ───────────────
+        //
+        // If the next-to-run thread has an in-flight kernel future
+        // (e.g. a suspended ReceiveMessage), poll it before switching.
+        // If the future is still Pending, re-park the thread and pick
+        // another one.
+        loop {
+            let (next_pid, next_tid) =
+                self.queue_heads[self.highest_ready_priority].expect("Highest prio head was empty");
 
-        if next_pid == current_pid && next_tid == current_tid {
+            // Take the future out (avoids borrow conflict with services).
+            let future = services
+                .process_mut(next_pid)
+                .expect("Chosen process did not exist")
+                .take_kernel_future(next_tid);
+
+            if let Some(kf) = future {
+                match kf.poll(services, next_pid) {
+                    PollResult::Ready(result) => {
+                        // Future completed — deliver the result to the thread.
+                        services.set_thread_result(next_pid, next_tid, result?).ok();
+                        // Fall through to normal activation.
+                    }
+                    PollResult::Pending => {
+                        // Not ready yet — put the future back, re-park the
+                        // thread, and try the next thread in the queue.
+                        let process = services.process_mut(next_pid).expect("process missing");
+                        process.set_kernel_future(next_tid, kf);
+                        process.set_thread_state(
+                            next_tid,
+                            ThreadState::WaitEvent { mask: EVENT_SERVER_MSG },
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // ── Normal activation path ────────────────────────────────
+            if next_pid == current_pid && next_tid == current_tid {
+                return Ok(xous::Result::ResumeProcess);
+            }
+
+            #[cfg(beetos)]
+            {
+                use crate::platform::{cancel_preemption, setup_preemption, start_measuring_idle};
+
+                let usage = cancel_preemption();
+                if usage > 1 && usage != self.cpu_usage[self.cpu_usage_index].1 {
+                    self.cpu_usage_index = (self.cpu_usage_index + 1) % self.cpu_usage.len();
+                    self.cpu_usage[self.cpu_usage_index] = (self.currently_measuring, usage);
+                }
+                if next_pid.get() == 1 {
+                    start_measuring_idle();
+                } else {
+                    setup_preemption(PROCESS_TIMESLICE_MS);
+                }
+                self.currently_measuring = next_pid.get();
+            }
+            services.process(next_pid).expect("Chosen process did not exist").activate();
+            let _ = ArchProcess::current().set_tid(next_tid);
             return Ok(xous::Result::ResumeProcess);
         }
-
-        // set up the preemption interrupt if we are switching away. Keep in mind that preemption is
-        // more of a safety feature, so the exact logic of this is not important.
-        #[cfg(beetos)]
-        {
-            use crate::platform::{cancel_preemption, setup_preemption, start_measuring_idle};
-
-            let usage = cancel_preemption();
-            // Don't pollute the table with short slices, and also handle the glitch case
-            // where we were so fast that the timer couldn't even reset in time
-            // (it waits for the next valid clock edge before actually resetting to 0)
-            if usage > 1 && usage != self.cpu_usage[self.cpu_usage_index].1 {
-                self.cpu_usage_index = (self.cpu_usage_index + 1) % self.cpu_usage.len();
-                self.cpu_usage[self.cpu_usage_index] = (self.currently_measuring, usage);
-            }
-            if next_pid.get() == 1 {
-                start_measuring_idle();
-            } else {
-                setup_preemption(PROCESS_TIMESLICE_MS);
-            }
-            self.currently_measuring = next_pid.get();
-        }
-        services.process(next_pid).expect("Chosen process did not exist").activate();
-        let _ = ArchProcess::current().set_tid(next_tid);
-        Ok(xous::Result::ResumeProcess)
     }
 }

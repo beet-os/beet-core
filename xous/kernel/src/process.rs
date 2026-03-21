@@ -9,6 +9,7 @@ use xous::{AppId, Error, MessageId, SystemEvent, ThreadPriority, CID, NUM_SYSTEM
 use crate::arch::mem::MemoryMapping;
 pub use crate::arch::process::Process as ArchProcess;
 pub use crate::arch::process::{current_pid, MAX_THREAD_COUNT};
+use crate::kfuture::KernelFuture;
 use crate::scheduler::Scheduler;
 use crate::server::MessagePermissions;
 #[cfg(beetos)]
@@ -73,6 +74,13 @@ pub struct Process {
     /// Pending notification bits (posted via PostEvent, consumed via WaitEvent/PollEvent).
     /// Bits are OR'd in by PostEvent and atomically cleared by WaitEvent/PollEvent.
     notification_bits: usize,
+
+    /// Per-thread kernel futures for in-flight async syscalls.
+    /// When a thread blocks on a syscall (e.g. ReceiveMessage), a
+    /// `KernelFuture` is stored here instead of encoding the state
+    /// in `ThreadState`.  The scheduler polls the future when the
+    /// thread is woken.
+    kernel_futures: [Option<KernelFuture>; MAX_THREAD_COUNT],
 }
 
 #[derive(Debug, Default)]
@@ -150,6 +158,7 @@ impl Process {
             #[cfg(beetos)]
             aslr_slide: 0,
             notification_bits: 0,
+            kernel_futures: [const { None }; MAX_THREAD_COUNT],
         }
     }
 
@@ -169,6 +178,7 @@ impl Process {
 
         for tid in 1..MAX_THREAD_COUNT {
             self.set_thread_state(tid, ThreadState::Free);
+            self.kernel_futures[tid] = None;
         }
 
         // Free all associated memory pages
@@ -312,6 +322,27 @@ impl Process {
 
     pub fn get_event_handler(&self, event: SystemEvent) -> Option<(SID, MessageId)> {
         self.event_handlers[event as usize].as_ref().map(|e| (e.sid, e.message_id))
+    }
+
+    /// Store a kernel future on the given thread.
+    pub fn set_kernel_future(&mut self, tid: TID, future: KernelFuture) {
+        if tid < MAX_THREAD_COUNT {
+            self.kernel_futures[tid] = Some(future);
+        }
+    }
+
+    /// Take (remove and return) the kernel future from the given thread.
+    pub fn take_kernel_future(&mut self, tid: TID) -> Option<KernelFuture> {
+        if tid < MAX_THREAD_COUNT {
+            self.kernel_futures[tid].take()
+        } else {
+            None
+        }
+    }
+
+    /// Check if the given thread has a pending kernel future.
+    pub fn has_kernel_future(&self, tid: TID) -> bool {
+        tid < MAX_THREAD_COUNT && self.kernel_futures[tid].is_some()
     }
 
     /// Read and clear all pending notification bits.
