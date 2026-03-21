@@ -25,6 +25,7 @@ bitvec = { version = "1.0.1", default-features = false }
 beetos = { path = "../../beetos" }
 xous = { path = "../xous-rs", features = ["forget-memory-messages"] }
 beetos-api-console = { path = "../../api/console" }
+beetos-api-storage = { path = "../../api/storage" }
 
 # Hardware dependencies will be added in M1 when we implement arch/aarch64
 # [target.'cfg(beetos)'.dependencies]

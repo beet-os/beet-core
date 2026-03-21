@@ -1,0 +1,8 @@
+[package]
+name = "beetos-api-storage"
+version = "0.1.0"
+edition = "2021"
+description = "BeetOS block storage API — BlockDevice trait and error types"
+license = "MIT OR Apache-2.0"
+
+[dependencies]

@@ -16,6 +16,7 @@ members = [
     "api/console",
     "api/procman",
     "api/fs",
+    "api/storage",
     "os/app-manifest",
     "xtask",
     # apps/ and loader are no_std + aarch64 only, excluded from default workspace

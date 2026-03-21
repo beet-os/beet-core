@@ -173,6 +173,35 @@ pub enum BlkError {
     DeviceFailed,
 }
 
+/// Zero-sized handle to the QEMU virtio-blk device.
+///
+/// Implements `beetos_api_storage::BlockDevice` so the filesystem service
+/// and any other consumer can depend on the platform-agnostic trait rather
+/// than calling `blk::read_sectors()` / `blk::write_sectors()` directly.
+pub struct VirtioBlk;
+
+impl beetos_api_storage::BlockDevice for VirtioBlk {
+    fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), beetos_api_storage::BlockError> {
+        read_sectors(lba, buf).map_err(|e| match e {
+            BlkError::OutOfRange => beetos_api_storage::BlockError::OutOfRange,
+            BlkError::NoDevice   => beetos_api_storage::BlockError::NotReady,
+            _                    => beetos_api_storage::BlockError::IoError,
+        })
+    }
+
+    fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), beetos_api_storage::BlockError> {
+        write_sectors(lba, buf).map_err(|e| match e {
+            BlkError::OutOfRange => beetos_api_storage::BlockError::OutOfRange,
+            BlkError::NoDevice   => beetos_api_storage::BlockError::NotReady,
+            _                    => beetos_api_storage::BlockError::IoError,
+        })
+    }
+
+    fn capacity_sectors(&self) -> u64 {
+        capacity()
+    }
+}
+
 /// Handle a virtio-blk interrupt. Called from the IRQ handler.
 pub fn handle_irq() {
     unsafe {
