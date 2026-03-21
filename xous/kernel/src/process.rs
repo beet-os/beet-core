@@ -119,7 +119,6 @@ pub enum ConnectionSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ThreadState {
-    // ── Universal (used on both hosted and hardware) ─────────────
     /// Unallocated
     Free,
     /// Either running or ready to run immediately
@@ -128,25 +127,10 @@ pub enum ThreadState {
     RetryConnect { sid_hash: u32 },
     /// Retrying a send() call because the server's queue was full.
     RetryQueueFull { sidx: usize },
-    /// Waiting on WaitEvent(mask) — blocked until notification_bits & mask != 0.
-    /// On hardware, this is the universal "parked" state: a KernelFuture
-    /// holds the syscall-specific details.
+    /// Waiting — blocked until notification_bits & mask != 0.
+    /// A `KernelFuture` stored per-thread holds the syscall-specific
+    /// details (server index, target PID, futex address, etc.).
     WaitEvent { mask: usize },
-
-    // ── Hosted mode only ─────────────────────────────────────────
-    // On hardware, these are replaced by KernelFuture variants stored
-    // per-thread.  The kernel future holds the scan key (target_pid,
-    // target_tid, addr) and the result mailbox handles wake delivery.
-    /// Waiting on join_thread()
-    WaitJoin { tid: usize },
-    /// Waiting on a blocking message send() to return
-    WaitBlocking { sidx: usize },
-    /// Waiting on a receive()
-    WaitReceive { sidx: usize },
-    /// Waiting on futex_wait()
-    WaitFutex { addr: usize },
-    /// Waiting for a process to exit via WaitProcess syscall
-    WaitProcess { pid: PID },
 }
 
 #[derive(Debug, Clone)]
@@ -506,34 +490,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thread_state_wait_process_equality() {
-        let pid3 = PID::new(3).unwrap();
-        let pid4 = PID::new(4).unwrap();
-        let state_a = ThreadState::WaitProcess { pid: pid3 };
-        let state_b = ThreadState::WaitProcess { pid: pid3 };
-        let state_c = ThreadState::WaitProcess { pid: pid4 };
-
-        assert_eq!(state_a, state_b, "same PID should match");
-        assert_ne!(state_a, state_c, "different PID should not match");
-        assert_ne!(state_a, ThreadState::Ready);
-        assert_ne!(state_a, ThreadState::Free);
-    }
-
-    #[test]
     fn thread_state_variants_are_distinct() {
-        let pid = PID::new(2).unwrap();
         let states = [
             ThreadState::Free,
             ThreadState::Ready,
-            ThreadState::WaitJoin { tid: 1 },
-            ThreadState::WaitBlocking { sidx: 0 },
-            ThreadState::WaitReceive { sidx: 0 },
-            ThreadState::WaitFutex { addr: 0x1000 },
-            ThreadState::WaitProcess { pid },
             ThreadState::RetryConnect { sid_hash: 42 },
             ThreadState::RetryQueueFull { sidx: 0 },
+            ThreadState::WaitEvent { mask: 1 },
         ];
-        // Each variant should be unique
         for (i, a) in states.iter().enumerate() {
             for (j, b) in states.iter().enumerate() {
                 if i != j {
@@ -545,8 +509,7 @@ mod tests {
 
     #[test]
     fn thread_state_copy_semantics() {
-        let pid = PID::new(5).unwrap();
-        let state = ThreadState::WaitProcess { pid };
+        let state = ThreadState::WaitEvent { mask: 0x3 };
         let copied = state; // Copy
         assert_eq!(state, copied);
     }

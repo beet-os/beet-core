@@ -237,17 +237,22 @@ fn for_each_process_debug_row(mut on_row: impl FnMut(ProcessDebugRow<'_>)) -> Pr
 
             let mut thread_states = [' '; MAX_THREAD_COUNT];
             for (tid, state) in thread_states.iter_mut().enumerate() {
-                *state = match process.thread_state(tid) {
+                use crate::kfuture::KernelFuture;
+                let ts = process.thread_state(tid);
+                let kf = process.kernel_future(tid);
+                *state = match ts {
                     ThreadState::Free => ' ',
                     ThreadState::Ready => 'R',
-                    ThreadState::WaitJoin { .. } => 'j',
                     ThreadState::RetryConnect { .. } => 'c',
                     ThreadState::RetryQueueFull { .. } => 'q',
-                    ThreadState::WaitBlocking { .. } => 'b',
-                    ThreadState::WaitReceive { .. } => 'w',
-                    ThreadState::WaitFutex { .. } => 'f',
-                    ThreadState::WaitProcess { .. } => 'p',
-                    ThreadState::WaitEvent { .. } => 'e',
+                    ThreadState::WaitEvent { .. } => match kf {
+                        Some(KernelFuture::ReceiveMessage { .. }) => 'w',
+                        Some(KernelFuture::WaitBlocking) => 'b',
+                        Some(KernelFuture::WaitProcessExit { .. }) => 'p',
+                        Some(KernelFuture::WaitJoin { .. }) => 'j',
+                        Some(KernelFuture::WaitFutex { .. }) => 'f',
+                        None => 'e',
+                    },
                 };
             }
 

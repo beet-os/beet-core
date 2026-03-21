@@ -9,7 +9,6 @@ use xous::{
 };
 
 use crate::irq::{interrupt_claim_user, interrupt_free};
-#[cfg(beetos)]
 use crate::kfuture::KernelFuture;
 use crate::mem::{MemoryManager, PAGE_SIZE};
 use crate::process::{current_pid, ConnectionSlot, ThreadState, IRQ_TID};
@@ -32,6 +31,15 @@ enum ExecutionType {
 /// `set_thread_result`.
 ///
 /// In both cases, the thread state is set to `Ready`.
+/// Wake a blocked thread and deliver a result.
+///
+/// If the thread has a kernel future:
+/// - **Hardware**: deposits the result in the thread's mailbox.
+///   `activate_current` will poll the future and deliver the result.
+/// - **Hosted**: consumes the future and delivers the result directly
+///   via `set_thread_result` (no polling needed).
+///
+/// If the thread has no kernel future, delivers the result directly.
 #[allow(dead_code)]
 pub(crate) fn wake_thread_with_result(
     ss: &mut SystemServices,
@@ -49,10 +57,12 @@ pub(crate) fn wake_thread_with_result(
             }
         }
     }
-    // Legacy path (hosted mode or no kernel future).
-    ss.process_mut(pid)
-        .map(|p| p.set_thread_state(tid, ThreadState::Ready))
-        .ok();
+    // Hosted mode (or no kernel future): consume future if present,
+    // deliver result directly.
+    if let Ok(process) = ss.process_mut(pid) {
+        process.take_kernel_future(tid);
+        process.set_thread_state(tid, ThreadState::Ready);
+    }
     ss.set_thread_result(pid, tid, result).ok();
 }
 
@@ -63,7 +73,6 @@ pub(crate) fn wake_thread_with_result(
 /// and `activate_current` polls the future to produce the syscall result.
 ///
 /// This is the single suspension primitive for all async syscalls.
-#[cfg(beetos)]
 pub(crate) fn suspend_with_future(ss: &mut SystemServices, tid: TID, future: KernelFuture, mask: usize) {
     let process = ss.current_process_mut();
     process.set_kernel_future(tid, future);
@@ -94,16 +103,11 @@ pub(crate) fn send_message(sender_tid: TID, cid: CID, message: Message) -> SysCa
         send_message_inner(ss, sender_tid, sidx, message)?;
 
         if blocking {
-            // On hardware: use kernel future + mailbox.
-            #[cfg(beetos)]
             suspend_with_future(
                 ss, sender_tid,
                 KernelFuture::WaitBlocking,
                 crate::kfuture::EVENT_KERNEL,
             );
-            // In hosted mode: legacy WaitBlocking state.
-            #[cfg(not(beetos))]
-            ss.current_process_mut().set_thread_state(sender_tid, ThreadState::WaitBlocking { sidx });
         } else {
             ss.set_thread_result(current_pid(), sender_tid, Result::Ok)?;
         }
@@ -358,28 +362,19 @@ fn receive_message(tid: TID, sid: SID, blocking: ExecutionType) -> SysCallResult
                 return Ok(Result::None);
             }
 
-            // In hosted mode: park thread on the server (legacy path).
+            // In hosted mode: also park thread on the server so
+            // send_message_inner can find it via take_available_thread.
             #[cfg(not(beetos))]
             server.park_thread(tid);
         }
         // `server` borrow released here — safe to borrow `ss` again.
 
-        // There is no pending message — suspend the thread.
         klog!("did not have any waiting messages -- suspending thread {}", tid);
-
-        // On hardware: suspend with a kernel future.
-        #[cfg(beetos)]
         suspend_with_future(
             ss, tid,
             KernelFuture::ReceiveMessage { sidx },
             crate::kfuture::EVENT_SERVER_MSG,
         );
-
-        // In hosted mode: use legacy WaitReceive state.
-        #[cfg(not(beetos))]
-        {
-            ss.current_process_mut().set_thread_state(tid, ThreadState::WaitReceive { sidx });
-        }
 
         Scheduler::with_mut(|s| s.activate_current(ss))
     })
@@ -578,14 +573,11 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             }
             SystemServices::with_mut(|ss| {
                 ss.set_thread_result(current_pid(), tid, xous::Result::Ok)?;
-                #[cfg(beetos)]
                 suspend_with_future(
                     ss, tid,
                     KernelFuture::WaitFutex { addr },
                     crate::kfuture::EVENT_KERNEL,
                 );
-                #[cfg(not(beetos))]
-                ss.current_process_mut().set_thread_state(tid, ThreadState::WaitFutex { addr });
                 Scheduler::with_mut(|s| s.activate_current(ss))
             })
         }),

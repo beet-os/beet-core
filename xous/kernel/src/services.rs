@@ -713,15 +713,11 @@ impl SystemServices {
             }
 
             for waiting_tid in 0..MAX_THREAD_COUNT {
-                #[cfg(beetos)]
                 let is_joiner = matches!(
                     self.current_process().kernel_future(waiting_tid),
                     Some(crate::kfuture::KernelFuture::WaitJoin { target_tid })
                         if *target_tid == tid
                 );
-                #[cfg(not(beetos))]
-                let is_joiner = self.current_process().thread_state(waiting_tid)
-                    == (ThreadState::WaitJoin { tid });
                 if is_joiner {
                     crate::syscall::wake_thread_with_result(
                         self, current_pid(), waiting_tid,
@@ -744,14 +740,11 @@ impl SystemServices {
         }
 
         if process.thread_state(join_tid) != ThreadState::Free {
-            #[cfg(beetos)]
             crate::syscall::suspend_with_future(
                 self, tid,
                 crate::kfuture::KernelFuture::WaitJoin { target_tid: join_tid },
                 crate::kfuture::EVENT_KERNEL,
             );
-            #[cfg(not(beetos))]
-            process.set_thread_state(tid, ThreadState::WaitJoin { tid: join_tid });
             Scheduler::with_mut(|s| s.activate_current(self))
         } else {
             // The thread does not exist -- continue execution
@@ -970,8 +963,8 @@ impl SystemServices {
         }
 
         // Wake all threads waiting on this process via WaitProcess syscall.
-        // On hardware: scan kernel futures for WaitProcessExit { target_pid }.
-        // In hosted mode: scan ThreadState for WaitProcess { pid }.
+        // Wake all threads waiting on this process via WaitProcess syscall.
+        // Scan kernel futures for WaitProcessExit { target_pid }.
         // Collect waiters first to avoid borrow conflicts.
         {
             let dying_pid = pid;
@@ -983,15 +976,11 @@ impl SystemServices {
                 let Some(process) = &self.processes[pidx] else { continue };
                 let waiter_pid = process.pid;
                 for wt in 1..crate::arch::process::MAX_THREAD_COUNT {
-                    #[cfg(beetos)]
                     let is_waiter = matches!(
                         process.kernel_future(wt),
                         Some(crate::kfuture::KernelFuture::WaitProcessExit { target_pid })
                             if *target_pid == dying_pid
                     );
-                    #[cfg(not(beetos))]
-                    let is_waiter = process.thread_state(wt)
-                        == (ThreadState::WaitProcess { pid: dying_pid });
                     if is_waiter && waiter_count < waiters.len() {
                         waiters[waiter_count] = (waiter_pid, wt);
                         waiter_count += 1;
@@ -1118,10 +1107,10 @@ impl SystemServices {
                 if tid == arch_process.current_tid() {
                     write!(output, "[Last active] ").ok();
                 }
+                use crate::kfuture::KernelFuture;
                 match thread {
                     ThreadState::Free => unreachable!(),
                     ThreadState::Ready => writeln!(output,).ok(),
-                    ThreadState::WaitJoin { tid: _tid } => writeln!(output, "WaitingJoin({_tid})").ok(),
                     ThreadState::RetryConnect { sid_hash: _sid_hash } => {
                         writeln!(output, "RetryConnect({_sid_hash:08x})").ok()
                     }
@@ -1132,23 +1121,32 @@ impl SystemServices {
                             writeln!(output, "RetryQueueFull(NONEXISTENT)").ok()
                         }
                     }
-                    ThreadState::WaitBlocking { sidx } => {
-                        if let Some(_server) = self.server_from_sidx(sidx) {
-                            writeln!(output, "WaitBlocking({:08x?}, pid={})", _server.sid, _server.pid).ok()
-                        } else {
-                            writeln!(output, "WaitBlocking(NONEXISTENT)").ok()
+                    ThreadState::WaitEvent { mask: _mask } => {
+                        match process.kernel_future(tid) {
+                            Some(KernelFuture::ReceiveMessage { sidx }) => {
+                                if let Some(_server) = self.server_from_sidx(*sidx) {
+                                    writeln!(output, "WaitRecv({:08x?}, pid={})", _server.sid, _server.pid).ok()
+                                } else {
+                                    writeln!(output, "WaitRecv(NONEXISTENT)").ok()
+                                }
+                            }
+                            Some(KernelFuture::WaitBlocking) => {
+                                writeln!(output, "WaitBlocking").ok()
+                            }
+                            Some(KernelFuture::WaitProcessExit { target_pid }) => {
+                                writeln!(output, "WaitProcess({})", target_pid).ok()
+                            }
+                            Some(KernelFuture::WaitJoin { target_tid }) => {
+                                writeln!(output, "WaitJoin({target_tid})").ok()
+                            }
+                            Some(KernelFuture::WaitFutex { addr }) => {
+                                writeln!(output, "WaitFutex({addr:08x})").ok()
+                            }
+                            None => {
+                                writeln!(output, "WaitEvent({_mask:#x})").ok()
+                            }
                         }
                     }
-                    ThreadState::WaitReceive { sidx } => {
-                        if let Some(_server) = self.server_from_sidx(sidx) {
-                            writeln!(output, "WaitRecv({:08x?}, pid={})", _server.sid, _server.pid).ok()
-                        } else {
-                            writeln!(output, "WaitRecv(NONEXISTENT)").ok()
-                        }
-                    }
-                    ThreadState::WaitFutex { addr: _addr } => writeln!(output, "WaitFutex({_addr:08x})").ok(),
-                    ThreadState::WaitProcess { pid: _pid } => writeln!(output, "WaitProcess({})", _pid).ok(),
-                    ThreadState::WaitEvent { mask: _mask } => writeln!(output, "WaitEvent({_mask:#x})").ok(),
                 };
                 write!(output, "{:?}", arch_process.thread(tid)).ok();
             }
