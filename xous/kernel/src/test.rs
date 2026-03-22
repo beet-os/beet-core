@@ -1221,3 +1221,86 @@ fn repeated_blocking_scalars() {
     shutdown_kernel();
     main_thread.join().expect("join kernel");
 }
+
+/// IPC round-trip latency benchmark.
+///
+/// Measures how long N blocking-scalar round-trips take between a client
+/// and a server process. Run this on both `main` and `dev` to compare
+/// scheduler / kfuture overhead.
+///
+/// The result is printed to stdout (visible with `cargo test -- --nocapture`)
+/// and is not asserted on (no latency threshold), so this test never flaps in CI.
+#[test]
+fn ipc_round_trip_benchmark() {
+    const ROUNDS: usize = 10_000;
+
+    let main_thread = start_kernel(SERVER_SPEC);
+    let (server_ready_send, server_ready_recv) = unbounded();
+    let (result_send, result_recv) = unbounded::<(usize, std::time::Duration)>();
+
+    let server_addr = b"bench-ipc-rtrip0";
+
+    let server = xous::create_process_as_thread(xous::ProcessArgsAsThread::new(
+        "bench_server",
+        move || {
+            let sid = xous::create_server_with_address(server_addr).expect("create server");
+            server_ready_send.send(()).unwrap();
+
+            for _ in 0..ROUNDS {
+                let env = xous::receive_message(sid).expect("receive");
+
+                if let xous::Message::BlockingScalar(msg) = env.body {
+                    xous::return_scalar(env.sender, msg.arg1).expect("return");
+                }
+            }
+        },
+    ))
+    .expect("spawn server");
+
+    let client = xous::create_process_as_thread(xous::ProcessArgsAsThread::new(
+        "bench_client",
+        move || {
+            server_ready_recv.recv().unwrap();
+            let sid = xous::SID::from_bytes(server_addr).unwrap();
+            let cid = xous::try_connect(sid).expect("connect");
+
+            let start = std::time::Instant::now();
+
+            for i in 0..ROUNDS {
+                let result = xous::send_message(
+                    cid,
+                    xous::Message::BlockingScalar(xous::ScalarMessage {
+                        id: 1,
+                        arg1: i,
+                        arg2: 0,
+                        arg3: 0,
+                        arg4: 0,
+                    }),
+                )
+                .expect("send");
+
+                match result {
+                    xous::Result::Scalar1(val) => assert_eq!(val, i),
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            }
+
+            let elapsed = start.elapsed();
+            result_send.send((ROUNDS, elapsed)).unwrap();
+        },
+    ))
+    .expect("spawn client");
+
+    xous::wait_process_as_thread(server).expect("server done");
+    xous::wait_process_as_thread(client).expect("client done");
+
+    let (rounds, elapsed) = result_recv.recv().expect("benchmark result");
+    let avg_ns = elapsed.as_nanos() / rounds as u128;
+    println!(
+        "\n[bench] ipc_round_trip: {} rounds in {:?} — avg {} ns/round",
+        rounds, elapsed, avg_ns
+    );
+
+    shutdown_kernel();
+    main_thread.join().expect("join kernel");
+}
