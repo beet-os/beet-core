@@ -472,7 +472,9 @@ pub enum SysCall {
 
     /// Block the calling thread until any notification bits matching `mask`
     /// are set on the current process.  Returns the bits that fired
-    /// (intersection of pending bits and mask) and atomically clears them.
+    /// (intersection of pending bits and mask) and clears them; the read
+    /// and clear happen under the kernel's exclusive hold on the process
+    /// state, so no bits can be lost between the check and the clear.
     ///
     /// # Returns
     ///
@@ -485,7 +487,8 @@ pub enum SysCall {
     WaitEvent(usize /* mask */),
 
     /// Non-blocking check of the current process's notification bits.
-    /// Returns all pending bits and atomically clears them.
+    /// Returns all pending bits and clears them under the kernel's
+    /// exclusive hold on the process state.
     ///
     /// # Returns
     ///
@@ -2330,7 +2333,8 @@ pub fn unpack_name_from_usize(args: &[usize; 4]) -> &[u8] {
 }
 
 /// Block until any notification bits matching `mask` are set on the current
-/// process.  Returns the fired bits and atomically clears them.
+/// process.  Returns the fired bits and clears them under the kernel's
+/// exclusive hold on the process state.
 ///
 /// If `mask` is 0, returns `InvalidArguments`.
 #[cfg(beetos)]
@@ -2344,7 +2348,8 @@ pub fn wait_event(mask: usize) -> core::result::Result<usize, Error> {
 }
 
 /// Non-blocking read of the current process's notification bits.
-/// Returns all pending bits and atomically clears them.
+/// Returns all pending bits and clears them under the kernel's
+/// exclusive hold on the process state.
 #[cfg(beetos)]
 #[inline]
 pub fn poll_event() -> core::result::Result<usize, Error> {

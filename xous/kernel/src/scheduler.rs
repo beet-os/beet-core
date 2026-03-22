@@ -291,3 +291,84 @@ impl Scheduler {
         Ok(xous::Result::ResumeProcess)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xous::ThreadPriority;
+
+    fn make_pid(n: u8) -> xous::PID { xous::PID::new(n).unwrap() }
+
+    fn empty_scheduler() -> Scheduler {
+        Scheduler {
+            queue_heads: [const { None }; NUM_PRIORITIES],
+            highest_ready_priority: 0,
+            links: [[const { None }; MAX_THREAD_COUNT]; MAX_PROCESS_COUNT],
+            in_irq_handler: false,
+        }
+    }
+
+    /// After parking the last thread in a priority queue, queue_heads[prio]
+    /// must be None.  This is the state activate_current relies on for its
+    /// "all-futures-Pending" exit path (fixed in commit 398d0af: changed
+    /// queue_heads[...].expect() to let-else break).
+    #[test]
+    fn queue_drains_to_none_when_all_threads_parked() {
+        let mut s = empty_scheduler();
+        let pid = make_pid(2);
+        let prio = ThreadPriority::AppDefault;
+        let prio_idx = prio as usize;
+
+        s.ready_thread(pid, 1, prio);
+        s.ready_thread(pid, 2, prio);
+        assert!(s.queue_heads[prio_idx].is_some());
+
+        s.park_thread(pid, 1, prio);
+        assert!(s.queue_heads[prio_idx].is_some(), "queue should still have one thread");
+
+        s.park_thread(pid, 2, prio);
+        assert!(
+            s.queue_heads[prio_idx].is_none(),
+            "queue_heads must be None after parking all threads — \
+             activate_current depends on this to exit cleanly instead of panicking"
+        );
+    }
+
+    /// yield_thread rotates the queue head to the next thread.
+    #[test]
+    fn yield_thread_rotates_queue() {
+        let mut s = empty_scheduler();
+        let p1 = make_pid(2);
+        let p2 = make_pid(3);
+        let prio = ThreadPriority::AppDefault;
+
+        s.ready_thread(p1, 1, prio);
+        s.ready_thread(p2, 1, prio);
+
+        assert_eq!(s.queue_heads[prio as usize], Some((p1, 1)));
+        s.yield_thread(p1, 1, prio);
+        assert_eq!(s.queue_heads[prio as usize], Some((p2, 1)));
+        s.yield_thread(p2, 1, prio);
+        assert_eq!(s.queue_heads[prio as usize], Some((p1, 1)));
+    }
+
+    /// highest_ready_priority is updated when threads are added/removed.
+    #[test]
+    fn highest_priority_tracks_correctly() {
+        let mut s = empty_scheduler();
+        let pid = make_pid(2);
+
+        s.ready_thread(pid, 1, ThreadPriority::AppDefault);
+        assert_eq!(s.highest_ready_priority, ThreadPriority::AppDefault as usize);
+
+        s.ready_thread(pid, 2, ThreadPriority::System0);
+        assert_eq!(s.highest_ready_priority, ThreadPriority::System0 as usize);
+
+        s.park_thread(pid, 2, ThreadPriority::System0);
+        assert_eq!(
+            s.highest_ready_priority,
+            ThreadPriority::AppDefault as usize,
+            "highest_ready_priority must fall back when the highest-priority thread is parked"
+        );
+    }
+}
