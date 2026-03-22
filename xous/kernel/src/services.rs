@@ -352,7 +352,12 @@ impl SystemServices {
         ArchProcess::current().set_thread_result(tid, result);
 
         // Return to the original memory space.
-        self.process(current_pid).expect("couldn't switch back after setting context result").activate();
+        // During process termination, the calling process may have been freed
+        // (CURRENT_PID still points to it). In that case, skip the switchback —
+        // the caller (activate_current) will activate the correct process.
+        if let Ok(p) = self.process(current_pid) {
+            p.activate();
+        }
         Ok(())
     }
 
