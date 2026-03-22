@@ -105,10 +105,15 @@ impl KernelFuture {
     /// `Pending` poll result.
     pub fn suspension_mask(&self) -> usize {
         match self {
-            // Woken by a server message arriving.
-            KernelFuture::ReceiveMessage { .. } | KernelFuture::WaitBlocking => EVENT_SERVER_MSG,
-            // Woken by a kernel event (process/thread exit, futex wake).
-            KernelFuture::WaitProcessExit { .. }
+            // Woken when a message arrives in the server's queue.
+            KernelFuture::ReceiveMessage { .. } => EVENT_SERVER_MSG,
+            // Woken by a kernel event: blocking-IPC reply, process/thread
+            // exit, or futex wake.  Must match the mask passed to
+            // suspend_with_future (EVENT_KERNEL) so re-parking after a
+            // Pending poll uses the same mask and avoids spurious wakeups
+            // from unrelated server-message notifications.
+            KernelFuture::WaitBlocking
+            | KernelFuture::WaitProcessExit { .. }
             | KernelFuture::WaitJoin { .. }
             | KernelFuture::WaitFutex { .. } => EVENT_KERNEL,
         }

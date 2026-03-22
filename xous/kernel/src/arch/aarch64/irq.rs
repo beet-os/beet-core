@@ -118,9 +118,16 @@ unsafe extern "C" fn _user_irq_handler_rust(context: *mut u8) {
 #[no_mangle]
 unsafe extern "C" fn _kernel_sync_handler_rust(_context: *mut u8) {
     let esr: u64;
+    let elr: u64;
+    let far: u64;
     core::arch::asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack));
+    core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
+    core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
     // Kernel synchronous exceptions are unexpected — halt
-    panic!("Kernel sync exception: ESR_EL1 = {:#018x}", esr);
+    panic!(
+        "Kernel sync exception: ESR={:#018x} ELR={:#018x} FAR={:#018x}",
+        esr, elr, far
+    );
 }
 
 /// Called from asm.S for kernel-mode IRQs.
