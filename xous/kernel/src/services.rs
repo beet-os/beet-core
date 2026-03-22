@@ -352,12 +352,7 @@ impl SystemServices {
         ArchProcess::current().set_thread_result(tid, result);
 
         // Return to the original memory space.
-        // During process termination, the calling process may have been freed
-        // (CURRENT_PID still points to it). In that case, skip the switchback —
-        // the caller (activate_current) will activate the correct process.
-        if let Ok(p) = self.process(current_pid) {
-            p.activate();
-        }
+        self.process(current_pid).expect("couldn't switch back after setting context result").activate();
         Ok(())
     }
 
@@ -1010,6 +1005,11 @@ impl SystemServices {
 
         self.process_mut(pid)?.terminate(ret)?;
         self.free_process(pid);
+
+        // CURRENT_PID still points to the freed process.  Reset it to
+        // PID 1 (kernel idle) so set_thread_result / activate_current
+        // never see an invalid current_pid.
+        self.process(PID::new(1).unwrap()).unwrap().activate();
 
         // Reparent all children to PID1
         self.for_all_processes(|p| {

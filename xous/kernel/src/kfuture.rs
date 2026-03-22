@@ -79,10 +79,11 @@ pub enum KernelFuture {
     WaitFutex { addr: usize },
 }
 
-// SAFETY: All fields are plain data (usize).  The Send bound is the
-// key architectural invariant — it prevents !Send types (like spinlock
-// guards) from being captured in a kernel future.
-unsafe impl Send for KernelFuture {}
+// All fields are plain data (PID, TID, usize) which are Send.
+// The compiler derives Send automatically.  If a future variant ever
+// captures a !Send type (e.g. a spinlock guard), the compiler will
+// refuse — that's the whole point.
+const _: () = { fn _assert_send<T: Send>() {} fn _check() { _assert_send::<KernelFuture>(); } };
 
 // ── PollResult ───────────────────────────────────────────────────────
 
