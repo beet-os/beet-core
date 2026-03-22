@@ -703,6 +703,10 @@ impl SystemServices {
     #[cfg(beetos)]
     pub fn thread_exited(&mut self, tid: TID) -> Result<xous::Result, Error> {
         self.current_process_mut().set_thread_state(tid, ThreadState::Free);
+        // Clean up any outstanding kernel future + mailbox for this TID
+        // so a future thread reusing this TID doesn't inherit stale state.
+        self.current_process_mut().take_kernel_future(tid);
+        self.current_process_mut().take_mailbox(tid);
 
         if tid != crate::process::IRQ_TID {
             let mut arch_process = ArchProcess::current();
