@@ -393,7 +393,9 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
         "-m".to_string(), "2G".to_string(),
-        "-nographic".to_string(),
+        "-serial".to_string(), "stdio".to_string(),
+        "-monitor".to_string(), "none".to_string(),
+        "-device".to_string(), "ramfb".to_string(),
         "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
     ];
 

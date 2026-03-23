@@ -17,6 +17,11 @@ mod test;
 mod kfuture;
 mod arch;
 
+#[cfg(beetos)]
+mod font;
+#[cfg(beetos)]
+mod fb_console;
+
 #[macro_use]
 mod args;
 mod io;

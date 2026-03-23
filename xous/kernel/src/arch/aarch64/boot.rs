@@ -236,7 +236,17 @@ pub unsafe fn init_memory(fdt_phys: *const u8) -> BootInfo {
     };
 
     // Cap to compile-time max (bitmap size is fixed)
-    let ram_size = ram_size_raw.min(beetos::RAM_SIZE);
+    let mut ram_size = ram_size_raw.min(beetos::RAM_SIZE);
+
+    // Reserve framebuffer at the top of RAM so the MemoryManager never
+    // allocates that region.  Only applies on QEMU virt (ramfb).
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        use crate::platform::qemu_virt::fb::FB_SIZE;
+        if ram_size >= FB_SIZE {
+            ram_size -= FB_SIZE;
+        }
+    }
 
     // 2. Set up bump allocator after kernel _end (high VA)
     let mut bump = BumpAllocator::new(kernel_end());

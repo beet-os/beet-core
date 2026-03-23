@@ -15,6 +15,7 @@
 //!   0x4000_0000  RAM base
 
 pub mod blk;
+pub mod fb;
 pub mod gic;
 pub mod net;
 pub mod net_stack;
@@ -45,6 +46,16 @@ pub fn init() {
 
     timer::init();
     uart::puts("Timer: initialized\n");
+
+    // Initialize framebuffer console (requires -device ramfb in QEMU args).
+    // Failure is non-fatal — UART remains the primary output.
+    if unsafe { fb::init() } {
+        uart::puts("FB: ramfb initialized (1280x800)\n");
+        fb::write_str("BeetOS v0.1.0\n");
+        fb::write_str("Platform: QEMU virt (AArch64)\n");
+    } else {
+        uart::puts("FB: ramfb not found (run with -device ramfb)\n");
+    }
 
     blk::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
     net::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
