@@ -21,7 +21,7 @@ mod tarfs;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
-use beetos_api_fs::{FsError, FsOp, FS_SID};
+use beetos_api_fs::{BUF_STATUS_OFFSET, BUF_TEXT_OFFSET, FsError, FsOp, FS_SID};
 
 // ============================================================================
 // UART output
@@ -115,8 +115,15 @@ pub extern "C" fn _start() -> ! {
         let msg = xous::rsyscall(xous::SysCall::ReceiveMessage(sid));
         match msg {
             Ok(xous::Result::MessageEnvelope(env)) => {
-                if let xous::Message::BlockingScalar(scalar) = env.body {
-                    handle_blocking_scalar(env.sender, scalar);
+                match &env.body {
+                    xous::Message::BlockingScalar(scalar) => {
+                        handle_blocking_scalar(env.sender, *scalar);
+                    }
+                    xous::Message::MutableBorrow(mem) => {
+                        handle_mutable_borrow(env.sender, mem);
+                        core::mem::forget(env);
+                    }
+                    _ => {}
                 }
             }
             _ => { xous::yield_slice(); }
@@ -318,6 +325,152 @@ fn do_write(path: &str, content: &[u8]) -> FsError {
         }
         Err(ramfs::FsError::IsDirectory) => FsError::IsDirectory,
         Err(_) => FsError::NoSpace,
+    }
+}
+
+// ============================================================================
+// Buffer-based output (MutableBorrow ops)
+// ============================================================================
+
+struct BufWrite<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> Write for BufWrite<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.pos + 1 < self.buf.len() {
+                self.buf[self.pos] = b;
+                self.pos += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn handle_mutable_borrow(sender: xous::MessageSender, mem: &xous::MemoryMessage) {
+    let op = mem.id;
+    let full_len = mem.buf.len();
+
+    // Copy path to stack before any mutable access to the buffer.
+    let mut path_copy = [0u8; 32];
+    {
+        let src = unsafe { core::slice::from_raw_parts(mem.buf.as_ptr(), full_len.min(32)) };
+        path_copy[..src.len()].copy_from_slice(src);
+    }
+    let path_len = path_copy.iter().position(|&b| b == 0).unwrap_or(32);
+    let path = core::str::from_utf8(&path_copy[..path_len]).unwrap_or("");
+
+    // Determine status and write output into the text area directly via raw pointer.
+    let status: FsError = if full_len > BUF_TEXT_OFFSET {
+        let text_ptr = unsafe { mem.buf.as_mut_ptr().add(BUF_TEXT_OFFSET) };
+        let text_len = full_len - BUF_TEXT_OFFSET;
+        // Zero text area.
+        unsafe { core::ptr::write_bytes(text_ptr, 0, text_len); }
+        let text_area = unsafe { core::slice::from_raw_parts_mut(text_ptr, text_len) };
+        if op == FsOp::LsBuf as usize {
+            do_ls_buf(path, text_area)
+        } else if op == FsOp::CatBuf as usize {
+            do_cat_buf(path, text_area)
+        } else {
+            FsError::InvalidPath
+        }
+    } else {
+        FsError::InvalidPath
+    };
+
+    // Write status byte at BUF_STATUS_OFFSET via raw pointer (avoids slice aliasing issues).
+    unsafe {
+        mem.buf.as_mut_ptr().add(BUF_STATUS_OFFSET).write_volatile(status as u8);
+    }
+
+    xous::return_memory_offset_valid(sender, mem.buf, None, None).ok();
+}
+
+fn do_ls_buf(path: &str, output: &mut [u8]) -> FsError {
+    let mut w = BufWrite { buf: output, pos: 0 };
+
+    let is_root = {
+        let p = path.strip_prefix('/').unwrap_or(path);
+        p.is_empty()
+    };
+
+    if is_root && get_disk_archive().is_some() {
+        let _ = write!(w, "  disk/  (block device)\n");
+    }
+
+    if is_disk_path(path) {
+        if let Some(archive) = get_disk_archive() {
+            let subpath = disk_subpath(path);
+            archive.list(subpath, |name, is_dir, size| {
+                if is_dir {
+                    let _ = write!(w, "  {}/\n", name);
+                } else {
+                    let _ = write!(w, "  {} ({} bytes)\n", name, size);
+                }
+            });
+            return FsError::Ok;
+        }
+        return FsError::NotFound;
+    }
+
+    match ramfs::list(path, |name, is_dir, size| {
+        if is_dir {
+            let _ = write!(w, "  {}/\n", name);
+        } else {
+            let _ = write!(w, "  {} ({} bytes)\n", name, size);
+        }
+    }) {
+        Ok(()) => FsError::Ok,
+        Err(ramfs::FsError::NotFound) => FsError::NotFound,
+        Err(ramfs::FsError::NotDirectory) => FsError::NotDirectory,
+        Err(_) => FsError::InvalidPath,
+    }
+}
+
+fn do_cat_buf(path: &str, output: &mut [u8]) -> FsError {
+    let mut w = BufWrite { buf: output, pos: 0 };
+
+    if is_disk_path(path) {
+        if let Some(archive) = get_disk_archive() {
+            let subpath = disk_subpath(path);
+            if let Some(data) = archive.find(subpath) {
+                match core::str::from_utf8(data) {
+                    Ok(text) => {
+                        let _ = write!(w, "{}", text);
+                        if !text.ends_with('\n') {
+                            let _ = write!(w, "\n");
+                        }
+                    }
+                    Err(_) => {
+                        let _ = write!(w, "<binary: {} bytes>\n", data.len());
+                    }
+                }
+                return FsError::Ok;
+            }
+        }
+        return FsError::NotFound;
+    }
+
+    match ramfs::read(path) {
+        Ok(data) => {
+            match core::str::from_utf8(data) {
+                Ok(text) => {
+                    let _ = write!(w, "{}", text);
+                    if !text.ends_with('\n') {
+                        let _ = write!(w, "\n");
+                    }
+                }
+                Err(_) => {
+                    let _ = write!(w, "<binary: {} bytes>\n", data.len());
+                }
+            }
+            FsError::Ok
+        }
+        Err(ramfs::FsError::NotFound) => FsError::NotFound,
+        Err(ramfs::FsError::IsDirectory) => FsError::IsDirectory,
+        Err(_) => FsError::InvalidPath,
     }
 }
 

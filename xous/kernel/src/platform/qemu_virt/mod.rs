@@ -17,6 +17,7 @@
 pub mod blk;
 pub mod fb;
 pub mod gic;
+pub mod input;
 pub mod net;
 pub mod net_stack;
 pub mod timer;
@@ -60,6 +61,7 @@ pub fn init() {
     blk::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
     net::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
     net_stack::init();
+    input::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
 }
 
 /// Reboot the system via PSCI SYSTEM_RESET (HVC #0).

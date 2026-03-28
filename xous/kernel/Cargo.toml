@@ -23,11 +23,10 @@ platform-apple-t8103 = ["beetos/platform-apple-t8103"]
 [dependencies]
 bitflags = "1.2.1"
 bitvec = { version = "1.0.1", default-features = false }
-beetos = { path = "../../beetos" }
+beetos = { path = "../../beetos", features = ["fb"] }
 xous = { path = "../xous-rs", features = ["forget-memory-messages"] }
 beetos-api-console = { path = "../../api/console" }
 beetos-api-storage = { path = "../../api/storage" }
-font8x8 = { version = "0.3", default-features = false }
 
 # Hardware dependencies will be added in M1 when we implement arch/aarch64
 # [target.'cfg(beetos)'.dependencies]

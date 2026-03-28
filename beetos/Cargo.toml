@@ -7,11 +7,14 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 core = { version = '1.0.0', optional = true, package = 'rustc-std-workspace-core' }
+font8x8 = { version = "0.3", default-features = false, optional = true }
 
 [features]
 default = ["page-16k"]
 # This is being built as part of libstd
 rustc-dep-of-std = ['core']
+# Framebuffer font rendering (requires font8x8 crate)
+fb = ["font8x8"]
 # Platform selection — affects RAM base address and max RAM size
 platform-qemu-virt = []
 platform-bcm2712 = []

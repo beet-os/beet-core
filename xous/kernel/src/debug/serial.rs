@@ -27,6 +27,7 @@ impl Write for Output {
         for c in _s.bytes() {
             self.serial.putc(c);
         }
+        crate::platform::fb_write(_s);
         Ok(())
     }
 }

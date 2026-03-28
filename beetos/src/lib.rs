@@ -31,6 +31,11 @@
 
 #![no_std]
 
+#[cfg(feature = "fb")]
+pub mod font;
+#[cfg(feature = "fb")]
+pub mod fb_console;
+
 /// AArch64 translation granule — set by the `page-4k` / `page-16k` / `page-64k` feature.
 /// Exactly one feature must be enabled. Default: `page-16k` (Apple Silicon).
 #[cfg(feature = "page-4k")]
@@ -281,6 +286,15 @@ pub const BOOT_SPLASH_FB: usize = 0x0000_5000_0000_0000;
 /// The page is mapped read-only and contains null-separated argument strings.
 /// x1 = ARGV_PAGE_VA, x2 = total byte length of argv data.
 pub const ARGV_PAGE_VA: usize = 0x10_0300_0000;
+
+/// Virtual address at which the kernel maps the UART MMIO page into userspace.
+/// Passed to the shell (and other processes) as x0 at process start.
+pub const SHELL_UART_VA: usize = 0x10_0100_0000;
+
+/// Virtual address at which the kernel maps the framebuffer into the shell.
+/// Passed as x1 at process start. The FB is 4 MiB (256 × 16 KiB pages).
+#[cfg(feature = "platform-qemu-virt")]
+pub const SHELL_FB_VA: usize = 0x10_0200_0000;
 
 /// Maximum size of argv data (fits in one page).
 pub const ARGV_MAX_LEN: usize = PAGE_SIZE;

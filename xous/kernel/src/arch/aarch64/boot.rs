@@ -515,6 +515,30 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         });
     }
 
+    // Map framebuffer into the shell's address space so it can render text there.
+    #[cfg(feature = "platform-qemu-virt")]
+    {
+        use crate::platform::qemu_virt::fb::{FB_PHYS, FB_SIZE};
+        let fb_pages = FB_SIZE / beetos::PAGE_SIZE;
+        let shell_fb_va = beetos::SHELL_FB_VA;
+        crate::services::SystemServices::with_mut(|ss| {
+            crate::mem::MemoryManager::with_mut(|mm| {
+                let process = ss.process_mut(shell_pid).expect("process for FB map");
+                for i in 0..fb_pages {
+                    let phys = FB_PHYS + i * beetos::PAGE_SIZE;
+                    let va   = shell_fb_va + i * beetos::PAGE_SIZE;
+                    process.mapping.map_page(
+                        mm,
+                        phys,
+                        va as *mut usize,
+                        xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                        true,
+                    ).expect("map FB");
+                }
+            });
+        });
+    }
+
     // Read disk data from virtio-blk and map into the fs service process.
     #[cfg(feature = "platform-qemu-virt")]
     let (disk_va, disk_size) = {
@@ -608,6 +632,9 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     }
     {
         let idx = shell_pid.get() as usize - 1;
+        #[cfg(feature = "platform-qemu-virt")]
+        super::process::set_thread_args(idx, SHELL_UART_VA, beetos::SHELL_FB_VA, 0);
+        #[cfg(not(feature = "platform-qemu-virt"))]
         super::process::set_thread_arg0(idx, SHELL_UART_VA);
     }
     {

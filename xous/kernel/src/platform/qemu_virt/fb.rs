@@ -71,7 +71,9 @@ const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// RamFB configuration written to FW_CFG `etc/ramfb` (all fields big-endian).
-#[repr(C)]
+///
+/// `packed` matches QEMU's `QEMU_PACKED` C struct (28 bytes, no padding).
+#[repr(C, packed)]
 struct RamFbCfg {
     addr:   u64, // framebuffer physical address
     fourcc: u32, // DRM pixel format code
@@ -128,13 +130,25 @@ unsafe fn fwcfg_read_be32() -> u32 {
     (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
 }
 
-/// Submit a DMA request.
+/// Submit a DMA request using two 32-bit writes.
 ///
-/// QEMU processes the DMA synchronously on the MMIO write, so this
-/// returns only after the transfer is complete.
+/// Writing the high half first sets the pending address; writing the low
+/// half triggers the DMA transfer. Both halves are big-endian (the DMA
+/// region uses DEVICE_BIG_ENDIAN). DSB ISH ensures prior Normal-memory
+/// writes to DMA_ACCESS and RAMFB_CFG are visible before the trigger.
 unsafe fn fwcfg_dma_submit() {
+    core::arch::asm!("dsb ish", options(nomem, nostack));
+
     let dma_phys = virt_to_phys(addr_of_mut!(DMA_ACCESS) as usize) as u64;
-    write_volatile((fwcfg_va() + FWCFG_DMA) as *mut u64, dma_phys.to_be());
+    let hi: u32 = (dma_phys >> 32) as u32;
+    let lo: u32 = (dma_phys & 0xFFFF_FFFF) as u32;
+
+    // Write high 32 bits (sets pending address, no trigger)
+    write_volatile((fwcfg_va() + FWCFG_DMA) as *mut u32, hi.to_be());
+    // Write low 32 bits (sets remaining address bits and triggers DMA)
+    write_volatile((fwcfg_va() + FWCFG_DMA + 4) as *mut u32, lo.to_be());
+
+    core::arch::asm!("dsb ish; isb", options(nomem, nostack));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -178,13 +192,13 @@ unsafe fn write_ramfb_cfg(key: u16) {
     write_volatile(addr_of_mut!((*cfg).stride), (FB_STRIDE_BYTES as u32).to_be());
 
     let cfg_phys = virt_to_phys(cfg as usize) as u64;
-    let cfg_size = core::mem::size_of::<RamFbCfg>() as u32;
+    let dma_len  = core::mem::size_of::<RamFbCfg>() as u32;
 
     // Fill DMA access descriptor (all big-endian).
     let dma = addr_of_mut!(DMA_ACCESS);
     let ctrl: u32 = ((key as u32) << 16) | DMA_CTL_SELECT | DMA_CTL_WRITE;
     write_volatile(addr_of_mut!((*dma).control), ctrl.to_be());
-    write_volatile(addr_of_mut!((*dma).length),  cfg_size.to_be());
+    write_volatile(addr_of_mut!((*dma).length),  dma_len.to_be());
     write_volatile(addr_of_mut!((*dma).address), cfg_phys.to_be());
 
     fwcfg_dma_submit();
@@ -202,7 +216,7 @@ unsafe fn write_ramfb_cfg(key: u16) {
 pub unsafe fn init() -> bool {
     let key = match find_ramfb_key() {
         Some(k) => k,
-        None    => return false,
+        None => return false,
     };
 
     write_ramfb_cfg(key);

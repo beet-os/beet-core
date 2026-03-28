@@ -624,6 +624,12 @@ User types "hello":
 
 ## Milestone 6 — Block Storage (virtio-blk on QEMU)
 
+**Status: DONE** — virtio-blk driver, tar read-only filesystem, `api/storage` BlockDevice trait, shell `disk`/`ls /disk/`/`cat /disk/` commands all operational on QEMU.
+
+---
+
+## Milestone 6 (archived spec) — Block Storage (virtio-blk on QEMU)
+
 **Goal:** Read/write a virtual block device via virtio-blk on QEMU. Simple read-only filesystem. Foundation for persistent storage on any platform.
 
 **Strategy:** Implement virtio MMIO transport + virtio-blk driver in the kernel (platform code), expose a block device API, add a simple tar-based read-only filesystem. The block API is platform-agnostic — future platforms (RPi5, Apple M1) add their own storage backends (SD card, NVMe) behind the same API.

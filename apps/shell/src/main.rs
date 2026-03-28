@@ -3,8 +3,9 @@
 
 //! BeetOS interactive shell (bsh) — runs as a userspace process.
 //!
-//! Receives UART characters from the kernel via IPC, writes output
-//! directly to UART MMIO (mapped into our address space by the kernel).
+//! Receives UART characters from the kernel via IPC, writes output to both
+//! UART MMIO (mapped by kernel, x0) and the framebuffer console (mapped by
+//! kernel at SHELL_FB_VA, x1).
 //!
 //! File operations (ls, cat, mkdir, rm, write) are delegated to the
 //! filesystem service via Xous IPC (BlockingScalar).
@@ -15,7 +16,7 @@
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
-use beetos_api_fs::{FsError, FsOp, FS_SID};
+use beetos_api_fs::{BUF_STATUS_OFFSET, BUF_TEXT_OFFSET, FsError, FsOp, FS_SID};
 
 // ============================================================================
 // UART output via mapped MMIO
@@ -27,7 +28,7 @@ const UART_FR_TXFF: u32 = 1 << 5;
 
 static mut UART_BASE: usize = 0;
 
-fn putc(c: u8) {
+fn uart_putc(c: u8) {
     unsafe {
         if UART_BASE == 0 { return; }
         let base = UART_BASE;
@@ -40,10 +41,39 @@ fn putc(c: u8) {
     }
 }
 
+// ============================================================================
+// Framebuffer console
+// ============================================================================
+
+use beetos::fb_console::FbConsole;
+
+// FB dimensions — must match kernel constants.
+const FB_WIDTH:  usize = 1280;
+const FB_HEIGHT: usize = 800;
+
+static mut FB_CONSOLE: Option<FbConsole> = None;
+
+fn fb_putc(c: u8) {
+    unsafe {
+        if let Some(ref mut con) = FB_CONSOLE {
+            con.putc(c);
+        }
+    }
+}
+
+// ============================================================================
+// Combined output (UART + FB)
+// ============================================================================
+
+fn putc(c: u8) {
+    uart_putc(c);
+    fb_putc(c);
+}
+
 fn puts(s: &str) { for b in s.bytes() { putc(b); } }
 
-struct UartWriter;
-impl Write for UartWriter {
+struct DualWriter;
+impl Write for DualWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         puts(s);
         Ok(())
@@ -246,13 +276,13 @@ fn cmd_info() {
     puts("BeetOS v0.1.0\n");
     puts("Kernel: Xous microkernel (AArch64)\n");
     puts("Platform: QEMU virt\n");
-    let _ = write!(UartWriter, "Page size: {} bytes\n", 16384);
+    let _ = write!(DualWriter, "Page size: {} bytes\n", 16384);
     puts("Shell: userspace process (EL0)\n");
 }
 
 fn cmd_pid() {
     match xous::rsyscall(xous::SysCall::GetProcessId) {
-        Ok(xous::Result::Scalar1(pid)) => { let _ = write!(UartWriter, "PID: {}\n", pid); }
+        Ok(xous::Result::Scalar1(pid)) => { let _ = write!(DualWriter, "PID: {}\n", pid); }
         _ => puts("pid: syscall failed\n"),
     }
 }
@@ -318,10 +348,10 @@ fn cmd_cd(args: &[&str]) {
             }
         }
         Some(code) if code == FsError::NotFound as usize => {
-            let _ = write!(UartWriter, "cd: {}: no such directory\n", target);
+            let _ = write!(DualWriter, "cd: {}: no such directory\n", target);
         }
         Some(code) if code == FsError::NotDirectory as usize => {
-            let _ = write!(UartWriter, "cd: {}: not a directory\n", target);
+            let _ = write!(DualWriter, "cd: {}: not a directory\n", target);
         }
         None => puts("cd: fs service not available\n"),
         _ => puts("cd: error\n"),
@@ -343,6 +373,57 @@ fn get_fs_cid() -> u32 {
             _ => 0,
         }
     }
+}
+
+/// Send a MutableBorrow to the FS service. Writes output to `puts()` on success.
+/// Returns `Some(FsError code)` or `None` if the service is unavailable.
+fn fs_buf_op(op: FsOp, path: &str) -> Option<usize> {
+    let cid = get_fs_cid();
+    if cid == 0 { return None; }
+
+    let page_size = xous::MemorySize::new(beetos::PAGE_SIZE)?;
+    let buf_range = match xous::rsyscall(xous::SysCall::MapMemory(
+        None, None, page_size, xous::MemoryFlags::W,
+    )) {
+        Ok(xous::Result::MemoryRange(r)) => r,
+        _ => return None,
+    };
+
+    unsafe { core::ptr::write_bytes(buf_range.as_mut_ptr(), 0, buf_range.len()); }
+
+    let page_slice = unsafe { core::slice::from_raw_parts_mut(buf_range.as_mut_ptr(), buf_range.len()) };
+    let path_bytes = path.as_bytes();
+    let path_len = path_bytes.len().min(beetos_api_fs::MAX_PATH_LEN);
+    page_slice[..path_len].copy_from_slice(&path_bytes[..path_len]);
+
+    let result = xous::rsyscall(xous::SysCall::SendMessage(
+        cid,
+        xous::Message::MutableBorrow(xous::MemoryMessage {
+            id: op as usize,
+            buf: buf_range,
+            offset: None,
+            valid: None,
+        }),
+    ));
+
+    let status = match result {
+        Ok(xous::Result::MemoryReturned(_, _)) | Ok(xous::Result::Ok) => {
+            let page_slice = unsafe { core::slice::from_raw_parts(buf_range.as_ptr(), buf_range.len()) };
+            let code = page_slice[BUF_STATUS_OFFSET] as usize;
+            if code == FsError::Ok as usize {
+                let text = &page_slice[BUF_TEXT_OFFSET..];
+                let len = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+                if let Ok(s) = core::str::from_utf8(&text[..len]) {
+                    puts(s);
+                }
+            }
+            Some(code)
+        }
+        _ => None,
+    };
+
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf_range)).ok();
+    status
 }
 
 /// Send a BlockingScalar to the FS service and return the result code.
@@ -374,14 +455,13 @@ fn cmd_ls(args: &[&str]) {
     } else {
         resolve_path(args[0], &mut buf)
     };
-    let packed = beetos_api_fs::pack_path(path);
-    match fs_scalar(FsOp::Ls, packed[0], packed[1], packed[2], packed[3]) {
+    match fs_buf_op(FsOp::LsBuf, path) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::NotFound as usize => {
-            let _ = write!(UartWriter, "ls: {}: not found\n", path);
+            let _ = write!(DualWriter, "ls: {}: not found\n", path);
         }
         Some(code) if code == FsError::NotDirectory as usize => {
-            let _ = write!(UartWriter, "ls: {}: not a directory\n", path);
+            let _ = write!(DualWriter, "ls: {}: not a directory\n", path);
         }
         None => puts("ls: fs service not available\n"),
         _ => puts("ls: error\n"),
@@ -392,14 +472,13 @@ fn cmd_cat(args: &[&str]) {
     if args.is_empty() { puts("usage: cat <path>\n"); return; }
     let mut buf = [0u8; MAX_PATH];
     let path = resolve_path(args[0], &mut buf);
-    let packed = beetos_api_fs::pack_path(path);
-    match fs_scalar(FsOp::Cat, packed[0], packed[1], packed[2], packed[3]) {
+    match fs_buf_op(FsOp::CatBuf, path) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::NotFound as usize => {
-            let _ = write!(UartWriter, "cat: {}: not found\n", path);
+            let _ = write!(DualWriter, "cat: {}: not found\n", path);
         }
         Some(code) if code == FsError::IsDirectory as usize => {
-            let _ = write!(UartWriter, "cat: {}: is a directory\n", path);
+            let _ = write!(DualWriter, "cat: {}: is a directory\n", path);
         }
         None => puts("cat: fs service not available\n"),
         _ => puts("cat: error\n"),
@@ -432,10 +511,10 @@ fn cmd_write(args: &[&str], full_line: &str) {
     match fs_scalar(FsOp::WriteShort, path_packed[0], path_packed[1], c_args[0], c_args[1]) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::ReadOnly as usize => {
-            let _ = write!(UartWriter, "write: {}: read-only\n", path);
+            let _ = write!(DualWriter, "write: {}: read-only\n", path);
         }
         Some(code) if code == FsError::IsDirectory as usize => {
-            let _ = write!(UartWriter, "write: {}: is a directory\n", path);
+            let _ = write!(DualWriter, "write: {}: is a directory\n", path);
         }
         None => puts("write: fs service not available\n"),
         _ => puts("write: error\n"),
@@ -450,10 +529,10 @@ fn cmd_mkdir(args: &[&str]) {
     match fs_scalar(FsOp::Mkdir, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::AlreadyExists as usize => {
-            let _ = write!(UartWriter, "mkdir: {}: already exists\n", args[0]);
+            let _ = write!(DualWriter, "mkdir: {}: already exists\n", args[0]);
         }
         Some(code) if code == FsError::ReadOnly as usize => {
-            let _ = write!(UartWriter, "mkdir: {}: read-only\n", args[0]);
+            let _ = write!(DualWriter, "mkdir: {}: read-only\n", args[0]);
         }
         None => puts("mkdir: fs service not available\n"),
         _ => puts("mkdir: error\n"),
@@ -468,13 +547,13 @@ fn cmd_rm(args: &[&str]) {
     match fs_scalar(FsOp::Remove, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::NotFound as usize => {
-            let _ = write!(UartWriter, "rm: {}: not found\n", args[0]);
+            let _ = write!(DualWriter, "rm: {}: not found\n", args[0]);
         }
         Some(code) if code == FsError::NotEmpty as usize => {
-            let _ = write!(UartWriter, "rm: {}: directory not empty\n", args[0]);
+            let _ = write!(DualWriter, "rm: {}: directory not empty\n", args[0]);
         }
         Some(code) if code == FsError::ReadOnly as usize => {
-            let _ = write!(UartWriter, "rm: {}: read-only\n", args[0]);
+            let _ = write!(DualWriter, "rm: {}: read-only\n", args[0]);
         }
         None => puts("rm: fs service not available\n"),
         _ => puts("rm: error\n"),
@@ -488,9 +567,9 @@ fn cmd_blkinfo() {
             if disk_size == 0 {
                 puts("No block device\n");
             } else {
-                let _ = write!(UartWriter, "Block device: {} bytes\n", disk_size);
+                let _ = write!(DualWriter, "Block device: {} bytes\n", disk_size);
                 puts("Mounted at: /disk/ (read-only, tar)\n");
-                let _ = write!(UartWriter, "Files: {}\n", disk_files);
+                let _ = write!(DualWriter, "Files: {}\n", disk_files);
             }
         }
         None => puts("blkinfo: fs service not available\n"),
@@ -515,7 +594,7 @@ fn cmd_ifconfig() {
                 ((mac_lo >> 16) & 0xFF) as u8,
             ];
             let _ = write!(
-                UartWriter,
+                DualWriter,
                 "eth0: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             );
@@ -523,7 +602,7 @@ fn cmd_ifconfig() {
                 puts("      inet: (no address — DHCP pending)\n");
             } else {
                 let _ = write!(
-                    UartWriter,
+                    DualWriter,
                     "      inet: {}.{}.{}.{}\n",
                     ip[0], ip[1], ip[2], ip[3],
                 );
@@ -538,10 +617,10 @@ fn cmd_mem() {
         Some(_) => {
             let (used, total, bytes, disk_size, _) = unsafe { LAST_STATS };
             puts("RAM filesystem:\n");
-            let _ = write!(UartWriter, "  Files: {}/{}\n", used, total);
-            let _ = write!(UartWriter, "  Used:  {} bytes\n", bytes);
+            let _ = write!(DualWriter, "  Files: {}/{}\n", used, total);
+            let _ = write!(DualWriter, "  Used:  {} bytes\n", bytes);
             if disk_size > 0 {
-                let _ = write!(UartWriter, "Disk: {} bytes\n", disk_size);
+                let _ = write!(DualWriter, "Disk: {} bytes\n", disk_size);
             }
         }
         None => puts("mem: fs service not available\n"),
@@ -568,7 +647,7 @@ fn get_procman_cid() -> u32 {
 fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
     let cid = get_procman_cid();
     if cid == 0 {
-        let _ = write!(UartWriter, "bsh: {}: procman not available\n", cmd);
+        let _ = write!(DualWriter, "bsh: {}: procman not available\n", cmd);
         return;
     }
 
@@ -586,13 +665,13 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
         match result {
             Ok(xous::Result::Scalar1(exit_code)) | Ok(xous::Result::Scalar2(exit_code, _)) => {
                 if exit_code == usize::MAX {
-                    let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
+                    let _ = write!(DualWriter, "bsh: {}: not found\n", cmd);
                 } else if exit_code != 0 {
-                    let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
+                    let _ = write!(DualWriter, "[exited: {}]\n", exit_code);
                 }
             }
-            Err(_) => { let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd); }
-            _ => { let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd); }
+            Err(_) => { let _ = write!(DualWriter, "bsh: {}: spawn failed\n", cmd); }
+            _ => { let _ = write!(DualWriter, "bsh: {}: unexpected result\n", cmd); }
         }
     } else {
         // Has args — allocate a page and send via MutableBorrow
@@ -602,14 +681,14 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
                 None, None, size, xous::MemoryFlags::W,
             ))
         } else {
-            let _ = write!(UartWriter, "bsh: {}: internal error\n", cmd);
+            let _ = write!(DualWriter, "bsh: {}: internal error\n", cmd);
             return;
         };
 
         let buf = match page {
             Ok(xous::Result::MemoryRange(range)) => range,
             _ => {
-                let _ = write!(UartWriter, "bsh: {}: out of memory\n", cmd);
+                let _ = write!(DualWriter, "bsh: {}: out of memory\n", cmd);
                 return;
             }
         };
@@ -642,13 +721,13 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
                     b
                 });
                 if exit_code == usize::MAX {
-                    let _ = write!(UartWriter, "bsh: {}: not found\n", cmd);
+                    let _ = write!(DualWriter, "bsh: {}: not found\n", cmd);
                 } else if exit_code != 0 {
-                    let _ = write!(UartWriter, "[exited: {}]\n", exit_code);
+                    let _ = write!(DualWriter, "[exited: {}]\n", exit_code);
                 }
             }
-            Err(_) => { let _ = write!(UartWriter, "bsh: {}: spawn failed\n", cmd); }
-            _ => { let _ = write!(UartWriter, "bsh: {}: unexpected result\n", cmd); }
+            Err(_) => { let _ = write!(DualWriter, "bsh: {}: spawn failed\n", cmd); }
+            _ => { let _ = write!(DualWriter, "bsh: {}: unexpected result\n", cmd); }
         }
 
         // Free the page
@@ -661,11 +740,14 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn _start(uart_base: usize) -> ! {
+pub extern "C" fn _start(uart_base: usize, fb_base: usize) -> ! {
     unsafe {
         UART_BASE = uart_base;
         CWD_BUF[0] = b'/';
         CWD_LEN = 1;
+        if fb_base != 0 {
+            FB_CONSOLE = Some(FbConsole::new(fb_base as *mut u32, FB_WIDTH, FB_HEIGHT, FB_WIDTH));
+        }
     }
 
     // Print banner

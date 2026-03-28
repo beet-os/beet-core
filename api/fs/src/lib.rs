@@ -20,10 +20,14 @@ pub const FS_SID: [u32; 4] = [0x4245_4554, 0x4F53_4653, 0, 0]; // "BEETOSFS"
 /// Maximum path length that fits in 4×usize (32 bytes on 64-bit).
 pub const MAX_PATH_LEN: usize = 4 * core::mem::size_of::<usize>();
 
+/// Byte offset of the status byte in a MutableBorrow buffer (LsBuf, CatBuf).
+/// Layout: [0..32] = path input (null-terminated), [32] = FsError as u8, [33..] = output text.
+pub const BUF_STATUS_OFFSET: usize = MAX_PATH_LEN;
+
+/// Byte offset where output text starts in a MutableBorrow buffer.
+pub const BUF_TEXT_OFFSET: usize = MAX_PATH_LEN + 1;
+
 /// Opcodes for FS service IPC messages.
-///
-/// All ops use BlockingScalar with path packed in arg1-arg4.
-/// For data output (ls, cat), the FS service writes directly to UART.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum FsOp {
@@ -63,6 +67,14 @@ pub enum FsOp {
     /// BlockingScalar: arg1-arg4 = path packed.
     /// Returns Scalar1(FsError): Ok=directory, NotFound, NotDirectory.
     IsDir = 6,
+
+    /// Buffer-based directory listing (MutableBorrow).
+    /// Buffer layout: [0..32] path input, [32] status (FsError as u8), [33..] output text (null-terminated).
+    LsBuf = 7,
+
+    /// Buffer-based file read (MutableBorrow).
+    /// Same layout as LsBuf.
+    CatBuf = 8,
 }
 
 /// Error codes returned by the FS service.

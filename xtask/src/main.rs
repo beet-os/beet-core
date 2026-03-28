@@ -396,6 +396,7 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
         "-serial".to_string(), "stdio".to_string(),
         "-monitor".to_string(), "none".to_string(),
         "-device".to_string(), "ramfb".to_string(),
+        "-device".to_string(), "virtio-keyboard-device".to_string(),
         "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
     ];
 

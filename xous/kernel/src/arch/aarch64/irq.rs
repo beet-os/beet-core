@@ -148,7 +148,7 @@ unsafe extern "C" fn _kernel_irq_handler_rust(context: *mut u8) {
 fn handle_irq() -> bool {
     #[cfg(feature = "platform-qemu-virt")]
     {
-        use crate::platform::qemu_virt::{blk, gic, net, net_stack, timer, uart};
+        use crate::platform::qemu_virt::{blk, gic, input, net, net_stack, timer, uart};
 
         let irq = gic::ack_irq();
         if irq == gic::IRQ_SPURIOUS {
@@ -174,6 +174,12 @@ fn handle_irq() -> bool {
             }
             irq_id if net::irq_number() == Some(irq_id) => {
                 net::handle_irq();
+            }
+            irq_id if input::irq_number() == Some(irq_id) => {
+                input::ack_irq();
+                while let Some(c) = input::get_char() {
+                    send_char_to_console(c);
+                }
             }
             irq_id => {
                 use core::fmt::Write;

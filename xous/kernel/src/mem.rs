@@ -535,6 +535,22 @@ impl MemoryManager {
                 }
             }
         }
+
+        // BeetOS has no demand-paging fault handler: allocate real physical pages eagerly
+        // when phys=0 (anonymous mapping). Without this, map_page would write a valid PTE
+        // pointing to PA=0 (QEMU boot ROM / NOR flash), which rejects cache write-backs and
+        // causes stale reads from IPC shared buffers.
+        #[cfg(beetos)]
+        if phys == 0 {
+            let pid = current_mapping.get_pid();
+            let (allocated, zeroed) = self.alloc_range(size / PAGE_SIZE, pid)?;
+            if !zeroed {
+                let va = beetos::phys_to_virt(allocated);
+                unsafe { core::ptr::write_bytes(va as *mut u8, 0, size); }
+            }
+            phys = allocated;
+        }
+
         // Actually perform the map.  At this stage, every physical page should be owned by us.
         for offset in (0..size).step_by(PAGE_SIZE) {
             let phys_page = if phys == 0 { 0 } else { phys + offset };
