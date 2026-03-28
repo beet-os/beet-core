@@ -353,6 +353,9 @@ fn cmd_cd(args: &[&str]) {
         Some(code) if code == FsError::NotDirectory as usize => {
             let _ = write!(DualWriter, "cd: {}: not a directory\n", target);
         }
+        Some(code) if code == FsError::InvalidPath as usize => {
+            let _ = write!(DualWriter, "cd: {}: invalid path\n", target);
+        }
         None => puts("cd: fs service not available\n"),
         _ => puts("cd: error\n"),
     }
@@ -463,6 +466,9 @@ fn cmd_ls(args: &[&str]) {
         Some(code) if code == FsError::NotDirectory as usize => {
             let _ = write!(DualWriter, "ls: {}: not a directory\n", path);
         }
+        Some(code) if code == FsError::InvalidPath as usize => {
+            let _ = write!(DualWriter, "ls: {}: invalid path\n", path);
+        }
         None => puts("ls: fs service not available\n"),
         _ => puts("ls: error\n"),
     }
@@ -479,6 +485,9 @@ fn cmd_cat(args: &[&str]) {
         }
         Some(code) if code == FsError::IsDirectory as usize => {
             let _ = write!(DualWriter, "cat: {}: is a directory\n", path);
+        }
+        Some(code) if code == FsError::InvalidPath as usize => {
+            let _ = write!(DualWriter, "cat: {}: invalid path\n", path);
         }
         None => puts("cat: fs service not available\n"),
         _ => puts("cat: error\n"),
@@ -516,6 +525,12 @@ fn cmd_write(args: &[&str], full_line: &str) {
         Some(code) if code == FsError::IsDirectory as usize => {
             let _ = write!(DualWriter, "write: {}: is a directory\n", path);
         }
+        Some(code) if code == FsError::NoSpace as usize => {
+            puts("write: no space left\n");
+        }
+        Some(code) if code == FsError::InvalidPath as usize => {
+            let _ = write!(DualWriter, "write: {}: invalid path\n", path);
+        }
         None => puts("write: fs service not available\n"),
         _ => puts("write: error\n"),
     }
@@ -533,6 +548,12 @@ fn cmd_mkdir(args: &[&str]) {
         }
         Some(code) if code == FsError::ReadOnly as usize => {
             let _ = write!(DualWriter, "mkdir: {}: read-only\n", args[0]);
+        }
+        Some(code) if code == FsError::NoSpace as usize => {
+            puts("mkdir: no space left\n");
+        }
+        Some(code) if code == FsError::InvalidPath as usize => {
+            let _ = write!(DualWriter, "mkdir: {}: invalid path\n", args[0]);
         }
         None => puts("mkdir: fs service not available\n"),
         _ => puts("mkdir: error\n"),
@@ -554,6 +575,9 @@ fn cmd_rm(args: &[&str]) {
         }
         Some(code) if code == FsError::ReadOnly as usize => {
             let _ = write!(DualWriter, "rm: {}: read-only\n", args[0]);
+        }
+        Some(code) if code == FsError::InvalidPath as usize => {
+            let _ = write!(DualWriter, "rm: {}: invalid path\n", args[0]);
         }
         None => puts("rm: fs service not available\n"),
         _ => puts("rm: error\n"),

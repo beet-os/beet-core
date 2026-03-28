@@ -219,29 +219,57 @@ impl ReactorInner {
 // ---------------------------------------------------------------------------
 // Global access — single-threaded, RefCell-guarded
 // ---------------------------------------------------------------------------
+//
+// On AArch64 hardware (cfg(beetos)): Xous processes are single-threaded.
+// A global static + RefCell is correct and safe.
+//
+// In hosted mode / tests (cfg(not(beetos))): cargo test spawns multiple OS
+// threads.  thread_local! gives each thread its own reactor instance so that
+// tests running concurrently never share state and never trigger a double-borrow
+// panic from RefCell.
 
+#[cfg(beetos)]
 struct ReactorCell(RefCell<Option<ReactorInner>>);
-
-// SAFETY: Xous processes are single-threaded.  The RefCell is only
-// borrowed from the executor loop and from futures polled by that loop —
-// never concurrently.
+// SAFETY: single-threaded on AArch64 hardware.
+#[cfg(beetos)]
 unsafe impl Sync for ReactorCell {}
-
+#[cfg(beetos)]
 static REACTOR: ReactorCell = ReactorCell(RefCell::new(None));
 
+#[cfg(not(beetos))]
+std::thread_local! {
+    static REACTOR: RefCell<Option<ReactorInner>> = const { RefCell::new(None) };
+}
+
 fn with<R>(f: impl FnOnce(&mut ReactorInner) -> R) -> R {
-    let mut borrow = REACTOR.0.borrow_mut();
-    f(borrow.as_mut().expect("xous-async-rt: reactor not initialised (call Executor::run)"))
+    #[cfg(beetos)]
+    {
+        let mut borrow = REACTOR.0.borrow_mut();
+        f(borrow.as_mut().expect("xous-async-rt: reactor not initialised (call Executor::run)"))
+    }
+    #[cfg(not(beetos))]
+    {
+        REACTOR.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            f(borrow.as_mut().expect("xous-async-rt: reactor not initialised (call Executor::run)"))
+        })
+    }
 }
 
 // -- Public (crate) API -----------------------------------------------------
 
 pub(crate) fn init() {
-    *REACTOR.0.borrow_mut() = Some(ReactorInner::new());
+    #[cfg(beetos)]
+    { *REACTOR.0.borrow_mut() = Some(ReactorInner::new()); }
+    #[cfg(not(beetos))]
+    { REACTOR.with(|cell| *cell.borrow_mut() = Some(ReactorInner::new())); }
 }
 
 pub(crate) fn shutdown() {
-    *REACTOR.0.borrow_mut() = None;
+    #[cfg(beetos)]
+    { *REACTOR.0.borrow_mut() = None; }
+    #[cfg(not(beetos))]
+    { REACTOR.with(|cell| *cell.borrow_mut() = None); }
 }
 
 // Servers

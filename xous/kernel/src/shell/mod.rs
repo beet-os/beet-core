@@ -441,13 +441,9 @@ impl JoinWithSpaces for [&str] {
 #[allow(static_mut_refs)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Reuse ramfs test lock since we share the same static state.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = ramfs::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ramfs::reset();
         ramfs::init();
         guard

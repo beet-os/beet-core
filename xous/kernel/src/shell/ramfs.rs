@@ -323,13 +323,14 @@ pub fn stats() -> (usize, usize, usize) {
     (used, MAX_FILES, bytes)
 }
 
+/// Shared test lock — exported so `shell::tests` can serialize against the same
+/// global `static mut FS` without a separate mutex.
+#[cfg(test)]
+pub(super) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Guard to serialize tests that share the global `static mut FS`.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Helper: reset + init before each test.
     /// Returns the MutexGuard to hold the lock for the test's duration.
