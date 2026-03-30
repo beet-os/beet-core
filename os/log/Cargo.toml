@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 xous = { path = "../../xous/xous-rs" }
+beetos = { path = "../../beetos", features = ["fb"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }

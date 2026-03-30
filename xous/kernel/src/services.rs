@@ -1215,10 +1215,12 @@ impl SystemServices {
         // Grant all syscall permissions
         self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
 
-        // Map UART MMIO into the new process
+        // Map UART MMIO, framebuffer, and cursor page into the new process.
         #[cfg(feature = "platform-qemu-virt")]
         {
+            use crate::platform::qemu_virt::fb::{FB_PHYS, FB_SIZE, CURSOR_PHYS};
             const UART_PHYS: usize = 0x0900_0000;
+            let fb_pages = FB_SIZE / beetos::PAGE_SIZE;
             crate::mem::MemoryManager::with_mut(|mm| {
                 let process = self.process_mut(pid).expect("spawned process");
                 process.mapping.map_page(
@@ -1227,14 +1229,40 @@ impl SystemServices {
                     crate::arch::boot::SHELL_UART_VA as *mut usize,
                     xous::MemoryFlags::W | xous::MemoryFlags::DEV,
                     true,
-                ).ok(); // May fail if already mapped, that's fine
+                ).ok();
+                for i in 0..fb_pages {
+                    let phys = FB_PHYS + i * beetos::PAGE_SIZE;
+                    let va   = beetos::SHELL_FB_VA + i * beetos::PAGE_SIZE;
+                    process.mapping.map_page(
+                        mm,
+                        phys,
+                        va as *mut usize,
+                        xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                        true,
+                    ).ok();
+                }
+                process.mapping.map_page(
+                    mm,
+                    CURSOR_PHYS,
+                    beetos::SHARED_CURSOR_VA as *mut usize,
+                    xous::MemoryFlags::W,
+                    true,
+                ).ok();
             });
         }
 
-        // Pass UART VA via x0
+        // Pass x0=uart_va, x1=fb_va, x2=0, x3=0
         {
             let idx = pid.get() as usize - 1;
-            unsafe { crate::arch::process::set_thread_arg0(idx, crate::arch::boot::SHELL_UART_VA); }
+            unsafe {
+                crate::arch::process::set_thread_args4(
+                    idx,
+                    crate::arch::boot::SHELL_UART_VA,
+                    beetos::SHELL_FB_VA,
+                    0,
+                    0,
+                );
+            }
         }
 
         println!("[*] spawn_by_name: created '{}' as PID {}", name, pid);
@@ -1284,10 +1312,12 @@ impl SystemServices {
         // Grant all syscall permissions
         self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
 
-        // Map UART MMIO into the new process
+        // Map UART MMIO, framebuffer, and cursor page into the new process.
         #[cfg(feature = "platform-qemu-virt")]
         {
+            use crate::platform::qemu_virt::fb::{FB_PHYS, FB_SIZE, CURSOR_PHYS};
             const UART_PHYS: usize = 0x0900_0000;
+            let fb_pages = FB_SIZE / beetos::PAGE_SIZE;
             crate::mem::MemoryManager::with_mut(|mm| {
                 let process = self.process_mut(pid).expect("spawned process");
                 process.mapping.map_page(
@@ -1295,6 +1325,24 @@ impl SystemServices {
                     UART_PHYS,
                     crate::arch::boot::SHELL_UART_VA as *mut usize,
                     xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                    true,
+                ).ok();
+                for i in 0..fb_pages {
+                    let phys = FB_PHYS + i * beetos::PAGE_SIZE;
+                    let va   = beetos::SHELL_FB_VA + i * beetos::PAGE_SIZE;
+                    process.mapping.map_page(
+                        mm,
+                        phys,
+                        va as *mut usize,
+                        xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                        true,
+                    ).ok();
+                }
+                process.mapping.map_page(
+                    mm,
+                    CURSOR_PHYS,
+                    beetos::SHARED_CURSOR_VA as *mut usize,
+                    xous::MemoryFlags::W,
                     true,
                 ).ok();
             });
@@ -1362,14 +1410,15 @@ impl SystemServices {
             0
         };
 
-        // Set x0 = UART VA, x1 = ARGV_PAGE_VA (or 0), x2 = argv_len
+        // Set x0=uart_va, x1=fb_va, x2=argv_va (or 0), x3=argv_len
         {
             let idx = pid.get() as usize - 1;
             let argv_va = if actual_argv_len > 0 { beetos::ARGV_PAGE_VA } else { 0 };
             unsafe {
-                crate::arch::process::set_thread_args(
+                crate::arch::process::set_thread_args4(
                     idx,
                     crate::arch::boot::SHELL_UART_VA,
+                    beetos::SHELL_FB_VA,
                     argv_va,
                     actual_argv_len,
                 );

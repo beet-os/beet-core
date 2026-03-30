@@ -69,6 +69,17 @@ impl FbConsole {
         }
     }
 
+    /// Return the current cursor position as `(row, col)`.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.row, self.col)
+    }
+
+    /// Set the cursor position, clamping to valid bounds.
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        self.row = row.min(self.rows.saturating_sub(1));
+        self.col = col.min(self.cols.saturating_sub(1));
+    }
+
     /// Clear the screen and reset the cursor.
     #[allow(dead_code)]
     pub fn clear(&mut self) {

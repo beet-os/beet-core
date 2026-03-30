@@ -296,5 +296,13 @@ pub const SHELL_UART_VA: usize = 0x10_0100_0000;
 #[cfg(feature = "platform-qemu-virt")]
 pub const SHELL_FB_VA: usize = 0x10_0200_0000;
 
+/// Virtual address of the shared framebuffer cursor page.
+///
+/// Mapped at a fixed VA in every process that writes to the framebuffer
+/// (shell, log server, spawned apps). Layout: `[0..4]` = row (u32 LE),
+/// `[4..8]` = col (u32 LE). Processes must sync this page before and
+/// after FB writes to keep cursor state consistent across processes.
+pub const SHARED_CURSOR_VA: usize = 0x10_0240_0000;
+
 /// Maximum size of argv data (fits in one page).
 pub const ARGV_MAX_LEN: usize = PAGE_SIZE;

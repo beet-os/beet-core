@@ -238,14 +238,18 @@ pub unsafe fn init_memory(fdt_phys: *const u8) -> BootInfo {
     // Cap to compile-time max (bitmap size is fixed)
     let mut ram_size = ram_size_raw.min(beetos::RAM_SIZE);
 
-    // Reserve framebuffer at the top of RAM so the MemoryManager never
-    // allocates that region.  Only applies on QEMU virt (ramfb).
+    // Reserve framebuffer + shared cursor page at the top of RAM so the
+    // MemoryManager never allocates those regions.  Only applies on QEMU virt.
     #[cfg(feature = "platform-qemu-virt")]
     {
-        use crate::platform::qemu_virt::fb::FB_SIZE;
-        if ram_size >= FB_SIZE {
-            ram_size -= FB_SIZE;
+        use crate::platform::qemu_virt::fb::{FB_SIZE, CURSOR_PHYS};
+        let reserved = FB_SIZE + PAGE_SIZE; // FB + one cursor page
+        if ram_size >= reserved {
+            ram_size -= reserved;
         }
+        // Zero the cursor page so it starts at (row=0, col=0).
+        let cursor_kva = beetos::phys_to_virt(CURSOR_PHYS) as *mut u8;
+        unsafe { core::ptr::write_bytes(cursor_kva, 0, PAGE_SIZE); }
     }
 
     // 2. Set up bump allocator after kernel _end (high VA)
@@ -515,25 +519,37 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         });
     }
 
-    // Map framebuffer into the shell's address space so it can render text there.
+    // Map framebuffer + shared cursor page into the shell and log server.
+    // Both processes render text there (shell for interactive output,
+    // log server for println!/eprintln! from std programs).
     #[cfg(feature = "platform-qemu-virt")]
     {
-        use crate::platform::qemu_virt::fb::{FB_PHYS, FB_SIZE};
+        use crate::platform::qemu_virt::fb::{FB_PHYS, FB_SIZE, CURSOR_PHYS};
         let fb_pages = FB_SIZE / beetos::PAGE_SIZE;
-        let shell_fb_va = beetos::SHELL_FB_VA;
+        let fb_va = beetos::SHELL_FB_VA;
         crate::services::SystemServices::with_mut(|ss| {
             crate::mem::MemoryManager::with_mut(|mm| {
-                let process = ss.process_mut(shell_pid).expect("process for FB map");
-                for i in 0..fb_pages {
-                    let phys = FB_PHYS + i * beetos::PAGE_SIZE;
-                    let va   = shell_fb_va + i * beetos::PAGE_SIZE;
+                for &pid in &[shell_pid, log_pid] {
+                    let process = ss.process_mut(pid).expect("process for FB map");
+                    for i in 0..fb_pages {
+                        let phys = FB_PHYS + i * beetos::PAGE_SIZE;
+                        let va   = fb_va + i * beetos::PAGE_SIZE;
+                        process.mapping.map_page(
+                            mm,
+                            phys,
+                            va as *mut usize,
+                            xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                            true,
+                        ).expect("map FB");
+                    }
+                    // Map shared cursor page (one page just below the FB).
                     process.mapping.map_page(
                         mm,
-                        phys,
-                        va as *mut usize,
-                        xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                        CURSOR_PHYS,
+                        beetos::SHARED_CURSOR_VA as *mut usize,
+                        xous::MemoryFlags::W,
                         true,
-                    ).expect("map FB");
+                    ).expect("map cursor page");
                 }
             });
         });
@@ -620,10 +636,15 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let (disk_va, disk_size) = (0usize, 0usize);
 
     // Pass boot parameters via registers:
-    //   log/procman/shell/hello: x0 = UART VA
-    //   fs service:              x0 = UART VA, x1 = disk VA, x2 = disk size
+    //   log:     x0 = UART VA, x1 = FB VA (for framebuffer console)
+    //   procman/hello: x0 = UART VA
+    //   shell:   x0 = UART VA, x1 = FB VA
+    //   fs:      x0 = UART VA, x1 = disk VA, x2 = disk size
     {
         let idx = log_pid.get() as usize - 1;
+        #[cfg(feature = "platform-qemu-virt")]
+        super::process::set_thread_args(idx, SHELL_UART_VA, beetos::SHELL_FB_VA, 0);
+        #[cfg(not(feature = "platform-qemu-virt"))]
         super::process::set_thread_arg0(idx, SHELL_UART_VA);
     }
     {

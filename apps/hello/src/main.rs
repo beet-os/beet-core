@@ -121,7 +121,7 @@ const UART_FR_TXFF: u32 = 1 << 5;
 
 static mut UART_BASE: usize = 0;
 
-fn putc(c: u8) {
+fn uart_putc(c: u8) {
     unsafe {
         if UART_BASE == 0 {
             return;
@@ -134,6 +134,35 @@ fn putc(c: u8) {
         }
         core::ptr::write_volatile((base + UART_DR) as *mut u32, c as u32);
     }
+}
+
+// ============================================================================
+// Framebuffer output
+// ============================================================================
+
+use beetos::fb_console::FbConsole;
+
+const FB_WIDTH:  usize = 1280;
+const FB_HEIGHT: usize = 800;
+
+static mut FB_CONSOLE: Option<FbConsole> = None;
+
+fn fb_putc(c: u8) {
+    unsafe {
+        if let Some(ref mut con) = FB_CONSOLE {
+            con.putc(c);
+            // Keep shared cursor page up to date.
+            let (row, col) = con.cursor();
+            let ptr = beetos::SHARED_CURSOR_VA as *mut u32;
+            core::ptr::write_volatile(ptr, row as u32);
+            core::ptr::write_volatile(ptr.add(1), col as u32);
+        }
+    }
+}
+
+fn putc(c: u8) {
+    uart_putc(c);
+    fb_putc(c);
 }
 
 fn puts(s: &str) {
@@ -175,9 +204,10 @@ fn put_usize(mut n: usize) {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Read boot parameters from registers BEFORE any function call or syscall.
-    // The kernel sets x0=uart_va, x1=argv_ptr, x2=argv_len before ERET.
+    // The kernel sets x0=uart_va, x1=fb_va, x2=argv_ptr, x3=argv_len before ERET.
     // Any syscall (including GetProcessId) will clobber x0-x7.
     let uart_base: usize;
+    let fb_base: usize;
     let argv_ptr: usize;
     let argv_len: usize;
     unsafe {
@@ -185,12 +215,25 @@ pub extern "C" fn _start() -> ! {
             "mov {0}, x0",
             "mov {1}, x1",
             "mov {2}, x2",
+            "mov {3}, x3",
             out(reg) uart_base,
+            out(reg) fb_base,
             out(reg) argv_ptr,
             out(reg) argv_len,
             options(nomem, nostack),
         );
         UART_BASE = uart_base;
+        if fb_base != 0 {
+            FB_CONSOLE = Some(FbConsole::new(fb_base as *mut u32, FB_WIDTH, FB_HEIGHT, FB_WIDTH));
+            // Restore the cursor from the shared page so we write after
+            // the shell's output, not at row 0.
+            let ptr = beetos::SHARED_CURSOR_VA as *const u32;
+            let row = core::ptr::read_volatile(ptr) as usize;
+            let col = core::ptr::read_volatile(ptr.add(1)) as usize;
+            if let Some(ref mut con) = FB_CONSOLE {
+                con.set_cursor(row, col);
+            }
+        }
     }
 
     // Get our PID

@@ -57,6 +57,26 @@ fn fb_putc(c: u8) {
     unsafe {
         if let Some(ref mut con) = FB_CONSOLE {
             con.putc(c);
+            // Keep shared cursor page in sync so the log server writes
+            // in the right position when it receives a println! message.
+            let (row, col) = con.cursor();
+            let ptr = beetos::SHARED_CURSOR_VA as *mut u32;
+            core::ptr::write_volatile(ptr, row as u32);
+            core::ptr::write_volatile(ptr.add(1), col as u32);
+        }
+    }
+}
+
+/// Re-read the cursor from the shared page into our FbConsole.
+/// Call this after a spawned process returns so we pick up any FB
+/// output it wrote (hello-nostd, hello-std via log server, etc.).
+fn sync_cursor_from_shared() {
+    unsafe {
+        if let Some(ref mut con) = FB_CONSOLE {
+            let ptr = beetos::SHARED_CURSOR_VA as *const u32;
+            let row = core::ptr::read_volatile(ptr) as usize;
+            let col = core::ptr::read_volatile(ptr.add(1)) as usize;
+            con.set_cursor(row, col);
         }
     }
 }
@@ -697,6 +717,9 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
             Err(_) => { let _ = write!(DualWriter, "bsh: {}: spawn failed\n", cmd); }
             _ => { let _ = write!(DualWriter, "bsh: {}: unexpected result\n", cmd); }
         }
+        // Sync cursor after the spawned process (or log server) wrote to FB.
+        sync_cursor_from_shared();
+        return;
     } else {
         // Has args — allocate a page and send via MutableBorrow
         let page_size = xous::MemorySize::new(beetos::PAGE_SIZE);
@@ -757,6 +780,10 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
         // Free the page
         xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
     }
+
+    // Re-sync cursor: the spawned process (or the log server on its behalf)
+    // may have written to the FB and updated the shared cursor page.
+    sync_cursor_from_shared();
 }
 
 // ============================================================================
@@ -797,6 +824,9 @@ pub extern "C" fn _start(uart_base: usize, fb_base: usize) -> ! {
             Ok(xous::Result::MessageEnvelope(env)) => {
                 if let xous::Message::Scalar(scalar) = env.body {
                     if scalar.id == beetos_api_console::ConsoleOp::Char as usize {
+                        // Re-sync cursor in case the log server wrote something
+                        // on behalf of a spawned process between keystrokes.
+                        sync_cursor_from_shared();
                         process_char(scalar.arg1 as u8);
                     }
                 }
