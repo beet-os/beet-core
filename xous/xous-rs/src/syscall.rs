@@ -537,6 +537,23 @@ pub enum SysCall {
     #[cfg(beetos)]
     ReleaseDisplay(usize /* row */, usize /* col */),
 
+    /// Claim keyboard input focus for the current display session.
+    ///
+    /// The caller must already hold the display lock (via `AcquireDisplay`).
+    /// Subsequent keystrokes are delivered to the given SID instead of the
+    /// kernel's fallback buffer. Any characters buffered since the last
+    /// `ReleaseDisplay` are drained to the SID immediately.
+    ///
+    /// # Arguments
+    ///
+    /// Four `u32` words encoding the target SID (a0..a3).
+    ///
+    /// # Errors
+    ///
+    /// * **AccessDenied**: caller is not the current display owner.
+    #[cfg(beetos)]
+    AcquireInputFocus(u32, u32, u32, u32),
+
     /// This syscall does not exist. It captures all possible
     /// arguments so detailed analysis can be performed.
     Invalid(usize, usize, usize, usize, usize, usize, usize),
@@ -609,6 +626,7 @@ pub enum SysCallNumber {
     GetBinaryName = 64,
     AcquireDisplay = 65,
     ReleaseDisplay = 66,
+    AcquireInputFocus = 67,
 
     Invalid,
 }
@@ -682,6 +700,7 @@ impl SysCallNumber {
             64 => GetBinaryName,
             65 => AcquireDisplay,
             66 => ReleaseDisplay,
+            67 => AcquireInputFocus,
             _ => Invalid,
         }
     }
@@ -1040,6 +1059,10 @@ impl SysCall {
             SysCall::ReleaseDisplay(row, col) => {
                 [SysCallNumber::ReleaseDisplay as usize, *row, *col, 0, 0, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::AcquireInputFocus(a, b, c, d) => {
+                [SysCallNumber::AcquireInputFocus as usize, *a as usize, *b as usize, *c as usize, *d as usize, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1241,6 +1264,10 @@ impl SysCall {
             SysCallNumber::AcquireDisplay => SysCall::AcquireDisplay,
             #[cfg(beetos)]
             SysCallNumber::ReleaseDisplay => SysCall::ReleaseDisplay(a1, a2),
+            #[cfg(beetos)]
+            SysCallNumber::AcquireInputFocus => {
+                SysCall::AcquireInputFocus(a1 as u32, a2 as u32, a3 as u32, a4 as u32)
+            }
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1258,7 +1285,8 @@ impl SysCall {
             | SysCallNumber::PostEvent
             | SysCallNumber::GetBinaryName
             | SysCallNumber::AcquireDisplay
-            | SysCallNumber::ReleaseDisplay => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::ReleaseDisplay
+            | SysCallNumber::AcquireInputFocus => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }

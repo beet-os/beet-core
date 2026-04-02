@@ -89,6 +89,16 @@ fn release_display(row: usize, col: usize) {
     xous::rsyscall(xous::SysCall::ReleaseDisplay(row, col)).ok();
 }
 
+/// Claim keyboard input focus.
+///
+/// Must be called immediately after `acquire_display`.  Passes `CONSOLE_SID`
+/// so the kernel routes subsequent keystrokes here, and drains any characters
+/// buffered since the previous owner released the display.
+fn acquire_input_focus() {
+    let [a, b, c, d] = beetos_api_console::CONSOLE_SID;
+    xous::rsyscall(xous::SysCall::AcquireInputFocus(a, b, c, d)).ok();
+}
+
 // ============================================================================
 // Combined output (UART + FB)
 // ============================================================================
@@ -722,6 +732,7 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
 
         // Re-acquire display after the child ran; cursor is now updated.
         let (row, col) = acquire_display();
+        acquire_input_focus();
         unsafe {
             if let Some(ref mut con) = FB_CONSOLE {
                 con.set_cursor(row, col);
@@ -783,6 +794,7 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
 
         // Re-acquire display after the child ran.
         let (row, col) = acquire_display();
+        acquire_input_focus();
         unsafe {
             if let Some(ref mut con) = FB_CONSOLE {
                 con.set_cursor(row, col);
@@ -830,8 +842,9 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
         ));
     }
 
-    // Acquire the display, print banner + prompt, then release.
+    // Acquire the display and keyboard focus, print banner + prompt, then release.
     let (row, col) = acquire_display();
+    acquire_input_focus();
     unsafe {
         if let Some(ref mut con) = FB_CONSOLE {
             con.set_cursor(row, col);
@@ -864,6 +877,7 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
                     if scalar.id == beetos_api_console::ConsoleOp::Char as usize {
                         // Acquire display, sync cursor, process char, release.
                         let (row, col) = acquire_display();
+                        acquire_input_focus();
                         unsafe {
                             if let Some(ref mut con) = FB_CONSOLE {
                                 con.set_cursor(row, col);

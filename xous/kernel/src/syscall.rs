@@ -416,7 +416,7 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         SysCall::GetBinaryName(_) => Ok(()),
 
         #[cfg(beetos)]
-        SysCall::AcquireDisplay | SysCall::ReleaseDisplay(..) => Ok(()),
+        SysCall::AcquireDisplay | SysCall::ReleaseDisplay(..) | SysCall::AcquireInputFocus(..) => Ok(()),
 
         // Messaging-related calls
         SysCall::CreateServer
@@ -1025,6 +1025,24 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         SysCall::ReleaseDisplay(row, col) => SystemServices::with_mut(|ss| {
             ss.release_display(row, col);
             Ok(xous::Result::Ok)
+        }),
+
+        #[cfg(beetos)]
+        SysCall::AcquireInputFocus(a, b, c, d) => SystemServices::with_mut(|ss| {
+            let pid = crate::arch::process::current_pid();
+            let sid_words = [a, b, c, d];
+            let mut buf = [0u8; crate::services::INPUT_BUF_CAP];
+            match ss.acquire_input_focus(pid, sid_words, &mut buf) {
+                Ok(n) => {
+                    // Drain buffered chars to the newly-registered SID.
+                    #[cfg(feature = "platform-qemu-virt")]
+                    for i in 0..n {
+                        crate::arch::irq::deliver_char_to_sid(ss, sid_words, buf[i]);
+                    }
+                    Ok(xous::Result::Ok)
+                }
+                Err(e) => Err(e),
+            }
         }),
 
         _ => Err(Error::UnhandledSyscall),

@@ -163,9 +163,9 @@ fn handle_irq() -> bool {
                 net_stack::tick(count);
             }
             uart::UART_IRQ => {
-                // Read all pending characters and send to the shell process via IPC
+                // Read all pending characters and route to input focus owner.
                 while let Some(c) = uart::try_getc() {
-                    send_char_to_console(c);
+                    dispatch_input_char(c);
                 }
                 uart::clear_rx_interrupt();
             }
@@ -178,7 +178,7 @@ fn handle_irq() -> bool {
             irq_id if input::irq_number() == Some(irq_id) => {
                 input::ack_irq();
                 while let Some(c) = input::get_char() {
-                    send_char_to_console(c);
+                    dispatch_input_char(c);
                 }
             }
             irq_id => {
@@ -218,66 +218,83 @@ fn handle_irq() -> bool {
     { /* TODO(M3b): AIC dispatch */ false }
 }
 
-/// Send a received UART character to the console/shell server via IPC.
+/// Route a character received from hardware input to the process that currently
+/// holds keyboard input focus.
 ///
-/// Called from IRQ context. Finds the console server by its well-known SID,
-/// and delivers a Scalar message containing the character. If the server
-/// thread is blocked in ReceiveMessage, it is woken up.
+/// Called from IRQ context.
+/// - If a SID is registered via `AcquireInputFocus`, deliver directly to it.
+/// - Otherwise, buffer the char in the kernel ring buffer for delivery when
+///   the next process registers input focus.
 #[cfg(feature = "platform-qemu-virt")]
-fn send_char_to_console(c: u8) {
+fn dispatch_input_char(c: u8) {
     use crate::services::SystemServices;
-    use xous::{Message, ScalarMessage, SID};
-
-    let console_sid = SID::from_array(beetos_api_console::CONSOLE_SID);
 
     SystemServices::with_mut(|ss| {
-        // Find the console server. It may not exist yet during early boot.
-        let sidx = match ss.servers.iter().position(|s| {
-            s.as_ref().is_some_and(|s| s.sid == console_sid)
-        }) {
-            Some(idx) => idx,
-            None => return, // Console server not registered yet
-        };
-
-        let server = match ss.server_from_sidx_mut(sidx) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let server_pid = server.pid;
-
-        // Create a Scalar message with the char
-        let msg = Message::Scalar(ScalarMessage {
-            id: beetos_api_console::ConsoleOp::Char as usize,
-            arg1: c as usize,
-            arg2: 0,
-            arg3: 0,
-            arg4: 0,
-        });
-
-        // If the server has a thread parked in ReceiveMessage, deliver directly
-        if let Some(server_tid) = server.take_available_thread() {
-            let sender = xous::MessageSender::from_usize(0); // kernel sender
-            let envelope = xous::MessageEnvelope { sender, body: msg };
-
-            if let Ok(p) = ss.process_mut(server_pid) {
-                p.take_kernel_future(server_tid);
-                p.set_thread_state(server_tid, crate::process::ThreadState::Ready);
-            }
-            ss.set_thread_result(server_pid, server_tid, xous::Result::MessageEnvelope(envelope))
-                .ok();
-        } else {
-            // Queue the message for later pickup
-            let kernel_pid = xous::PID::new(1).unwrap();
-            ss.queue_server_message(sidx, kernel_pid, 1, msg, None).ok();
-            // Wake the server thread so it polls the queue via its kernel future
-            if let Ok(process) = ss.process_mut(server_pid) {
-                if let Some((woken_tid, fired_bits)) = process.post_notification_bits(1) {
-                    ss.set_thread_result(server_pid, woken_tid, xous::Result::Scalar1(fired_bits)).ok();
-                }
-            }
+        match ss.display_input_sid() {
+            Some(sid_words) => deliver_char_to_sid(ss, sid_words, c),
+            None => ss.push_display_input_char(c),
         }
     });
+}
+
+/// Deliver a single character to the server registered at `sid_words` via IPC.
+///
+/// This is the low-level delivery primitive shared by `dispatch_input_char`
+/// (live delivery from IRQ) and the `AcquireInputFocus` syscall handler
+/// (draining the buffer to the new owner).
+///
+/// `ss` must already be locked by the caller.
+#[cfg(feature = "platform-qemu-virt")]
+pub(crate) fn deliver_char_to_sid(
+    ss: &mut crate::services::SystemServices,
+    sid_words: [u32; 4],
+    c: u8,
+) {
+    use xous::{Message, MessageSender, ScalarMessage, SID};
+
+    let target_sid = SID::from_array(sid_words);
+
+    let sidx = match ss.servers.iter().position(|s| {
+        s.as_ref().is_some_and(|s| s.sid == target_sid)
+    }) {
+        Some(idx) => idx,
+        None => return, // server not registered yet
+    };
+
+    let server = match ss.server_from_sidx_mut(sidx) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let server_pid = server.pid;
+
+    let msg = Message::Scalar(ScalarMessage {
+        id: beetos_api_console::ConsoleOp::Char as usize,
+        arg1: c as usize,
+        arg2: 0,
+        arg3: 0,
+        arg4: 0,
+    });
+
+    if let Some(server_tid) = server.take_available_thread() {
+        let sender = MessageSender::from_usize(0); // kernel sender
+        let envelope = xous::MessageEnvelope { sender, body: msg };
+
+        if let Ok(p) = ss.process_mut(server_pid) {
+            p.take_kernel_future(server_tid);
+            p.set_thread_state(server_tid, crate::process::ThreadState::Ready);
+        }
+        ss.set_thread_result(server_pid, server_tid, xous::Result::MessageEnvelope(envelope))
+            .ok();
+    } else {
+        let kernel_pid = xous::PID::new(1).unwrap();
+        ss.queue_server_message(sidx, kernel_pid, 1, msg, None).ok();
+        if let Ok(process) = ss.process_mut(server_pid) {
+            if let Some((woken_tid, fired_bits)) = process.post_notification_bits(1) {
+                ss.set_thread_result(server_pid, woken_tid, xous::Result::Scalar1(fired_bits)).ok();
+            }
+        }
+    }
 }
 
 /// Handle an SVC (syscall) from userspace.

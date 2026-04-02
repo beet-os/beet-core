@@ -27,12 +27,20 @@ const MAX_SERVER_COUNT: usize = 128;
 /// Maximum number of processes waiting for the display at once.
 const DISPLAY_WAITER_MAX: usize = 16;
 
+/// Capacity of the keyboard input ring buffer (bytes).
+pub(crate) const INPUT_BUF_CAP: usize = 64;
+
 /// Kernel state for exclusive display ownership.
 ///
 /// At most one process holds the framebuffer at a time.  Others block on
 /// `AcquireDisplay` and are queued here.  When the owner calls
 /// `ReleaseDisplay(row, col)`, the cursor position is stored and the first
 /// waiter is handed ownership.
+///
+/// Input focus follows display ownership: the owner may call
+/// `AcquireInputFocus(sid)` to register where keyboard characters should be
+/// delivered.  Characters arriving while no focus is claimed are buffered in
+/// `input_buf` and drained on the next `AcquireInputFocus`.
 #[cfg(beetos)]
 struct DisplayState {
     /// Current owner, or `None` if the display is free.
@@ -45,6 +53,14 @@ struct DisplayState {
     waiters: [(PID, TID); DISPLAY_WAITER_MAX],
     waiter_head: usize,
     waiter_count: usize,
+    /// SID to which keyboard characters are currently routed, or `None` to buffer.
+    input_sid: Option<[u32; 4]>,
+    /// Ring buffer for characters arriving while no input focus is claimed.
+    input_buf: [u8; INPUT_BUF_CAP],
+    /// Index of the oldest byte in `input_buf`.
+    input_head: usize,
+    /// Number of bytes currently in `input_buf`.
+    input_count: usize,
 }
 
 #[cfg(beetos)]
@@ -59,6 +75,10 @@ impl DisplayState {
             waiters: [(DUMMY_PID, DUMMY_TID); DISPLAY_WAITER_MAX],
             waiter_head: 0,
             waiter_count: 0,
+            input_sid: None,
+            input_buf: [0u8; INPUT_BUF_CAP],
+            input_head: 0,
+            input_count: 0,
         }
     }
 
@@ -82,6 +102,40 @@ impl DisplayState {
         self.waiter_head = (self.waiter_head + 1) % DISPLAY_WAITER_MAX;
         self.waiter_count -= 1;
         Some(entry)
+    }
+
+    fn set_input_focus(&mut self, sid: [u32; 4]) {
+        self.input_sid = Some(sid);
+    }
+
+    fn clear_input_focus(&mut self) {
+        self.input_sid = None;
+    }
+
+    /// Push one byte into the ring buffer, dropping the oldest byte when full.
+    pub(crate) fn push_input_char(&mut self, c: u8) {
+        if self.input_count < INPUT_BUF_CAP {
+            let tail = (self.input_head + self.input_count) % INPUT_BUF_CAP;
+            self.input_buf[tail] = c;
+            self.input_count += 1;
+        } else {
+            // Full — overwrite oldest byte.
+            self.input_buf[self.input_head] = c;
+            self.input_head = (self.input_head + 1) % INPUT_BUF_CAP;
+        }
+    }
+
+    /// Drain all buffered bytes into `out`, returning the count.
+    fn drain_input_buf(&mut self, out: &mut [u8; INPUT_BUF_CAP]) -> usize {
+        let n = self.input_count;
+
+        for i in 0..n {
+            out[i] = self.input_buf[(self.input_head + i) % INPUT_BUF_CAP];
+        }
+
+        self.input_head = 0;
+        self.input_count = 0;
+        n
     }
 }
 
@@ -1467,6 +1521,44 @@ impl SystemServices {
         (self.display_state.cursor_row, self.display_state.cursor_col)
     }
 
+    /// Return the SID currently registered for keyboard input, if any.
+    #[cfg(beetos)]
+    pub fn display_input_sid(&self) -> Option<[u32; 4]> {
+        self.display_state.input_sid
+    }
+
+    /// Push a character into the kernel input buffer (called from IRQ context
+    /// when no input focus is registered).
+    #[cfg(beetos)]
+    pub fn push_display_input_char(&mut self, c: u8) {
+        self.display_state.push_input_char(c);
+    }
+
+    /// Register `sid_words` as the keyboard input destination for the current
+    /// display session.  The caller must be the current display owner.
+    ///
+    /// Any characters buffered since the last `ReleaseDisplay` are returned via
+    /// `out_buf` so the caller can drain them to the SID.  Returns the number
+    /// of buffered bytes copied into `out_buf`.
+    ///
+    /// Returns `Err(AccessDenied)` if `pid` is not the current display owner.
+    #[cfg(beetos)]
+    pub fn acquire_input_focus(
+        &mut self,
+        pid: PID,
+        sid_words: [u32; 4],
+        out_buf: &mut [u8; INPUT_BUF_CAP],
+    ) -> Result<usize, xous::Error> {
+        if self.display_state.owner.map(|(p, _)| p) != Some(pid) {
+            return Err(xous::Error::AccessDenied);
+        }
+
+        self.display_state.set_input_focus(sid_words);
+
+        let n = self.display_state.drain_input_buf(out_buf);
+        Ok(n)
+    }
+
     /// Try to acquire exclusive display ownership for `(pid, tid)`.
     ///
     /// Returns `true` if ownership was granted immediately (the display was
@@ -1505,6 +1597,7 @@ impl SystemServices {
         self.display_state.owner = None;
         self.display_state.cursor_row = row;
         self.display_state.cursor_col = col;
+        self.display_state.clear_input_focus();
         self.unmap_fb_for(pid);
 
         // Hand off to next waiter, if any.
@@ -1528,6 +1621,7 @@ impl SystemServices {
             let col = self.display_state.cursor_col;
             // Don't unmap — the process page tables are being freed anyway.
             self.display_state.owner = None;
+            self.display_state.clear_input_focus();
 
             // Hand off to next waiter, if any.
             if let Some((waiter_pid, waiter_tid)) = self.display_state.pop_waiter() {
