@@ -166,6 +166,45 @@ impl<'a> TarArchive<'a> {
         }
     }
 
+    /// Returns true if `dir` is a valid directory in the archive.
+    ///
+    /// Accepts both explicit directory entries (type `5`) and implicit
+    /// directories inferred from any entry whose path starts with `dir/`.
+    pub fn has_dir(&self, dir: &str) -> bool {
+        let dir = dir.strip_prefix('/').unwrap_or(dir);
+        let dir = dir.strip_suffix('/').unwrap_or(dir);
+
+        if dir.is_empty() {
+            return true; // archive root always exists
+        }
+
+        let mut offset = 0;
+        while offset + HEADER_SIZE <= self.data.len() {
+            let header_bytes: &[u8; HEADER_SIZE] = match self.data[offset..offset + HEADER_SIZE].try_into() {
+                Ok(h) => h,
+                Err(_) => break,
+            };
+            let header = TarHeader { data: header_bytes };
+            if !header.is_valid() { break; }
+            let size = header.size();
+            let name = header.name();
+            let name = name.strip_prefix('/').unwrap_or(name);
+            let name_clean = name.strip_suffix('/').unwrap_or(name);
+
+            // Explicit directory entry
+            if name_clean == dir && header.is_dir() {
+                return true;
+            }
+            // Implicit directory: any entry whose path starts with dir/
+            if name.starts_with(dir) && name.as_bytes().get(dir.len()) == Some(&b'/') {
+                return true;
+            }
+
+            offset += HEADER_SIZE + round_up_512(size);
+        }
+        false
+    }
+
     /// Return total number of entries.
     pub fn count(&self) -> usize {
         let mut n = 0;

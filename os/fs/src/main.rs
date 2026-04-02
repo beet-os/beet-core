@@ -240,9 +240,18 @@ fn do_cat(path: &str) -> FsError {
 }
 
 fn do_is_dir(path: &str) -> FsError {
-    // /disk itself and any disk subpath: directory if disk is present.
     if is_disk_path(path) {
-        return if get_disk_archive().is_some() { FsError::Ok } else { FsError::NotFound };
+        let subpath = disk_subpath(path);
+        return match get_disk_archive() {
+            None => FsError::NotFound,
+            Some(archive) => {
+                if subpath.is_empty() || archive.has_dir(subpath) {
+                    FsError::Ok
+                } else {
+                    FsError::NotFound
+                }
+            }
+        };
     }
 
     // Use list with a no-op callback — it returns NotFound or NotDirectory for non-dirs.
