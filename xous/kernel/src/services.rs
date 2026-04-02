@@ -1597,7 +1597,10 @@ impl SystemServices {
         self.display_state.owner = None;
         self.display_state.cursor_row = row;
         self.display_state.cursor_col = col;
-        self.display_state.clear_input_focus();
+        // input_sid intentionally NOT cleared here — input focus outlives
+        // individual display lock cycles.  It is cleared only when the process
+        // exits (release_display_on_exit) or when another process takes over
+        // via AcquireInputFocus.
         self.unmap_fb_for(pid);
 
         // Hand off to next waiter, if any.

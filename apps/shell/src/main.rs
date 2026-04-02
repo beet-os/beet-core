@@ -876,8 +876,8 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
                 if let xous::Message::Scalar(scalar) = env.body {
                     if scalar.id == beetos_api_console::ConsoleOp::Char as usize {
                         // Acquire display, sync cursor, process char, release.
+                        // (Input focus is already held — no need to re-acquire.)
                         let (row, col) = acquire_display();
-                        acquire_input_focus();
                         unsafe {
                             if let Some(ref mut con) = FB_CONSOLE {
                                 con.set_cursor(row, col);
