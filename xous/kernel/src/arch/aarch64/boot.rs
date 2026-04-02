@@ -348,7 +348,6 @@ static TEST_ELF: &[u8] = include_bytes!(
 #[cfg(not(feature = "test-mode"))]
 static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("log", LOG_ELF),
-    ("idle", HELLO_ELF),
     ("hello-std", HELLO_STD_ELF),
     ("hello-nostd", HELLO_ELF),
     ("shell", SHELL_ELF),
@@ -359,7 +358,6 @@ static BINARY_TABLE: &[(&str, &[u8])] = &[
 #[cfg(feature = "test-mode")]
 static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("log", LOG_ELF),
-    ("idle", HELLO_ELF),
     ("beetos-test", TEST_ELF),
     ("hello-nostd", HELLO_ELF),
     ("shell", SHELL_ELF),
@@ -470,25 +468,22 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let log_pid = PID::new(2).unwrap();
     create_elf_process(log_pid, LOG_ELF, b"log");
 
-    // PID 3: idle placeholder
-    let idle_pid = PID::new(3).unwrap();
-    create_elf_process(idle_pid, HELLO_ELF, b"idle");
-
-    // PID 4: process manager
-    let procman_pid = PID::new(4).unwrap();
+    // PID 3: process manager
+    // (No idle process — the kernel's PID 1 handles idle via wfi in idle_wait_then_load.)
+    let procman_pid = PID::new(3).unwrap();
     create_elf_process(procman_pid, PROCMAN_ELF, b"procman");
 
-    // PID 5: shell
-    let shell_pid = PID::new(5).unwrap();
+    // PID 4: shell
+    let shell_pid = PID::new(4).unwrap();
     create_elf_process(shell_pid, SHELL_ELF, b"shell");
 
-    // PID 6: filesystem service
-    let fs_pid = PID::new(6).unwrap();
+    // PID 5: filesystem service
+    let fs_pid = PID::new(5).unwrap();
     create_elf_process(fs_pid, FS_ELF, b"fs");
 
-    // PID 7: beetos-test in test-mode only (hello-std is spawnable from the shell).
+    // PID 6: beetos-test in test-mode only (hello-std is spawnable from the shell).
     #[cfg(feature = "test-mode")]
-    let app_pid = PID::new(7).unwrap();
+    let app_pid = PID::new(6).unwrap();
     #[cfg(feature = "test-mode")]
     create_elf_process(app_pid, TEST_ELF, b"beetos-test");
 

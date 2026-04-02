@@ -3,14 +3,8 @@
 
 //! BeetOS "hello" process.
 //!
-//! When used as "idle" (PID 3): yields in a loop forever, absorbing CPU
-//! when no other process is ready.
-//!
-//! When spawned by name as "hello": prints a greeting with its PID,
-//! tests heap allocation (Box, Vec, String), then exits cleanly.
-//!
-//! The kernel determines the behavior by checking the process name.
-//! Both cases use the same binary — the name is set during create_process.
+//! Prints a greeting with its PID, tests heap allocation (Box, Vec, String),
+//! then exits cleanly.  Spawnable from the shell as "hello-nostd".
 
 #![no_std]
 #![no_main]
@@ -227,14 +221,6 @@ pub extern "C" fn _start() -> ! {
         Ok(xous::Result::ProcessID(pid)) => pid.get() as usize,
         _ => 0,
     };
-
-    // If we're PID 3 (idle placeholder), just yield forever.
-    // The kernel handles CPU idle itself (WFI via the scheduler).
-    if pid == 3 {
-        loop {
-            xous::yield_slice();
-        }
-    }
 
     // Acquire the display and restore the cursor left by the previous owner.
     let (row, col) = match xous::rsyscall(xous::SysCall::AcquireDisplay) {
