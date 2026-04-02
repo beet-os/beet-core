@@ -1610,16 +1610,26 @@ impl SystemServices {
         // via AcquireInputFocus.
         self.unmap_fb_for(pid);
 
-        // Hand off to next waiter, if any.
-        if let Some((waiter_pid, waiter_tid)) = self.display_state.pop_waiter() {
-            self.display_state.owner = Some((waiter_pid, waiter_tid));
-            self.map_fb_for(waiter_pid);
-            crate::syscall::wake_thread_with_result(
-                self,
-                waiter_pid,
-                waiter_tid,
-                xous::Result::Scalar2(row, col),
-            );
+        // Hand off to next waiter, skipping any that exited while waiting.
+        loop {
+            match self.display_state.pop_waiter() {
+                None => break,
+                Some((waiter_pid, waiter_tid)) => {
+                    if self.process(waiter_pid).is_err() {
+                        continue; // process exited — try next
+                    }
+
+                    self.display_state.owner = Some((waiter_pid, waiter_tid));
+                    self.map_fb_for(waiter_pid);
+                    crate::syscall::wake_thread_with_result(
+                        self,
+                        waiter_pid,
+                        waiter_tid,
+                        xous::Result::Scalar2(row, col),
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -1633,16 +1643,26 @@ impl SystemServices {
             self.display_state.owner = None;
             self.display_state.clear_input_focus();
 
-            // Hand off to next waiter, if any.
-            if let Some((waiter_pid, waiter_tid)) = self.display_state.pop_waiter() {
-                self.display_state.owner = Some((waiter_pid, waiter_tid));
-                self.map_fb_for(waiter_pid);
-                crate::syscall::wake_thread_with_result(
-                    self,
-                    waiter_pid,
-                    waiter_tid,
-                    xous::Result::Scalar2(row, col),
-                );
+            // Hand off to next waiter, skipping any that exited while waiting.
+            loop {
+                match self.display_state.pop_waiter() {
+                    None => break,
+                    Some((waiter_pid, waiter_tid)) => {
+                        if self.process(waiter_pid).is_err() {
+                            continue; // process exited — try next
+                        }
+
+                        self.display_state.owner = Some((waiter_pid, waiter_tid));
+                        self.map_fb_for(waiter_pid);
+                        crate::syscall::wake_thread_with_result(
+                            self,
+                            waiter_pid,
+                            waiter_tid,
+                            xous::Result::Scalar2(row, col),
+                        );
+                        break;
+                    }
+                }
             }
         }
     }

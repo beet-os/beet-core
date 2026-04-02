@@ -175,7 +175,9 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
 
                         if id == OPCODE_BEGIN_PANIC {
                             puts("\nPANIC: ");
-                        } else if id > OPCODE_PANIC_MSG_BASE && id <= OPCODE_PANIC_FINISHED {
+                        } else if id == OPCODE_PANIC_FINISHED {
+                            puts("\n");
+                        } else if id > OPCODE_PANIC_MSG_BASE && id < OPCODE_PANIC_FINISHED {
                             // AppendPanicMessage: id - base = number of bytes in this chunk.
                             // Bytes are packed little-endian into 4 usize args.
                             let n = id - OPCODE_PANIC_MSG_BASE;
@@ -192,8 +194,6 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
                                     written += 1;
                                 }
                             }
-                        } else if id == OPCODE_PANIC_FINISHED {
-                            puts("\n");
                         }
                     }
 

@@ -487,16 +487,24 @@ fn fs_scalar(op: FsOp, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> Op
         }),
     )) {
         Ok(xous::Result::Scalar1(code)) => Some(code),
-        Ok(xous::Result::Scalar5(a, b, c, d, e)) => {
-            // Store for Stats — caller reads LAST_STATS
-            unsafe { LAST_STATS = (a, b, c, d, e); }
-            Some(0)
-        }
         _ => None,
     }
 }
 
-static mut LAST_STATS: (usize, usize, usize, usize, usize) = (0, 0, 0, 0, 0);
+/// Query filesystem statistics, returning (ram_used, ram_total, ram_bytes, disk_size, disk_files).
+fn fs_stats() -> Option<(usize, usize, usize, usize, usize)> {
+    let cid = get_fs_cid();
+    if cid == 0 { return None; }
+    match xous::rsyscall(xous::SysCall::SendMessage(
+        cid,
+        xous::Message::BlockingScalar(xous::ScalarMessage {
+            id: FsOp::Stats as usize, arg1: 0, arg2: 0, arg3: 0, arg4: 0,
+        }),
+    )) {
+        Ok(xous::Result::Scalar5(a, b, c, d, e)) => Some((a, b, c, d, e)),
+        _ => None,
+    }
+}
 
 fn cmd_ls(args: &[&str]) {
     let mut buf = [0u8; MAX_PATH];
@@ -632,9 +640,8 @@ fn cmd_rm(args: &[&str]) {
 }
 
 fn cmd_blkinfo() {
-    match fs_scalar(FsOp::Stats, 0, 0, 0, 0) {
-        Some(_) => {
-            let (_, _, _, disk_size, disk_files) = unsafe { LAST_STATS };
+    match fs_stats() {
+        Some((_, _, _, disk_size, disk_files)) => {
             if disk_size == 0 {
                 puts("No block device\n");
             } else {
@@ -684,9 +691,8 @@ fn cmd_ifconfig() {
 }
 
 fn cmd_mem() {
-    match fs_scalar(FsOp::Stats, 0, 0, 0, 0) {
-        Some(_) => {
-            let (used, total, bytes, disk_size, _) = unsafe { LAST_STATS };
+    match fs_stats() {
+        Some((used, total, bytes, disk_size, _)) => {
             puts("RAM filesystem:\n");
             let _ = write!(DualWriter, "  Files: {}/{}\n", used, total);
             let _ = write!(DualWriter, "  Used:  {} bytes\n", bytes);
