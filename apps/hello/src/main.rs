@@ -3,7 +3,7 @@
 
 //! BeetOS "hello" process.
 //!
-//! When used as "idle" (PID 2): yields in a loop forever, absorbing CPU
+//! When used as "idle" (PID 3): yields in a loop forever, absorbing CPU
 //! when no other process is ready.
 //!
 //! When spawned by name as "hello": prints a greeting with its PID,
@@ -228,8 +228,9 @@ pub extern "C" fn _start() -> ! {
         _ => 0,
     };
 
-    // If we're PID 2 (idle), just yield forever
-    if pid == 2 {
+    // If we're PID 3 (idle placeholder), just yield forever.
+    // The kernel handles CPU idle itself (WFI via the scheduler).
+    if pid == 3 {
         loop {
             xous::yield_slice();
         }
