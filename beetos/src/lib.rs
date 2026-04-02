@@ -295,6 +295,44 @@ pub const SHELL_UART_VA: usize = 0x10_0100_0000;
 /// The FB is 4 MiB (256 × 16 KiB pages).
 pub const SHELL_FB_VA: usize = 0x10_0200_0000;
 
+/// Framebuffer dimensions — single source of truth for kernel and userspace.
+/// Both must agree: the kernel programs the hardware, userspace renders into
+/// the mapped region at SHELL_FB_VA.
+pub const FB_WIDTH: usize = 1280;
+pub const FB_HEIGHT: usize = 800;
 
 /// Maximum size of argv data (fits in one page).
 pub const ARGV_MAX_LEN: usize = PAGE_SIZE;
+
+// ======================== Syscall permission masks ========================
+//
+// `check_syscall_permission` in the kernel uses a 64-bit bitmask where bit N
+// allows SysCallNumber N.  Most everyday syscalls (IPC, memory, display) are
+// unconditionally allowed and never touch this mask.  The mask only guards a
+// small privileged set: spawn, kill, shutdown, interrupt claims, etc.
+//
+// See xous/kernel/src/syscall.rs :: check_syscall_permission for the full
+// list of which syscalls actually check the mask.
+
+const fn perm_bit(n: u8) -> u64 { 1u64 << n }
+
+/// Log server — pure IPC server, no privileged ops needed.
+pub const PERM_LOG_SERVER: u64 = 0;
+
+/// Filesystem service — pure IPC server, no privileged ops needed.
+pub const PERM_FS_SERVER: u64 = 0;
+
+/// Process manager — may spawn processes and wait for / kill them.
+pub const PERM_PROCMAN: u64 =
+    perm_bit(53) | // TerminatePid
+    perm_bit(57) | // SpawnByName
+    perm_bit(58) | // WaitProcess
+    perm_bit(59);  // SpawnByNameWithArgs
+
+/// Interactive shell — may shut down the system and query stats.
+pub const PERM_SHELL: u64 =
+    perm_bit(23) | // Shutdown
+    perm_bit(52);  // GetSystemStats
+
+/// Dynamically spawned user programs (hello, hello-std, …) — no privileged ops.
+pub const PERM_USER_PROGRAM: u64 = 0;

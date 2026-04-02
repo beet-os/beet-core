@@ -288,7 +288,6 @@ impl SystemServices {
                 entry_point: 0,
                 stack,
                 irq_stack,
-                aslr_slide: 0,
             },
             self,
         )
@@ -343,7 +342,6 @@ impl SystemServices {
                 entry_point: 0,
                 stack,
                 irq_stack,
-                aslr_slide: 0,
             },
             self,
         )
@@ -1339,8 +1337,8 @@ impl SystemServices {
             }
         }
 
-        // Grant all syscall permissions
-        self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
+        // Grant user-program permissions (no spawn, no shutdown, no interrupt claims).
+        self.process_mut(pid)?.set_syscall_permissions(beetos::PERM_USER_PROGRAM);
 
         // Map UART MMIO into the new process.
         #[cfg(feature = "platform-qemu-virt")]
@@ -1415,8 +1413,8 @@ impl SystemServices {
         let startup = self.create_process(init)?;
         let pid = startup.pid();
 
-        // Grant all syscall permissions
-        self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
+        // Grant user-program permissions (no spawn, no shutdown, no interrupt claims).
+        self.process_mut(pid)?.set_syscall_permissions(beetos::PERM_USER_PROGRAM);
 
         // Map UART MMIO into the new process.
         #[cfg(feature = "platform-qemu-virt")]

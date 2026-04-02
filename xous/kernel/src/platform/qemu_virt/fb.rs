@@ -30,11 +30,10 @@ use crate::fb_console::FbConsole;
 /// Must match the reservation subtracted from `ram_size` in boot.rs.
 pub const FB_PHYS: usize = 0x7FC0_0000;
 
-/// Framebuffer width in pixels.
-pub const FB_WIDTH: usize = 1280;
-
-/// Framebuffer height in pixels.
-pub const FB_HEIGHT: usize = 800;
+/// Framebuffer width in pixels — single source of truth lives in the `beetos` crate.
+pub use beetos::FB_WIDTH;
+/// Framebuffer height in pixels — single source of truth lives in the `beetos` crate.
+pub use beetos::FB_HEIGHT;
 
 /// Bytes per row (XRGB8888 = 4 bytes per pixel).
 pub const FB_STRIDE_BYTES: usize = FB_WIDTH * 4;

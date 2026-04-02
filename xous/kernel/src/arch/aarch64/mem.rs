@@ -415,8 +415,6 @@ pub struct MemoryMapping {
     ttbr0: usize,
     /// The PID / ASID for this mapping.
     pid: usize,
-    /// ASLR slide applied to this process.
-    aslr_slide: usize,
 }
 
 impl MemoryMapping {
@@ -436,7 +434,6 @@ impl MemoryMapping {
         MemoryMapping {
             ttbr0: (ttbr0 & PTE_ADDR_MASK) as usize,
             pid: ctx as usize,
-            aslr_slide: 0,
         }
     }
 

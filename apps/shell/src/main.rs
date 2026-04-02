@@ -47,10 +47,6 @@ fn uart_putc(c: u8) {
 
 use beetos::fb_console::FbConsole;
 
-// FB dimensions — must match kernel constants.
-const FB_WIDTH:  usize = 1280;
-const FB_HEIGHT: usize = 800;
-
 static mut FB_CONSOLE: Option<FbConsole> = None;
 
 fn fb_putc(c: u8) {
@@ -855,7 +851,7 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
         // FB is mapped at a fixed VA by AcquireDisplay — use it directly.
         FB_CONSOLE = Some(FbConsole::new(
             beetos::SHELL_FB_VA as *mut u32,
-            FB_WIDTH, FB_HEIGHT, FB_WIDTH,
+            beetos::FB_WIDTH, beetos::FB_HEIGHT, beetos::FB_WIDTH,
         ));
     }
 

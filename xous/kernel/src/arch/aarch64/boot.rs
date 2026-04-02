@@ -95,30 +95,42 @@ pub unsafe fn parse_fdt_ram(fdt_ptr: *const u8) -> Option<RamRegion> {
         return None;
     }
 
-    let off_dt_struct = be32(fdt_ptr.add(8)) as usize;
+    // FDT header: totalsize at offset 4, off_dt_struct at 8, off_dt_strings at 12.
+    let total_size     = be32(fdt_ptr.add(4)) as usize;
+    let off_dt_struct  = be32(fdt_ptr.add(8)) as usize;
     let off_dt_strings = be32(fdt_ptr.add(12)) as usize;
 
-    let struct_base = fdt_ptr.add(off_dt_struct);
+    // Sanity: offsets must fit within the claimed total size.
+    if off_dt_struct >= total_size || off_dt_strings >= total_size {
+        return None;
+    }
+
+    let struct_base  = fdt_ptr.add(off_dt_struct);
     let strings_base = fdt_ptr.add(off_dt_strings);
+    // Maximum number of bytes available in the struct block.
+    let struct_limit = total_size - off_dt_struct;
 
     let mut pos: usize = 0;
     let mut depth: usize = 0;
     let mut in_memory_node = false;
 
     loop {
+        // Need 4 bytes for the token.
+        if pos + 4 > struct_limit { break; }
         let token = be32(struct_base.add(pos));
         pos += 4;
 
         match token {
             FDT_BEGIN_NODE => {
                 depth += 1;
-                // Node name is a null-terminated string, 4-byte aligned
+                // Node name is a null-terminated string, 4-byte aligned.
                 let name_ptr = struct_base.add(pos);
                 let mut name_len = 0;
-                while *struct_base.add(pos + name_len) != 0 {
+                // Scan for null terminator — stop at struct_limit to avoid OOB.
+                while pos + name_len < struct_limit && *struct_base.add(pos + name_len) != 0 {
                     name_len += 1;
                 }
-                pos += name_len + 1; // skip null terminator
+                pos += name_len + 1; // skip name + null terminator
                 pos = (pos + 3) & !3; // align to 4
 
                 // /memory or /memory@XXXXXXXX at depth 2 (root is depth 1)
@@ -130,12 +142,17 @@ pub unsafe fn parse_fdt_ram(fdt_ptr: *const u8) -> Option<RamRegion> {
                 if in_memory_node && depth == 2 {
                     in_memory_node = false;
                 }
-                depth -= 1;
+                depth = depth.saturating_sub(1);
             }
             FDT_PROP => {
-                let len = be32(struct_base.add(pos)) as usize;
+                // Need 8 bytes for len + nameoff fields.
+                if pos + 8 > struct_limit { break; }
+                let len     = be32(struct_base.add(pos)) as usize;
                 let nameoff = be32(struct_base.add(pos + 4)) as usize;
                 pos += 8; // skip len + nameoff
+
+                // Validate: property data must fit within the struct block.
+                if pos.saturating_add(len) > struct_limit { break; }
 
                 if in_memory_node && len >= 16 {
                     let prop_name = strings_base.add(nameoff);
@@ -410,6 +427,10 @@ pub const DISK_DATA_VA: usize = 0x0000_0010_0200_0000;
 /// Create a user process from an ELF binary using the kernel's standard
 /// load_elf → allocate stack → setup_process pipeline.
 ///
+/// `perm` is the syscall permission mask for this process.  Use the
+/// `beetos::PERM_*` constants — see `check_syscall_permission` for which
+/// syscalls are actually gated by the mask.
+///
 /// # Safety
 ///
 /// Must be called after MMU, MemoryManager, and SystemServices are initialized.
@@ -417,6 +438,7 @@ unsafe fn create_elf_process(
     pid: xous::PID,
     elf_bytes: &[u8],
     name: &[u8],
+    perm: u64,
 ) {
     use xous::MemoryAddress;
 
@@ -435,10 +457,9 @@ unsafe fn create_elf_process(
         ss.create_process(init).expect("create_process failed");
     });
 
-    // Grant all syscall permissions
     crate::services::SystemServices::with_mut(|ss| {
         let process = ss.process_mut(pid).expect("process not found");
-        process.set_syscall_permissions(u64::MAX);
+        process.set_syscall_permissions(perm);
     });
 }
 
@@ -466,26 +487,26 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
 
     // PID 2: log server — must be first so println! works in all std processes.
     let log_pid = PID::new(2).unwrap();
-    create_elf_process(log_pid, LOG_ELF, b"log");
+    create_elf_process(log_pid, LOG_ELF, b"log", beetos::PERM_LOG_SERVER);
 
     // PID 3: process manager
     // (No idle process — the kernel's PID 1 handles idle via wfi in idle_wait_then_load.)
     let procman_pid = PID::new(3).unwrap();
-    create_elf_process(procman_pid, PROCMAN_ELF, b"procman");
+    create_elf_process(procman_pid, PROCMAN_ELF, b"procman", beetos::PERM_PROCMAN);
 
     // PID 4: shell
     let shell_pid = PID::new(4).unwrap();
-    create_elf_process(shell_pid, SHELL_ELF, b"shell");
+    create_elf_process(shell_pid, SHELL_ELF, b"shell", beetos::PERM_SHELL);
 
     // PID 5: filesystem service
     let fs_pid = PID::new(5).unwrap();
-    create_elf_process(fs_pid, FS_ELF, b"fs");
+    create_elf_process(fs_pid, FS_ELF, b"fs", beetos::PERM_FS_SERVER);
 
     // PID 6: beetos-test in test-mode only (hello-std is spawnable from the shell).
     #[cfg(feature = "test-mode")]
     let app_pid = PID::new(6).unwrap();
     #[cfg(feature = "test-mode")]
-    create_elf_process(app_pid, TEST_ELF, b"beetos-test");
+    create_elf_process(app_pid, TEST_ELF, b"beetos-test", beetos::PERM_USER_PROGRAM);
 
     // Map UART MMIO into log, procman, shell, fs (and beetos-test in test-mode).
     #[cfg(feature = "platform-qemu-virt")]

@@ -207,7 +207,6 @@ pub struct ProcessSetup {
     pub entry_point: usize,
     pub stack: MemoryRange,
     pub irq_stack: MemoryRange,
-    pub aslr_slide: usize,
 }
 
 /// Architecture-specific process handle used by the kernel.
@@ -428,13 +427,14 @@ impl Process {
         }
 
         // Set up the initial thread context with the ELF entry point.
+        // The ASLR slide has already been applied to all segment VAs and the
+        // entry point during ELF loading above — it does not need to be stored.
         Self::setup_process(
             ProcessSetup {
                 pid,
                 entry_point: elf_result.entry_point,
                 stack,
                 irq_stack,
-                aslr_slide: elf_result.aslr_slide,
             },
             services,
         )?;

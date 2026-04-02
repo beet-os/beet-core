@@ -38,10 +38,6 @@ const UART_FR_TXFF: u32 = 1 << 5;
 
 static mut UART_BASE: usize = 0;
 
-// FB dimensions — must match the kernel constants in platform/qemu_virt/fb.rs.
-const FB_WIDTH:  usize = 1280;
-const FB_HEIGHT: usize = 800;
-
 static mut FB_CONSOLE: Option<FbConsole> = None;
 
 fn uart_putc(c: u8) {
@@ -139,7 +135,7 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
         UART_BASE = uart_base;
         FB_CONSOLE = Some(FbConsole::new(
             beetos::SHELL_FB_VA as *mut u32,
-            FB_WIDTH, FB_HEIGHT, FB_WIDTH,
+            beetos::FB_WIDTH, beetos::FB_HEIGHT, beetos::FB_WIDTH,
         ));
     }
 

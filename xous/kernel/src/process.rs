@@ -65,12 +65,6 @@ pub struct Process {
     /// The virtual address to use for the next mirror allocation
     pub next_mirror_address: usize,
 
-    /// ASLR slide applied when loading the ELF
-    /// This is only used to make sense of a backtrace after a crash
-    #[cfg(beetos)]
-    #[allow(dead_code)]
-    pub(crate) aslr_slide: usize,
-
     /// Pending notification bits (posted via PostEvent, consumed via WaitEvent/PollEvent).
     /// Bits are OR'd in by PostEvent and atomically cleared by WaitEvent/PollEvent.
     notification_bits: usize,
@@ -156,8 +150,6 @@ impl Process {
             connection_map: Default::default(),
             allocation_hint: MMAP_AREA_VIRT,
             next_mirror_address: MEMORY_MIRROR_AREA_VIRT,
-            #[cfg(beetos)]
-            aslr_slide: 0,
             notification_bits: 0,
             kernel_futures: [const { None }; MAX_THREAD_COUNT],
             result_mailbox: [const { None }; MAX_THREAD_COUNT],
