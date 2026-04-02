@@ -77,6 +77,11 @@ pub enum KernelFuture {
     /// `addr` is the scan key: FutexWake scans the current process's
     /// kernel futures for matching addr.
     WaitFutex { addr: usize },
+
+    /// Waiting to acquire the display.
+    /// Mailbox-based.  Woken by `release_display` which deposits
+    /// `Scalar2(row, col)` in the mailbox and sets the thread Ready.
+    WaitDisplay,
 }
 
 // All fields are plain data (PID, TID, usize) which are Send.
@@ -115,7 +120,8 @@ impl KernelFuture {
             KernelFuture::WaitBlocking
             | KernelFuture::WaitProcessExit { .. }
             | KernelFuture::WaitJoin { .. }
-            | KernelFuture::WaitFutex { .. } => EVENT_KERNEL,
+            | KernelFuture::WaitFutex { .. }
+            | KernelFuture::WaitDisplay => EVENT_KERNEL,
         }
     }
 
@@ -144,7 +150,8 @@ impl KernelFuture {
             KernelFuture::WaitBlocking
             | KernelFuture::WaitProcessExit { .. }
             | KernelFuture::WaitJoin { .. }
-            | KernelFuture::WaitFutex { .. } => {
+            | KernelFuture::WaitFutex { .. }
+            | KernelFuture::WaitDisplay => {
                 poll_mailbox(ss, pid, tid)
             }
         }

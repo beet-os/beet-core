@@ -251,6 +251,7 @@ fn for_each_process_debug_row(mut on_row: impl FnMut(ProcessDebugRow<'_>)) -> Pr
                         Some(KernelFuture::WaitProcessExit { .. }) => 'p',
                         Some(KernelFuture::WaitJoin { .. }) => 'j',
                         Some(KernelFuture::WaitFutex { .. }) => 'f',
+                        Some(KernelFuture::WaitDisplay) => 'd',
                         None => 'e',
                     },
                 };

@@ -415,6 +415,9 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         #[cfg(beetos)]
         SysCall::GetBinaryName(_) => Ok(()),
 
+        #[cfg(beetos)]
+        SysCall::AcquireDisplay | SysCall::ReleaseDisplay(..) => Ok(()),
+
         // Messaging-related calls
         SysCall::CreateServer
         | SysCall::CreateServerId
@@ -999,6 +1002,30 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
                 Ok(Result::Ok)
             })
         }
+
+        #[cfg(beetos)]
+        SysCall::AcquireDisplay => SystemServices::with_mut(|ss| {
+            let pid = crate::arch::process::current_pid();
+            let (row, col) = ss.display_cursor();
+            if ss.try_acquire_display(pid, tid) {
+                // Granted immediately — return cursor position.
+                Ok(xous::Result::Scalar2(row, col))
+            } else {
+                // Queued — suspend until release_display wakes us.
+                suspend_with_future(
+                    ss, tid,
+                    KernelFuture::WaitDisplay,
+                    crate::kfuture::EVENT_KERNEL,
+                );
+                Scheduler::with_mut(|s| s.activate_current(ss))
+            }
+        }),
+
+        #[cfg(beetos)]
+        SysCall::ReleaseDisplay(row, col) => SystemServices::with_mut(|ss| {
+            ss.release_display(row, col);
+            Ok(xous::Result::Ok)
+        }),
 
         _ => Err(Error::UnhandledSyscall),
     };

@@ -513,6 +513,30 @@ pub enum SysCall {
     #[cfg(beetos)]
     GetBinaryName(usize /* index */),
 
+    /// Acquire exclusive access to the display.
+    ///
+    /// If the display is free, maps the framebuffer into the calling process and
+    /// returns immediately with the cursor position left by the previous owner.
+    /// If the display is held by another process, blocks until it is released.
+    ///
+    /// # Returns
+    ///
+    /// * **Scalar2(row, col)**: Cursor position (0, 0 on first call).
+    #[cfg(beetos)]
+    AcquireDisplay,
+
+    /// Release exclusive access to the display.
+    ///
+    /// Unmaps the framebuffer from the calling process and records the current
+    /// cursor position. Wakes the next waiter if any.
+    ///
+    /// # Arguments
+    ///
+    /// * `row` — cursor row to hand off
+    /// * `col` — cursor column to hand off
+    #[cfg(beetos)]
+    ReleaseDisplay(usize /* row */, usize /* col */),
+
     /// This syscall does not exist. It captures all possible
     /// arguments so detailed analysis can be performed.
     Invalid(usize, usize, usize, usize, usize, usize, usize),
@@ -583,6 +607,8 @@ pub enum SysCallNumber {
     PollEvent = 62,
     PostEvent = 63,
     GetBinaryName = 64,
+    AcquireDisplay = 65,
+    ReleaseDisplay = 66,
 
     Invalid,
 }
@@ -654,6 +680,8 @@ impl SysCallNumber {
             62 => PollEvent,
             63 => PostEvent,
             64 => GetBinaryName,
+            65 => AcquireDisplay,
+            66 => ReleaseDisplay,
             _ => Invalid,
         }
     }
@@ -1004,6 +1032,14 @@ impl SysCall {
             SysCall::GetBinaryName(index) => {
                 [SysCallNumber::GetBinaryName as usize, *index, 0, 0, 0, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::AcquireDisplay => {
+                [SysCallNumber::AcquireDisplay as usize, 0, 0, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::ReleaseDisplay(row, col) => {
+                [SysCallNumber::ReleaseDisplay as usize, *row, *col, 0, 0, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1201,6 +1237,10 @@ impl SysCall {
             }
             #[cfg(beetos)]
             SysCallNumber::GetBinaryName => SysCall::GetBinaryName(a1),
+            #[cfg(beetos)]
+            SysCallNumber::AcquireDisplay => SysCall::AcquireDisplay,
+            #[cfg(beetos)]
+            SysCallNumber::ReleaseDisplay => SysCall::ReleaseDisplay(a1, a2),
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1216,7 +1256,9 @@ impl SysCall {
             | SysCallNumber::WaitEvent
             | SysCallNumber::PollEvent
             | SysCallNumber::PostEvent
-            | SysCallNumber::GetBinaryName => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::GetBinaryName
+            | SysCallNumber::AcquireDisplay
+            | SysCallNumber::ReleaseDisplay => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }

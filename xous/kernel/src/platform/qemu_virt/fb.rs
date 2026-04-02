@@ -42,9 +42,6 @@ pub const FB_STRIDE_BYTES: usize = FB_WIDTH * 4;
 /// Total framebuffer size reserved in physical RAM (multiple of 16 KB page).
 pub const FB_SIZE: usize = 4 * 1024 * 1024; // 4 MB
 
-/// Physical address of the shared cursor page (one page below the framebuffer).
-/// Reserved together with the FB — not given to MemoryManager.
-pub const CURSOR_PHYS: usize = FB_PHYS - beetos::PAGE_SIZE;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FW_CFG constants

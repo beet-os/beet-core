@@ -24,6 +24,67 @@ use crate::server::Server;
 
 const MAX_SERVER_COUNT: usize = 128;
 
+/// Maximum number of processes waiting for the display at once.
+const DISPLAY_WAITER_MAX: usize = 16;
+
+/// Kernel state for exclusive display ownership.
+///
+/// At most one process holds the framebuffer at a time.  Others block on
+/// `AcquireDisplay` and are queued here.  When the owner calls
+/// `ReleaseDisplay(row, col)`, the cursor position is stored and the first
+/// waiter is handed ownership.
+#[cfg(beetos)]
+struct DisplayState {
+    /// Current owner, or `None` if the display is free.
+    owner: Option<(PID, TID)>,
+    /// Cursor row handed off by the last owner (starts at 0).
+    cursor_row: usize,
+    /// Cursor column handed off by the last owner (starts at 0).
+    cursor_col: usize,
+    /// Ring buffer of waiting (PID, TID) pairs.
+    waiters: [(PID, TID); DISPLAY_WAITER_MAX],
+    waiter_head: usize,
+    waiter_count: usize,
+}
+
+#[cfg(beetos)]
+impl DisplayState {
+    const fn new() -> Self {
+        const DUMMY_PID: PID = unsafe { core::mem::transmute(1u8) };
+        const DUMMY_TID: TID = 0;
+        Self {
+            owner: None,
+            cursor_row: 0,
+            cursor_col: 0,
+            waiters: [(DUMMY_PID, DUMMY_TID); DISPLAY_WAITER_MAX],
+            waiter_head: 0,
+            waiter_count: 0,
+        }
+    }
+
+    fn push_waiter(&mut self, pid: PID, tid: TID) -> bool {
+        if self.waiter_count >= DISPLAY_WAITER_MAX {
+            return false;
+        }
+
+        let tail = (self.waiter_head + self.waiter_count) % DISPLAY_WAITER_MAX;
+        self.waiters[tail] = (pid, tid);
+        self.waiter_count += 1;
+        true
+    }
+
+    fn pop_waiter(&mut self) -> Option<(PID, TID)> {
+        if self.waiter_count == 0 {
+            return None;
+        }
+
+        let entry = self.waiters[self.waiter_head];
+        self.waiter_head = (self.waiter_head + 1) % DISPLAY_WAITER_MAX;
+        self.waiter_count -= 1;
+        Some(entry)
+    }
+}
+
 /// A big unifying struct containing all of the system state.
 #[allow(dead_code)]
 pub struct SystemServices {
@@ -38,6 +99,10 @@ pub struct SystemServices {
 
     /// PID of the process that "owns" the current panic message
     panic_message_pid: Option<PID>,
+
+    /// Exclusive display ownership state.
+    #[cfg(beetos)]
+    display_state: DisplayState,
 }
 
 #[cfg(not(beetos))]
@@ -55,6 +120,7 @@ static mut SYSTEM_SERVICES: SystemServices = SystemServices {
     servers: [const { None }; MAX_SERVER_COUNT],
     panic_message: BufStr::new(),
     panic_message_pid: None,
+    display_state: DisplayState::new(),
 };
 
 #[allow(dead_code)]
@@ -1007,6 +1073,10 @@ impl SystemServices {
             crate::debug::serial::with_output(|stream| self.print_current_process(stream, true).unwrap());
         }
 
+        // If the dying process held the display, release it.
+        #[cfg(beetos)]
+        self.release_display_on_exit(pid);
+
         self.process_mut(pid)?.terminate(ret)?;
         self.free_process(pid);
 
@@ -1151,6 +1221,9 @@ impl SystemServices {
                             Some(KernelFuture::WaitFutex { addr }) => {
                                 writeln!(output, "WaitFutex({addr:08x})").ok()
                             }
+                            Some(KernelFuture::WaitDisplay) => {
+                                writeln!(output, "WaitDisplay").ok()
+                            }
                             None => {
                                 writeln!(output, "WaitEvent({_mask:#x})").ok()
                             }
@@ -1215,12 +1288,10 @@ impl SystemServices {
         // Grant all syscall permissions
         self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
 
-        // Map UART MMIO, framebuffer, and cursor page into the new process.
+        // Map UART MMIO into the new process.
         #[cfg(feature = "platform-qemu-virt")]
         {
-            use crate::platform::qemu_virt::fb::{FB_PHYS, FB_SIZE, CURSOR_PHYS};
             const UART_PHYS: usize = 0x0900_0000;
-            let fb_pages = FB_SIZE / beetos::PAGE_SIZE;
             crate::mem::MemoryManager::with_mut(|mm| {
                 let process = self.process_mut(pid).expect("spawned process");
                 process.mapping.map_page(
@@ -1230,35 +1301,16 @@ impl SystemServices {
                     xous::MemoryFlags::W | xous::MemoryFlags::DEV,
                     true,
                 ).ok();
-                for i in 0..fb_pages {
-                    let phys = FB_PHYS + i * beetos::PAGE_SIZE;
-                    let va   = beetos::SHELL_FB_VA + i * beetos::PAGE_SIZE;
-                    process.mapping.map_page(
-                        mm,
-                        phys,
-                        va as *mut usize,
-                        xous::MemoryFlags::W | xous::MemoryFlags::DEV,
-                        true,
-                    ).ok();
-                }
-                process.mapping.map_page(
-                    mm,
-                    CURSOR_PHYS,
-                    beetos::SHARED_CURSOR_VA as *mut usize,
-                    xous::MemoryFlags::W,
-                    true,
-                ).ok();
             });
         }
 
-        // Pass x0=uart_va, x1=fb_va, x2=0, x3=0
+        // Pass x0=uart_va, x1=0, x2=0
         {
             let idx = pid.get() as usize - 1;
             unsafe {
-                crate::arch::process::set_thread_args4(
+                crate::arch::process::set_thread_args(
                     idx,
                     crate::arch::boot::SHELL_UART_VA,
-                    beetos::SHELL_FB_VA,
                     0,
                     0,
                 );
@@ -1312,12 +1364,10 @@ impl SystemServices {
         // Grant all syscall permissions
         self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
 
-        // Map UART MMIO, framebuffer, and cursor page into the new process.
+        // Map UART MMIO into the new process.
         #[cfg(feature = "platform-qemu-virt")]
         {
-            use crate::platform::qemu_virt::fb::{FB_PHYS, FB_SIZE, CURSOR_PHYS};
             const UART_PHYS: usize = 0x0900_0000;
-            let fb_pages = FB_SIZE / beetos::PAGE_SIZE;
             crate::mem::MemoryManager::with_mut(|mm| {
                 let process = self.process_mut(pid).expect("spawned process");
                 process.mapping.map_page(
@@ -1325,24 +1375,6 @@ impl SystemServices {
                     UART_PHYS,
                     crate::arch::boot::SHELL_UART_VA as *mut usize,
                     xous::MemoryFlags::W | xous::MemoryFlags::DEV,
-                    true,
-                ).ok();
-                for i in 0..fb_pages {
-                    let phys = FB_PHYS + i * beetos::PAGE_SIZE;
-                    let va   = beetos::SHELL_FB_VA + i * beetos::PAGE_SIZE;
-                    process.mapping.map_page(
-                        mm,
-                        phys,
-                        va as *mut usize,
-                        xous::MemoryFlags::W | xous::MemoryFlags::DEV,
-                        true,
-                    ).ok();
-                }
-                process.mapping.map_page(
-                    mm,
-                    CURSOR_PHYS,
-                    beetos::SHARED_CURSOR_VA as *mut usize,
-                    xous::MemoryFlags::W,
                     true,
                 ).ok();
             });
@@ -1410,15 +1442,14 @@ impl SystemServices {
             0
         };
 
-        // Set x0=uart_va, x1=fb_va, x2=argv_va (or 0), x3=argv_len
+        // Set x0=uart_va, x1=argv_va (or 0), x2=argv_len
         {
             let idx = pid.get() as usize - 1;
             let argv_va = if actual_argv_len > 0 { beetos::ARGV_PAGE_VA } else { 0 };
             unsafe {
-                crate::arch::process::set_thread_args4(
+                crate::arch::process::set_thread_args(
                     idx,
                     crate::arch::boot::SHELL_UART_VA,
-                    beetos::SHELL_FB_VA,
                     argv_va,
                     actual_argv_len,
                 );
@@ -1429,6 +1460,132 @@ impl SystemServices {
             name, pid, actual_argv_len);
         Ok(pid)
     }
+
+    /// Return the current cursor position stored by the last `release_display` call.
+    #[cfg(beetos)]
+    pub fn display_cursor(&self) -> (usize, usize) {
+        (self.display_state.cursor_row, self.display_state.cursor_col)
+    }
+
+    /// Try to acquire exclusive display ownership for `(pid, tid)`.
+    ///
+    /// Returns `true` if ownership was granted immediately (the display was
+    /// free).  Returns `false` if another process already owns the display —
+    /// in that case the caller is queued and will be woken when the current
+    /// owner calls `release_display`.
+    ///
+    /// On success the framebuffer pages are mapped into `pid`'s address space
+    /// at `SHELL_FB_VA`.
+    #[cfg(beetos)]
+    pub fn try_acquire_display(&mut self, pid: PID, tid: TID) -> bool {
+        if self.display_state.owner.is_some() {
+            // Display is busy — enqueue this thread.
+            self.display_state.push_waiter(pid, tid);
+            return false;
+        }
+
+        // Display is free — grant ownership immediately.
+        self.display_state.owner = Some((pid, tid));
+        self.map_fb_for(pid);
+        true
+    }
+
+    /// Release exclusive display ownership, storing the cursor position.
+    ///
+    /// Unmaps the FB from the current owner.  If any threads are waiting,
+    /// hands ownership to the first one: maps the FB into its address space,
+    /// deposits `Scalar2(row, col)` in its mailbox, and marks it Ready.
+    #[cfg(beetos)]
+    pub fn release_display(&mut self, row: usize, col: usize) {
+        let pid = crate::arch::process::current_pid();
+        if self.display_state.owner.map(|(p, _)| p) != Some(pid) {
+            return; // called by non-owner, ignore
+        }
+
+        self.display_state.owner = None;
+        self.display_state.cursor_row = row;
+        self.display_state.cursor_col = col;
+        self.unmap_fb_for(pid);
+
+        // Hand off to next waiter, if any.
+        if let Some((waiter_pid, waiter_tid)) = self.display_state.pop_waiter() {
+            self.display_state.owner = Some((waiter_pid, waiter_tid));
+            self.map_fb_for(waiter_pid);
+            crate::syscall::wake_thread_with_result(
+                self,
+                waiter_pid,
+                waiter_tid,
+                xous::Result::Scalar2(row, col),
+            );
+        }
+    }
+
+    /// Called when a process exits: if it held the display, release it.
+    #[cfg(beetos)]
+    pub fn release_display_on_exit(&mut self, pid: PID) {
+        if self.display_state.owner.map(|(p, _)| p) == Some(pid) {
+            let row = self.display_state.cursor_row;
+            let col = self.display_state.cursor_col;
+            // Don't unmap — the process page tables are being freed anyway.
+            self.display_state.owner = None;
+
+            // Hand off to next waiter, if any.
+            if let Some((waiter_pid, waiter_tid)) = self.display_state.pop_waiter() {
+                self.display_state.owner = Some((waiter_pid, waiter_tid));
+                self.map_fb_for(waiter_pid);
+                crate::syscall::wake_thread_with_result(
+                    self,
+                    waiter_pid,
+                    waiter_tid,
+                    xous::Result::Scalar2(row, col),
+                );
+            }
+        }
+    }
+
+    /// Map the framebuffer pages into the given process at `SHELL_FB_VA`.
+    #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+    fn map_fb_for(&mut self, pid: PID) {
+        use crate::platform::qemu_virt::fb::{FB_PHYS, FB_SIZE};
+
+        let fb_pages = FB_SIZE / beetos::PAGE_SIZE;
+        crate::mem::MemoryManager::with_mut(|mm| {
+            if let Ok(process) = self.process_mut(pid) {
+                for i in 0..fb_pages {
+                    let phys = FB_PHYS + i * beetos::PAGE_SIZE;
+                    let va = beetos::SHELL_FB_VA + i * beetos::PAGE_SIZE;
+                    process.mapping.map_page(
+                        mm,
+                        phys,
+                        va as *mut usize,
+                        xous::MemoryFlags::W | xous::MemoryFlags::DEV,
+                        true,
+                    ).ok();
+                }
+            }
+        });
+    }
+
+    /// Unmap the framebuffer pages from the given process.
+    #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+    fn unmap_fb_for(&mut self, pid: PID) {
+        use crate::platform::qemu_virt::fb::FB_SIZE;
+
+        let fb_pages = FB_SIZE / beetos::PAGE_SIZE;
+        if let Ok(process) = self.process_mut(pid) {
+            for i in 0..fb_pages {
+                let va = beetos::SHELL_FB_VA + i * beetos::PAGE_SIZE;
+                process.mapping.unmap_page(va as *mut usize).ok();
+            }
+        }
+    }
+
+    // Stub for non-qemu-virt platforms: display ownership is a no-op.
+    #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
+    fn map_fb_for(&mut self, _pid: PID) {}
+
+    #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
+    fn unmap_fb_for(&mut self, _pid: PID) {}
 
     pub fn pid_from_app_id(&self, app_id: AppId) -> Option<PID> {
         for process in self.processes.iter().flatten() {

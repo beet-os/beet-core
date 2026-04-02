@@ -4,7 +4,7 @@
 //! BeetOS log server.
 //!
 //! Receives stdout/stderr/panic messages via Xous IPC and forwards them
-//! to the UART and framebuffer. Implements the `xous-log-server` SID that
+//! to the UART and framebuffer.  Implements the `xous-log-server` SID that
 //! the Rust std PAL expects (see library/std/src/os/beetos/services/log.rs).
 //!
 //! Protocol (opcodes match xous-api-log):
@@ -13,6 +13,13 @@
 //!   Scalar(1000)   BeginPanic        — print "PANIC: "
 //!   Scalar(1100+N) AppendPanicMessage — print N bytes packed in 4 args
 //!   Scalar(1200)   PanicFinished     — print "\n"
+//!
+//! Display ownership:
+//!   For each IPC message, the log server acquires the display, syncs the
+//!   cursor to the position left by the previous owner, writes its output,
+//!   and releases the display with the new cursor position.  No shared
+//!   memory is used — cursor state is transmitted through the kernel via
+//!   AcquireDisplay / ReleaseDisplay.
 
 #![no_std]
 #![no_main]
@@ -65,28 +72,6 @@ fn putc(c: u8) {
     }
 }
 
-/// Read the cursor from the shared cursor page and apply it to FB_CONSOLE.
-/// Call before writing a message to FB so we continue from where the shell left off.
-unsafe fn sync_cursor_from_shared() {
-    if let Some(ref mut con) = FB_CONSOLE {
-        let ptr = beetos::SHARED_CURSOR_VA as *const u32;
-        let row = core::ptr::read_volatile(ptr) as usize;
-        let col = core::ptr::read_volatile(ptr.add(1)) as usize;
-        con.set_cursor(row, col);
-    }
-}
-
-/// Write the current FB_CONSOLE cursor back to the shared cursor page.
-/// Call after finishing a write so the shell picks up the new position.
-unsafe fn sync_cursor_to_shared() {
-    if let Some(ref con) = FB_CONSOLE {
-        let (row, col) = con.cursor();
-        let ptr = beetos::SHARED_CURSOR_VA as *mut u32;
-        core::ptr::write_volatile(ptr, row as u32);
-        core::ptr::write_volatile(ptr.add(1), col as u32);
-    }
-}
-
 fn write_bytes(s: &[u8]) {
     for &b in s {
         putc(b);
@@ -97,12 +82,30 @@ fn puts(s: &str) {
     write_bytes(s.as_bytes());
 }
 
-/// Write to UART only — used for the log server's own startup messages
-/// so they don't interfere with the shell's cursor on the framebuffer.
-fn uart_puts(s: &str) {
-    for b in s.bytes() {
-        uart_putc(b);
+/// Acquire the display lock and sync cursor to FB_CONSOLE.
+fn acquire_display() {
+    match xous::rsyscall(xous::SysCall::AcquireDisplay) {
+        Ok(xous::Result::Scalar2(row, col)) => {
+            unsafe {
+                if let Some(ref mut con) = FB_CONSOLE {
+                    con.set_cursor(row, col);
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+/// Release the display lock, passing the current FB cursor position.
+fn release_display() {
+    let (row, col) = unsafe {
+        if let Some(ref con) = FB_CONSOLE {
+            con.cursor()
+        } else {
+            (0, 0)
+        }
+    };
+    xous::rsyscall(xous::SysCall::ReleaseDisplay(row, col)).ok();
 }
 
 // ============================================================================
@@ -128,38 +131,29 @@ const OPCODE_PANIC_FINISHED: usize = 1200;
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn _start(uart_base: usize, fb_base: usize) -> ! {
-    // x0 = UART MMIO base VA, x1 = framebuffer base VA (0 if not available).
-    // Set by kernel in launch_first_process before ERET.
+pub extern "C" fn _start(uart_base: usize) -> ! {
+    // x0 = UART MMIO base VA (mapped by kernel before ERET).
+    // The framebuffer is acquired on demand via AcquireDisplay (mapped at
+    // SHELL_FB_VA).  No fb_base register argument — fixed VA is used.
     unsafe {
         UART_BASE = uart_base;
-        if fb_base != 0 {
-            FB_CONSOLE = Some(FbConsole::new(
-                fb_base as *mut u32,
-                FB_WIDTH, FB_HEIGHT, FB_WIDTH,
-            ));
-            // Cursor starts at (0,0); will be synced from the shared page
-            // before each IPC message is written to the FB.
-        }
+        FB_CONSOLE = Some(FbConsole::new(
+            beetos::SHELL_FB_VA as *mut u32,
+            FB_WIDTH, FB_HEIGHT, FB_WIDTH,
+        ));
     }
-
-    // Startup messages go to UART only — writing to FB here would collide
-    // with the shell's "bsh> " prompt that was printed at the same position.
-    uart_puts("[log] starting\n");
 
     let sid = xous::SID::from_array(LOG_SID);
     let _server = xous::rsyscall(xous::SysCall::CreateServerWithAddress(sid, 0..0));
-
-    uart_puts("[log] registered xous-log-server\n");
 
     loop {
         let msg = xous::rsyscall(xous::SysCall::ReceiveMessage(sid));
 
         match msg {
             Ok(xous::Result::MessageEnvelope(env)) => {
-                // Sync cursor from shared page before writing so we start
-                // at the right position (after shell or previous app output).
-                unsafe { sync_cursor_from_shared(); }
+                // Acquire the display for this message.  This syncs the
+                // cursor to wherever the previous owner left off.
+                acquire_display();
 
                 match &env.body {
                     xous::Message::Borrow(mem) => {
@@ -206,9 +200,8 @@ pub extern "C" fn _start(uart_base: usize, fb_base: usize) -> ! {
                     _ => {}
                 }
 
-                // Sync updated cursor back so the shell (or next process) starts
-                // writing after our output.
-                unsafe { sync_cursor_to_shared(); }
+                // Release the display, handing off cursor position.
+                release_display();
             }
 
             _ => {
@@ -220,7 +213,9 @@ pub extern "C" fn _start(uart_base: usize, fb_base: usize) -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    puts("PANIC in log server!\n");
+    for b in b"PANIC in log server!\r\n" {
+        uart_putc(*b);
+    }
     loop {
         unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
     }

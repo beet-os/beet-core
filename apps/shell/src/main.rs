@@ -4,8 +4,8 @@
 //! BeetOS interactive shell (bsh) — runs as a userspace process.
 //!
 //! Receives UART characters from the kernel via IPC, writes output to both
-//! UART MMIO (mapped by kernel, x0) and the framebuffer console (mapped by
-//! kernel at SHELL_FB_VA, x1).
+//! UART MMIO (mapped by kernel, x0) and the framebuffer console (mapped at
+//! SHELL_FB_VA after calling AcquireDisplay).
 //!
 //! File operations (ls, cat, mkdir, rm, write) are delegated to the
 //! filesystem service via Xous IPC (BlockingScalar).
@@ -57,28 +57,36 @@ fn fb_putc(c: u8) {
     unsafe {
         if let Some(ref mut con) = FB_CONSOLE {
             con.putc(c);
-            // Keep shared cursor page in sync so the log server writes
-            // in the right position when it receives a println! message.
-            let (row, col) = con.cursor();
-            let ptr = beetos::SHARED_CURSOR_VA as *mut u32;
-            core::ptr::write_volatile(ptr, row as u32);
-            core::ptr::write_volatile(ptr.add(1), col as u32);
         }
     }
 }
 
-/// Re-read the cursor from the shared page into our FbConsole.
-/// Call this after a spawned process returns so we pick up any FB
-/// output it wrote (hello-nostd, hello-std via log server, etc.).
-fn sync_cursor_from_shared() {
+/// Read the current cursor position from the FB console.
+fn fb_cursor() -> (usize, usize) {
     unsafe {
-        if let Some(ref mut con) = FB_CONSOLE {
-            let ptr = beetos::SHARED_CURSOR_VA as *const u32;
-            let row = core::ptr::read_volatile(ptr) as usize;
-            let col = core::ptr::read_volatile(ptr.add(1)) as usize;
-            con.set_cursor(row, col);
+        if let Some(ref con) = FB_CONSOLE {
+            con.cursor()
+        } else {
+            (0, 0)
         }
     }
+}
+
+/// Acquire exclusive display ownership.
+/// Blocks until the display is free, then returns the cursor position
+/// left by the previous owner.  After this call the FB is mapped at
+/// `SHELL_FB_VA` in this process.
+fn acquire_display() -> (usize, usize) {
+    match xous::rsyscall(xous::SysCall::AcquireDisplay) {
+        Ok(xous::Result::Scalar2(row, col)) => (row, col),
+        _ => (0, 0),
+    }
+}
+
+/// Release exclusive display ownership, recording the current cursor.
+/// After this call the FB is unmapped from this process.
+fn release_display(row: usize, col: usize) {
+    xous::rsyscall(xous::SysCall::ReleaseDisplay(row, col)).ok();
 }
 
 // ============================================================================
@@ -696,8 +704,13 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
     }
 
     if args.is_empty() {
-        // No args — use the simple scalar path (SpawnAndWait)
         let name_packed = beetos_api_procman::pack_name(cmd);
+
+        // Release the display before blocking on procman — the spawned
+        // process needs to acquire it.  Deadlock otherwise.
+        let (row, col) = fb_cursor();
+        release_display(row, col);
+
         let result = xous::rsyscall(xous::SysCall::SendMessage(
             cid,
             xous::Message::BlockingScalar(xous::ScalarMessage {
@@ -706,6 +719,15 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
                 arg3: name_packed[2], arg4: name_packed[3],
             }),
         ));
+
+        // Re-acquire display after the child ran; cursor is now updated.
+        let (row, col) = acquire_display();
+        unsafe {
+            if let Some(ref mut con) = FB_CONSOLE {
+                con.set_cursor(row, col);
+            }
+        }
+
         match result {
             Ok(xous::Result::Scalar1(exit_code)) | Ok(xous::Result::Scalar2(exit_code, _)) => {
                 if exit_code == usize::MAX {
@@ -717,9 +739,6 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
             Err(_) => { let _ = write!(DualWriter, "bsh: {}: spawn failed\n", cmd); }
             _ => { let _ = write!(DualWriter, "bsh: {}: unexpected result\n", cmd); }
         }
-        // Sync cursor after the spawned process (or log server) wrote to FB.
-        sync_cursor_from_shared();
-        return;
     } else {
         // Has args — allocate a page and send via MutableBorrow
         let page_size = xous::MemorySize::new(beetos::PAGE_SIZE);
@@ -746,8 +765,12 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
         };
         let valid_len = beetos_api_procman::format_cmdline(page_slice, cmd, args);
 
-        // Send MutableBorrow to procman
         let valid = xous::MemorySize::new(valid_len);
+
+        // Release the display before blocking on procman.
+        let (row, col) = fb_cursor();
+        release_display(row, col);
+
         let result = xous::rsyscall(xous::SysCall::SendMessage(
             cid,
             xous::Message::MutableBorrow(xous::MemoryMessage {
@@ -757,6 +780,14 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
                 valid,
             }),
         ));
+
+        // Re-acquire display after the child ran.
+        let (row, col) = acquire_display();
+        unsafe {
+            if let Some(ref mut con) = FB_CONSOLE {
+                con.set_cursor(row, col);
+            }
+        }
 
         // Read exit code from the returned buffer (first usize)
         match result {
@@ -780,10 +811,6 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
         // Free the page
         xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
     }
-
-    // Re-sync cursor: the spawned process (or the log server on its behalf)
-    // may have written to the FB and updated the shared cursor page.
-    sync_cursor_from_shared();
 }
 
 // ============================================================================
@@ -791,17 +818,25 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn _start(uart_base: usize, fb_base: usize) -> ! {
+pub extern "C" fn _start(uart_base: usize) -> ! {
     unsafe {
         UART_BASE = uart_base;
         CWD_BUF[0] = b'/';
         CWD_LEN = 1;
-        if fb_base != 0 {
-            FB_CONSOLE = Some(FbConsole::new(fb_base as *mut u32, FB_WIDTH, FB_HEIGHT, FB_WIDTH));
-        }
+        // FB is mapped at a fixed VA by AcquireDisplay — use it directly.
+        FB_CONSOLE = Some(FbConsole::new(
+            beetos::SHELL_FB_VA as *mut u32,
+            FB_WIDTH, FB_HEIGHT, FB_WIDTH,
+        ));
     }
 
-    // Print banner
+    // Acquire the display, print banner + prompt, then release.
+    let (row, col) = acquire_display();
+    unsafe {
+        if let Some(ref mut con) = FB_CONSOLE {
+            con.set_cursor(row, col);
+        }
+    }
     puts("\n");
     puts("  ____            _    ___  ____\n");
     puts(" | __ )  ___  ___| |_ / _ \\/ ___|\n");
@@ -813,21 +848,30 @@ pub extern "C" fn _start(uart_base: usize, fb_base: usize) -> ! {
     puts("Shell running as userspace process (EL0)\n");
     puts("\n");
     prompt();
+    let (row, col) = fb_cursor();
+    release_display(row, col);
 
     // Create console server and receive characters from UART IRQ handler
     let sid = xous::SID::from_array(beetos_api_console::CONSOLE_SID);
     let _server = xous::rsyscall(xous::SysCall::CreateServerWithAddress(sid, 0..0));
 
     loop {
+        // Wait for a keypress — display is NOT held here.
         let msg = xous::rsyscall(xous::SysCall::ReceiveMessage(sid));
         match msg {
             Ok(xous::Result::MessageEnvelope(env)) => {
                 if let xous::Message::Scalar(scalar) = env.body {
                     if scalar.id == beetos_api_console::ConsoleOp::Char as usize {
-                        // Re-sync cursor in case the log server wrote something
-                        // on behalf of a spawned process between keystrokes.
-                        sync_cursor_from_shared();
+                        // Acquire display, sync cursor, process char, release.
+                        let (row, col) = acquire_display();
+                        unsafe {
+                            if let Some(ref mut con) = FB_CONSOLE {
+                                con.set_cursor(row, col);
+                            }
+                        }
                         process_char(scalar.arg1 as u8);
+                        let (row, col) = fb_cursor();
+                        release_display(row, col);
                     }
                 }
             }
