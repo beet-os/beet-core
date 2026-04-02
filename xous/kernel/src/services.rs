@@ -1534,6 +1534,13 @@ impl SystemServices {
         self.display_state.push_input_char(c);
     }
 
+    /// Clear the keyboard input focus. Subsequent keystrokes go to the kernel
+    /// ring buffer until the next `AcquireInputFocus` call.
+    #[cfg(beetos)]
+    pub fn release_input_focus(&mut self) {
+        self.display_state.clear_input_focus();
+    }
+
     /// Register `sid_words` as the keyboard input destination for the current
     /// display session.  The caller must be the current display owner.
     ///

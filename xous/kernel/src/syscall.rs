@@ -416,7 +416,7 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         SysCall::GetBinaryName(_) => Ok(()),
 
         #[cfg(beetos)]
-        SysCall::AcquireDisplay | SysCall::ReleaseDisplay(..) | SysCall::AcquireInputFocus(..) => Ok(()),
+        SysCall::AcquireDisplay | SysCall::ReleaseDisplay(..) | SysCall::AcquireInputFocus(..) | SysCall::ReleaseInputFocus => Ok(()),
 
         // Messaging-related calls
         SysCall::CreateServer
@@ -1043,6 +1043,12 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
                 }
                 Err(e) => Err(e),
             }
+        }),
+
+        #[cfg(beetos)]
+        SysCall::ReleaseInputFocus => SystemServices::with_mut(|ss| {
+            ss.release_input_focus();
+            Ok(xous::Result::Ok)
         }),
 
         _ => Err(Error::UnhandledSyscall),

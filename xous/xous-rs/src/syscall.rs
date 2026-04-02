@@ -554,6 +554,15 @@ pub enum SysCall {
     #[cfg(beetos)]
     AcquireInputFocus(u32, u32, u32, u32),
 
+    /// Release keyboard input focus.
+    ///
+    /// Clears the registered input SID. Subsequent keystrokes are buffered in
+    /// the kernel ring buffer until the next `AcquireInputFocus` call.
+    /// Typically called before `SpawnAndWait` so chars typed during the
+    /// transition go to the buffer rather than a blocked process's IPC queue.
+    #[cfg(beetos)]
+    ReleaseInputFocus,
+
     /// This syscall does not exist. It captures all possible
     /// arguments so detailed analysis can be performed.
     Invalid(usize, usize, usize, usize, usize, usize, usize),
@@ -627,6 +636,7 @@ pub enum SysCallNumber {
     AcquireDisplay = 65,
     ReleaseDisplay = 66,
     AcquireInputFocus = 67,
+    ReleaseInputFocus = 68,
 
     Invalid,
 }
@@ -701,6 +711,7 @@ impl SysCallNumber {
             65 => AcquireDisplay,
             66 => ReleaseDisplay,
             67 => AcquireInputFocus,
+            68 => ReleaseInputFocus,
             _ => Invalid,
         }
     }
@@ -1063,6 +1074,10 @@ impl SysCall {
             SysCall::AcquireInputFocus(a, b, c, d) => {
                 [SysCallNumber::AcquireInputFocus as usize, *a as usize, *b as usize, *c as usize, *d as usize, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::ReleaseInputFocus => {
+                [SysCallNumber::ReleaseInputFocus as usize, 0, 0, 0, 0, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1268,6 +1283,8 @@ impl SysCall {
             SysCallNumber::AcquireInputFocus => {
                 SysCall::AcquireInputFocus(a1 as u32, a2 as u32, a3 as u32, a4 as u32)
             }
+            #[cfg(beetos)]
+            SysCallNumber::ReleaseInputFocus => SysCall::ReleaseInputFocus,
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1286,7 +1303,8 @@ impl SysCall {
             | SysCallNumber::GetBinaryName
             | SysCallNumber::AcquireDisplay
             | SysCallNumber::ReleaseDisplay
-            | SysCallNumber::AcquireInputFocus => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::AcquireInputFocus
+            | SysCallNumber::ReleaseInputFocus => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }

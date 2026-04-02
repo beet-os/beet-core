@@ -99,6 +99,15 @@ fn acquire_input_focus() {
     xous::rsyscall(xous::SysCall::AcquireInputFocus(a, b, c, d)).ok();
 }
 
+/// Release keyboard input focus before blocking in SpawnAndWait.
+///
+/// Subsequent keystrokes go to the kernel ring buffer so they are not
+/// delivered to our (blocked) IPC queue.  The child will claim focus via
+/// `AcquireInputFocus`; on return we reclaim it with `acquire_input_focus`.
+fn release_input_focus() {
+    xous::rsyscall(xous::SysCall::ReleaseInputFocus).ok();
+}
+
 // ============================================================================
 // Combined output (UART + FB)
 // ============================================================================
@@ -716,10 +725,11 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
     if args.is_empty() {
         let name_packed = beetos_api_procman::pack_name(cmd);
 
-        // Release the display before blocking on procman — the spawned
-        // process needs to acquire it.  Deadlock otherwise.
+        // Release display and input focus before blocking on procman — the
+        // spawned process needs to acquire both.  Deadlock otherwise.
         let (row, col) = fb_cursor();
         release_display(row, col);
+        release_input_focus();
 
         let result = xous::rsyscall(xous::SysCall::SendMessage(
             cid,
@@ -778,9 +788,10 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
 
         let valid = xous::MemorySize::new(valid_len);
 
-        // Release the display before blocking on procman.
+        // Release display and input focus before blocking on procman.
         let (row, col) = fb_cursor();
         release_display(row, col);
+        release_input_focus();
 
         let result = xous::rsyscall(xous::SysCall::SendMessage(
             cid,
