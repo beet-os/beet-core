@@ -12,18 +12,16 @@
 
 pub mod backtrace;
 pub mod boot;
-#[allow(dead_code)]
 pub mod elf;
 pub mod irq;
 pub mod mem;
 pub mod panic;
 pub mod process;
-#[allow(dead_code)]
 pub mod rand;
+// `invoke` is not called yet — future use for kernel-injected syscalls.
 #[allow(dead_code)]
 pub mod syscall;
 
-#[allow(dead_code)]
 mod asm;
 
 use core::arch::asm;

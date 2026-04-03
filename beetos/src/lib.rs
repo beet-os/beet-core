@@ -256,10 +256,18 @@ pub const PLAINTEXT_DRAM_END: usize = PLAINTEXT_DRAM_BASE + RAM_SIZE;
 pub const ENCRYPTED_DRAM_BASE: usize = PLAINTEXT_DRAM_BASE;
 pub const ENCRYPTED_DRAM_END: usize = PLAINTEXT_DRAM_END;
 
-/// Convert to "encrypted" physical address (no-op on Apple Silicon).
+/// Convert to "encrypted" physical address.
+///
+/// No-op today — seam for a future memory encryption layer (e.g. AMD SME/TME
+/// or a software XOR scheme). Keep the call sites so the layer can be
+/// activated in one place without hunting through the codebase.
+#[inline(always)]
 pub fn to_encrypted_phys_addr(addr: usize) -> usize { addr }
 
-/// Convert to plaintext physical address (no-op on Apple Silicon).
+/// Convert to plaintext physical address.
+///
+/// No-op today — see `to_encrypted_phys_addr`.
+#[inline(always)]
 pub fn to_plaintext_phys_addr(addr: usize) -> usize { addr }
 
 /// Check if address is in the "encrypted" region (always same as plaintext on M1).

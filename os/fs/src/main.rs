@@ -71,6 +71,12 @@ fn get_disk_archive() -> Option<tarfs::TarArchive<'static>> {
     }
 }
 
+fn ipc_reply(sender: xous::MessageSender, val: usize) {
+    if xous::return_scalar(sender, val).is_err() {
+        puts("fs: IPC reply failed\n");
+    }
+}
+
 fn is_disk_path(path: &str) -> bool {
     let p = path.strip_prefix('/').unwrap_or(path);
     p == "disk" || p.starts_with("disk/")
@@ -142,22 +148,22 @@ fn handle_blocking_scalar(sender: xous::MessageSender, scalar: xous::ScalarMessa
         id if id == FsOp::Cat as usize => {
             let path = beetos_api_fs::unpack_path(&args);
             let result = do_cat(path);
-            xous::return_scalar(sender, result as usize).ok();
+            ipc_reply(sender, result as usize);
         }
         id if id == FsOp::Ls as usize => {
             let path = beetos_api_fs::unpack_path(&args);
             let result = do_ls(path);
-            xous::return_scalar(sender, result as usize).ok();
+            ipc_reply(sender, result as usize);
         }
         id if id == FsOp::Mkdir as usize => {
             let path = beetos_api_fs::unpack_path(&args);
             let result = do_mkdir(path);
-            xous::return_scalar(sender, result as usize).ok();
+            ipc_reply(sender, result as usize);
         }
         id if id == FsOp::Remove as usize => {
             let path = beetos_api_fs::unpack_path(&args);
             let result = do_remove(path);
-            xous::return_scalar(sender, result as usize).ok();
+            ipc_reply(sender, result as usize);
         }
         id if id == FsOp::WriteShort as usize => {
             // arg1-arg2 = path (16 bytes), arg3-arg4 = content (16 bytes)
@@ -166,21 +172,24 @@ fn handle_blocking_scalar(sender: xous::MessageSender, scalar: xous::ScalarMessa
             let content_args = [scalar.arg3, scalar.arg4];
             let content = unpack_short_content(&content_args);
             let result = do_write(path, content);
-            xous::return_scalar(sender, result as usize).ok();
+            ipc_reply(sender, result as usize);
         }
         id if id == FsOp::Stats as usize => {
             let (used, total, bytes) = ramfs::stats();
             let disk_size = unsafe { DISK_SIZE };
             let disk_files = get_disk_archive().map(|a| a.count()).unwrap_or(0);
-            xous::return_scalar5(sender, used, total, bytes, disk_size, disk_files).ok();
+
+            if xous::return_scalar5(sender, used, total, bytes, disk_size, disk_files).is_err() {
+                puts("fs: IPC reply failed\n");
+            }
         }
         id if id == FsOp::IsDir as usize => {
             let path = beetos_api_fs::unpack_path(&args);
             let result = do_is_dir(path);
-            xous::return_scalar(sender, result as usize).ok();
+            ipc_reply(sender, result as usize);
         }
         _ => {
-            xous::return_scalar(sender, FsError::InvalidPath as usize).ok();
+            ipc_reply(sender, FsError::InvalidPath as usize);
         }
     }
 }

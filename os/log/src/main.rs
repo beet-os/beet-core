@@ -201,6 +201,9 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
             }
 
             _ => {
+                // ReceiveMessage is blocking, so this branch is only reachable
+                // if the kernel delivers an unexpected message type. Yield rather
+                // than spin to avoid monopolizing the CPU in that unlikely case.
                 xous::yield_slice();
             }
         }
