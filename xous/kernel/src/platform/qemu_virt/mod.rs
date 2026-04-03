@@ -35,15 +35,36 @@ mod defaults {
 /// Initialize the QEMU virt platform.
 ///
 /// Called after MMU is enabled and the kernel is running at high VA (TTBR1).
-/// MMIO addresses are converted to kernel VA via `phys_to_virt` so all
-/// device access goes through TTBR1, not TTBR0.
-pub fn init() {
-    uart::init(beetos::phys_to_virt(defaults::UART0_PHYS));
+/// MMIO physical addresses are read from the FDT first; the `defaults` module
+/// provides fallbacks for when the FDT is absent or incomplete.
+/// All addresses are converted to kernel VA via `phys_to_virt`.
+pub fn init(fdt_phys: *const u8) {
+    // Resolve MMIO addresses: prefer FDT, fall back to compiled-in defaults.
+    let mmio = unsafe {
+        crate::arch::boot::parse_fdt_mmio(beetos::phys_to_virt(fdt_phys as usize) as *const u8)
+    };
+
+    let uart0_phys = mmio.uart0_phys.unwrap_or(defaults::UART0_PHYS);
+    let gicd_phys  = mmio.gicd_phys.unwrap_or(defaults::GICD_PHYS);
+    let gicr_phys  = mmio.gicr_phys.unwrap_or(defaults::GICR_PHYS);
+
+    uart::init(beetos::phys_to_virt(uart0_phys));
     uart::puts("BeetOS v0.1.0\n");
     uart::puts("Platform: QEMU virt (AArch64)\n");
 
-    gic::init(beetos::phys_to_virt(defaults::GICD_PHYS), beetos::phys_to_virt(defaults::GICR_PHYS));
-    uart::puts("GIC: initialized\n");
+    if mmio.uart0_phys.is_some() {
+        uart::puts("UART: address from FDT\n");
+    } else {
+        uart::puts("UART: address from default (FDT not found)\n");
+    }
+
+    gic::init(beetos::phys_to_virt(gicd_phys), beetos::phys_to_virt(gicr_phys));
+
+    if mmio.gicd_phys.is_some() {
+        uart::puts("GIC: initialized (address from FDT)\n");
+    } else {
+        uart::puts("GIC: initialized (address from default)\n");
+    }
 
     timer::init();
     uart::puts("Timer: initialized\n");

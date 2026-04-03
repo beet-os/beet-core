@@ -176,6 +176,148 @@ pub unsafe fn parse_fdt_ram(fdt_ptr: *const u8) -> Option<RamRegion> {
     None
 }
 
+/// MMIO base physical addresses discovered from the FDT.
+/// Fields are `None` when the corresponding node was not found.
+pub struct MmioAddrs {
+    pub uart0_phys: Option<usize>,
+    pub gicd_phys:  Option<usize>,
+    pub gicr_phys:  Option<usize>,
+}
+
+/// Check whether a FDT `compatible` value contains `target` as a whole entry.
+///
+/// Compatible values are lists of null-terminated strings, e.g.
+/// `"arm,pl011\0arm,primecell\0"`.  We match whole entries to avoid
+/// false positives (e.g. `"arm,pl011-r2"` would be a different peripheral).
+unsafe fn compat_has(data: *const u8, len: usize, target: &[u8]) -> bool {
+    let haystack = core::slice::from_raw_parts(data, len);
+    let mut start = 0;
+
+    while start < haystack.len() {
+        let end = haystack[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| start + p)
+            .unwrap_or(haystack.len());
+
+        if &haystack[start..end] == target {
+            return true;
+        }
+
+        start = end + 1;
+    }
+
+    false
+}
+
+/// Parse the FDT to discover UART and GIC MMIO physical base addresses.
+///
+/// Matches devices by their `compatible` string:
+/// - UART: `arm,pl011`
+/// - GIC:  `arm,gic-v3`
+///
+/// Assumes `#address-cells = 2`, `#size-cells = 2` at the root level
+/// (standard for QEMU virt and Apple Silicon).  Returns `None` for any
+/// device not found in the FDT; callers should fall back to platform defaults.
+///
+/// # Safety
+///
+/// `fdt_ptr` must point to a valid FDT blob accessible through TTBR1.
+pub unsafe fn parse_fdt_mmio(fdt_ptr: *const u8) -> MmioAddrs {
+    let mut result = MmioAddrs { uart0_phys: None, gicd_phys: None, gicr_phys: None };
+
+    if be32(fdt_ptr) != FDT_MAGIC {
+        return result;
+    }
+
+    let total_size     = be32(fdt_ptr.add(4)) as usize;
+    let off_dt_struct  = be32(fdt_ptr.add(8)) as usize;
+    let off_dt_strings = be32(fdt_ptr.add(12)) as usize;
+
+    if off_dt_struct >= total_size || off_dt_strings >= total_size {
+        return result;
+    }
+
+    let struct_base  = fdt_ptr.add(off_dt_struct);
+    let strings_base = fdt_ptr.add(off_dt_strings);
+    let struct_limit = total_size - off_dt_struct;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind { None, Uart, Gic }
+
+    let mut pos: usize = 0;
+    let mut depth: usize = 0;
+    let mut kind = Kind::None;
+    let mut kind_depth: usize = 0;
+
+    loop {
+        if pos + 4 > struct_limit { break; }
+        let token = be32(struct_base.add(pos));
+        pos += 4;
+
+        match token {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                // Skip null-terminated node name.
+                let mut name_len = 0;
+                while pos + name_len < struct_limit && *struct_base.add(pos + name_len) != 0 {
+                    name_len += 1;
+                }
+                pos += name_len + 1;
+                pos = (pos + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if kind != Kind::None && depth == kind_depth {
+                    kind = Kind::None;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            FDT_PROP => {
+                if pos + 8 > struct_limit { break; }
+                let len     = be32(struct_base.add(pos)) as usize;
+                let nameoff = be32(struct_base.add(pos + 4)) as usize;
+                pos += 8;
+
+                if pos.saturating_add(len) > struct_limit { break; }
+
+                let prop_name = strings_base.add(nameoff);
+                let prop_data = struct_base.add(pos);
+
+                if cstr_starts_with(prop_name, b"compatible\0") {
+                    if result.uart0_phys.is_none() && compat_has(prop_data, len, b"arm,pl011") {
+                        kind = Kind::Uart;
+                        kind_depth = depth;
+                    } else if result.gicd_phys.is_none() && compat_has(prop_data, len, b"arm,gic-v3") {
+                        kind = Kind::Gic;
+                        kind_depth = depth;
+                    }
+                } else if cstr_starts_with(prop_name, b"reg\0") {
+                    match kind {
+                        // UART: one reg entry = [addr_hi addr_lo size_hi size_lo] (2+2 cells × 4B = 16B)
+                        Kind::Uart if len >= 16 => {
+                            result.uart0_phys = Some(be64(prop_data) as usize);
+                        }
+                        // GIC: two reg entries = [GICD addr/size, GICR addr/size] (2×16B = 32B)
+                        Kind::Gic if len >= 32 => {
+                            result.gicd_phys = Some(be64(prop_data) as usize);
+                            result.gicr_phys = Some(be64(prop_data.add(16)) as usize);
+                        }
+                        _ => {}
+                    }
+                }
+
+                pos += len;
+                pos = (pos + 3) & !3;
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => break,
+        }
+    }
+
+    result
+}
+
 // ============================================================================
 // Bump allocator (works in high VA space)
 // ============================================================================

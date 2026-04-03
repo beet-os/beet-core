@@ -60,8 +60,10 @@ use xous::*;
 /// This is safe to call only once, from the startup assembly.
 pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     // Initialize platform hardware (UART for output, GIC, timer).
+    // Pass the FDT physical address so the platform can parse MMIO addresses
+    // from it instead of relying on hardcoded defaults.
     // MMIO is accessed at high VA through TTBR1 (phys_to_virt).
-    platform::init();
+    platform::init(arg_offset as *const u8);
 
     // Store the boot arguments (FDT pointer) for later use
     args::KernelArguments::init(arg_offset);

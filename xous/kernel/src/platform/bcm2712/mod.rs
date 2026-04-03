@@ -28,9 +28,9 @@ mod defaults {
 
 /// Initialize the BCM2712 platform.
 ///
-/// Uses hardcoded defaults from the RPi5 device tree. FDT parsing for
-/// dynamic address discovery is a future improvement.
-pub fn init() {
+/// `fdt_phys` is the FDT physical address (reserved for future FDT-based
+/// address discovery). Currently uses hardcoded defaults from the RPi5 device tree.
+pub fn init(_fdt_phys: *const u8) {
     uart::init(defaults::UART0_BASE);
     uart::puts("BeetOS v0.1.0\n");
     uart::puts("Platform: Raspberry Pi 5 (BCM2712 / AArch64)\n");

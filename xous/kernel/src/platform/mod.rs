@@ -21,19 +21,23 @@ pub fn fb_write(s: &str) { self::qemu_virt::fb::write_str(s); }
 pub fn fb_write(_s: &str) {}
 
 /// Platform specific initialization.
+///
+/// `fdt_phys` is the FDT physical address passed by the bootloader (x0 on
+/// AArch64).  Platforms use it to discover MMIO base addresses; hosted mode
+/// ignores it.
 #[cfg(feature = "platform-qemu-virt")]
-pub fn init() { self::qemu_virt::init(); }
+pub fn init(fdt_phys: *const u8) { self::qemu_virt::init(fdt_phys); }
 
 #[cfg(feature = "platform-bcm2712")]
-pub fn init() { self::bcm2712::init(); }
+pub fn init(fdt_phys: *const u8) { self::bcm2712::init(fdt_phys); }
 
 #[cfg(feature = "platform-apple-t8103")]
-pub fn init() { self::apple_t8103::init(); }
+pub fn init(fdt_phys: *const u8) { self::apple_t8103::init(fdt_phys); }
 
 /// Platform init stub for hosted mode (no platform hardware).
 #[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-bcm2712", feature = "platform-apple-t8103")))]
 #[allow(dead_code)]
-pub fn init() {}
+pub fn init(_fdt_phys: *const u8) {}
 
 /// Halt / shutdown the system.
 #[cfg(feature = "platform-qemu-virt")]

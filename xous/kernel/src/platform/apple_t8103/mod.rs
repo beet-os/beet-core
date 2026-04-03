@@ -19,9 +19,9 @@ pub mod wdt;
 
 /// Platform-specific initialization for Apple T8103 (M1).
 ///
-/// Called early in boot after the kernel has set up basic memory.
-/// Will eventually initialize AIC, timers, framebuffer, etc.
-pub fn init() {
+/// `fdt_phys` is the FDT physical address for MMIO discovery (M1n1 passes it
+/// in x0). Currently a stub — AIC, timers, and framebuffer init are TODO(M3).
+pub fn init(_fdt_phys: *const u8) {
     // TODO(M2): implement platform init
     // - Parse FDT for MMIO addresses
     // - Initialize AIC (interrupt controller)
