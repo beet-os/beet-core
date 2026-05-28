@@ -16,6 +16,11 @@ mod test;
 
 mod kfuture;
 mod arch;
+/// Generic PCIe enumeration (config-space access, BAR sizing, bus walk).
+/// Pure register-level code, unit-tested against a `MockMmio`. Platform
+/// glue (BCM2712 link bring-up, future Apple AGX dart-pcie, etc.) lives
+/// in the per-platform module.
+mod pcie;
 
 #[cfg(beetos)]
 mod fb_console;

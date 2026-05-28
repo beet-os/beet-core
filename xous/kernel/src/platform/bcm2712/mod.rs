@@ -16,6 +16,7 @@
 pub mod fb;
 pub mod gic;
 pub mod mailbox;
+pub mod pcie_brcm;
 pub mod timer;
 pub mod uart;
 
