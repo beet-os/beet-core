@@ -97,6 +97,9 @@ pub enum WindowKind {
     /// Animated Mandelbrot fractal — zooms slowly toward a fixed
     /// pretty point. Pure CPU, exercises every gfx pixel path.
     Mandelbrot(MandelState),
+    /// Conway's Game of Life — a 32x24 board evolving once per
+    /// animation tick.  Space toggles pause, R reseeds randomly.
+    Life(LifeState),
 }
 
 /// One line of text inside a `WindowKind::Text` window.
@@ -641,6 +644,174 @@ fn palette_color(iter: u16, max_iter: u16) -> Color {
     rgb
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Conway's Game of Life
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const LIFE_COLS: usize = 32;
+pub const LIFE_ROWS: usize = 24;
+pub const LIFE_CELLS: usize = LIFE_COLS * LIFE_ROWS;
+
+/// Conway's Game of Life — fixed 32x24 board, double-buffered next
+/// state, xorshift seed for "R" reseeding. Pauses on space.
+#[derive(Clone, Copy)]
+pub struct LifeState {
+    pub cells:  [u8; LIFE_CELLS], // 0 = dead, 1 = alive (only LSB used)
+    pub paused: bool,
+    pub generation: u32,
+    rng: u32,
+    counter: u8,
+}
+
+impl LifeState {
+    /// Tick rate divider — Life steps every STEP_TICKS animation frames.
+    /// 2 → ~5 generations per second at the 10 Hz recompose rate.
+    const STEP_TICKS: u8 = 2;
+
+    /// Pre-seeded with a classic glider + a small R-pentomino so the
+    /// initial frame is interesting before anyone presses R.
+    pub const fn new() -> Self {
+        let mut cells = [0u8; LIFE_CELLS];
+        // glider near top-left.
+        let glider = [(2, 1), (3, 2), (1, 3), (2, 3), (3, 3)];
+        let mut i = 0;
+        while i < glider.len() {
+            let (x, y) = glider[i];
+            cells[y * LIFE_COLS + x] = 1;
+            i += 1;
+        }
+        // R-pentomino in the middle — long-lived chaos.
+        let r_pento = [(16, 11), (17, 11), (15, 12), (16, 12), (16, 13)];
+        let mut i = 0;
+        while i < r_pento.len() {
+            let (x, y) = r_pento[i];
+            cells[y * LIFE_COLS + x] = 1;
+            i += 1;
+        }
+        // Blinker far right.
+        let blinker = [(28, 4), (28, 5), (28, 6)];
+        let mut i = 0;
+        while i < blinker.len() {
+            let (x, y) = blinker[i];
+            cells[y * LIFE_COLS + x] = 1;
+            i += 1;
+        }
+        LifeState { cells, paused: false, generation: 0, rng: 0xACE0_F11E, counter: 0 }
+    }
+
+    /// Random-fill (~30 % alive) seeded from the xorshift state.
+    pub fn reseed(&mut self) {
+        self.cells = [0; LIFE_CELLS];
+        for cell in self.cells.iter_mut() {
+            let mut x = self.rng;
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            self.rng = x.max(1);
+            *cell = if (x & 0xFF) < 80 { 1 } else { 0 };
+        }
+        self.generation = 0;
+    }
+
+    /// Step the board by one Conway generation.
+    fn step(&mut self) {
+        let mut next = [0u8; LIFE_CELLS];
+        for y in 0..LIFE_ROWS as i32 {
+            for x in 0..LIFE_COLS as i32 {
+                let mut neighbors = 0u8;
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if dx == 0 && dy == 0 { continue; }
+                        // Toroidal wrap so gliders survive at edges.
+                        let nx = (x + dx + LIFE_COLS as i32) % LIFE_COLS as i32;
+                        let ny = (y + dy + LIFE_ROWS as i32) % LIFE_ROWS as i32;
+                        neighbors += self.cells[(ny as usize) * LIFE_COLS + nx as usize];
+                    }
+                }
+                let alive = self.cells[(y as usize) * LIFE_COLS + x as usize] != 0;
+                let lives_next = matches!((alive, neighbors), (true, 2) | (true, 3) | (false, 3));
+                next[(y as usize) * LIFE_COLS + x as usize] = lives_next as u8;
+            }
+        }
+        self.cells = next;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn tick(&mut self) -> bool {
+        if self.paused { return false; }
+        self.counter += 1;
+        if self.counter < Self::STEP_TICKS { return false; }
+        self.counter = 0;
+        self.step();
+        true
+    }
+
+    pub fn press(&mut self, key: u8) -> bool {
+        match key {
+            b' '          => { self.paused = !self.paused; true }
+            b'r' | b'R'   => { self.reseed(); true }
+            _ => false,
+        }
+    }
+
+    fn draw(&self, screen: &mut Surface, rect: &Rect) {
+        // Pad slightly so the grid doesn't hug the window frame.
+        let inset = 8;
+        let avail_w = (rect.w - 2 * inset).max(LIFE_COLS as i32);
+        let avail_h = (rect.h - 2 * inset - 18).max(LIFE_ROWS as i32);
+        let cell = avail_w.min(avail_h * LIFE_COLS as i32 / LIFE_ROWS as i32) / LIFE_COLS as i32;
+        let board_w = cell * LIFE_COLS as i32;
+        let board_h = cell * LIFE_ROWS as i32;
+        let bx = rect.x + (rect.w - board_w) / 2;
+        let by = rect.y + inset;
+        screen.fill_rect(&Rect::new(bx, by, board_w, board_h), color::BLACK);
+        for y in 0..LIFE_ROWS as i32 {
+            for x in 0..LIFE_COLS as i32 {
+                if self.cells[(y as usize) * LIFE_COLS + x as usize] != 0 {
+                    let c = if self.generation < 4 {
+                        // Initial seed cells glow brighter so the
+                        // starting position is obvious for a moment.
+                        color::BRIGHT_GREEN
+                    } else {
+                        color::GREEN
+                    };
+                    let cx = bx + x * cell + 1;
+                    let cy = by + y * cell + 1;
+                    let cs = (cell - 1).max(1);
+                    screen.fill_rect(&Rect::new(cx, cy, cs, cs), c);
+                }
+            }
+        }
+        // Footer with generation count + hint.
+        let mut buf = [0u8; 32];
+        let label = format_generation(self.generation, self.paused, &mut buf);
+        screen.draw_text(rect.x + 8, rect.bottom() - 16, label, color::LIGHT_GRAY, color::WINDOW_BG);
+    }
+}
+
+fn format_generation(gen: u32, paused: bool, buf: &mut [u8]) -> &str {
+    let pre = if paused { &b"gen "[..] } else { &b"gen "[..] };
+    let pre_len = pre.len();
+    buf[..pre_len].copy_from_slice(pre);
+    let mut n = gen;
+    let mut tmp = [0u8; 10];
+    let mut idx = tmp.len();
+    if n == 0 { idx -= 1; tmp[idx] = b'0'; }
+    while n > 0 && idx > 0 {
+        idx -= 1;
+        tmp[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let digits = &tmp[idx..];
+    let suffix = if paused { &b" [paused - space=resume, r=reseed]"[..] }
+                 else      { &b" - space=pause, r=reseed"[..] };
+    let mut cursor = pre_len + digits.len();
+    buf[pre_len..cursor].copy_from_slice(digits);
+    let max = buf.len();
+    let take = suffix.len().min(max - cursor);
+    buf[cursor..cursor + take].copy_from_slice(&suffix[..take]);
+    cursor += take;
+    core::str::from_utf8(&buf[..cursor]).unwrap_or("gen")
+}
+
 /// Format `score` as `"score: NNNN"` into the given byte buffer.
 fn format_score(score: u16, buf: &mut [u8]) -> &str {
     let prefix = b"score: ";
@@ -832,6 +1003,10 @@ impl Window {
                 state.draw(screen, &content);
             }
             WindowKind::Mandelbrot(state) => {
+                state.draw(screen, &content);
+            }
+            WindowKind::Life(state) => {
+                screen.fill_rect(&content, self.bg);
                 state.draw(screen, &content);
             }
             WindowKind::Notes(state) => {
@@ -1074,6 +1249,7 @@ impl WindowManager {
             WindowKind::Calc(state)  => state.press(key),
             WindowKind::Notes(state) => state.press(key),
             WindowKind::Snake(state) => state.press(key),
+            WindowKind::Life(state)  => state.press(key),
             _ => false,
         }
     }
@@ -1092,6 +1268,9 @@ impl WindowManager {
                     WindowKind::Mandelbrot(state) => {
                         state.tick();
                         changed = true;
+                    }
+                    WindowKind::Life(state) => {
+                        if state.tick() { changed = true; }
                     }
                     _ => {}
                 }

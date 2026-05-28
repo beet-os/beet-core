@@ -20,7 +20,7 @@ use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 use beetos::gfx::{color, Color, Rect, Surface};
 use beetos::gui::{
-    about_grid, CalcState, MandelState, NotesState, SnakeState, TextLine, Window, WindowKind,
+    CalcState, LifeState, MandelState, NotesState, SnakeState, TextLine, Window, WindowKind,
     WindowManager, MAX_TEXT_LINES,
 };
 use beetos::{phys_to_virt, virt_to_phys};
@@ -443,13 +443,13 @@ pub fn populate_demo_desktop() {
         );
         let _ = wm.add(boot);
 
-        // Window 3 — about dialog (bottom-left, partly overlapping boot log).
-        let about = Window::new(
-            Rect::new(120, 540, 340, 180),
-            "About BeetOS",
-            WindowKind::Widgets(about_grid()),
+        // Window 3 — Conway's Game of Life (bottom-left).
+        let life = Window::new(
+            Rect::new(40, 540, 420, 180),
+            "Game of Life",
+            WindowKind::Life(LifeState::new()),
         );
-        let _ = wm.add(about);
+        let _ = wm.add(life);
 
         // Window 4 — Snake game (centre-top, the wow-factor demo).
         // Board is 20x15 cells at 16 px each, so we size the content
