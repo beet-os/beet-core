@@ -91,6 +91,9 @@ pub enum WindowKind {
     /// A note pad — every printable key appends, backspace deletes,
     /// Enter inserts a newline. Up to [`NOTES_MAX_LEN`] chars.
     Notes(NotesState),
+    /// A live Snake game. Arrow keys steer, space restarts, the
+    /// game ticks forward each animation frame.
+    Snake(SnakeState),
 }
 
 /// One line of text inside a `WindowKind::Text` window.
@@ -282,6 +285,256 @@ fn i64_to_str(mut n: i64, buf: &mut [u8]) -> &str {
 /// Maximum chars in the Notes pad.
 pub const NOTES_MAX_LEN: usize = 512;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Snake game state — interactive, ticks once per animation frame.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Snake board geometry — chosen to give a comfortable cell size at
+/// the demo window dimensions (320×240 content → 16 px cells).
+pub const SNAKE_COLS: usize = 20;
+pub const SNAKE_ROWS: usize = 15;
+pub const SNAKE_MAX_LEN: usize = SNAKE_COLS * SNAKE_ROWS;
+pub const SNAKE_CELL_PX: i32 = 16;
+
+/// Compass directions the snake can be heading. Stored as u8 so it
+/// stays Copy alongside the rest of `SnakeState`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnakeDir { North = 0, East = 1, South = 2, West = 3 }
+
+/// Snake's full state — segments, direction, food, score, RNG, game-over.
+///
+/// All allocation-free: segments live in a fixed `[(u8, u8); SNAKE_MAX_LEN]`
+/// array with a `len` cursor, and the RNG is a tiny xorshift32.
+#[derive(Clone, Copy)]
+pub struct SnakeState {
+    segments: [(u8, u8); SNAKE_MAX_LEN],
+    len: u16,
+    dir: SnakeDir,
+    /// Direction the user requested but that hasn't been applied yet
+    /// (debounces multi-keypresses inside one tick).
+    next_dir: SnakeDir,
+    food: (u8, u8),
+    pub score: u16,
+    pub game_over: bool,
+    /// Tick counter — the game advances every `STEP_TICKS` frames so
+    /// the snake doesn't fly off the board at 10 Hz.
+    counter: u16,
+    rng: u32,
+}
+
+impl SnakeState {
+    /// How many animation frames between snake moves (4 → ~2.5 cells/sec
+    /// at the 10 Hz recompose rate; brisk but playable).
+    const STEP_TICKS: u16 = 4;
+
+    pub const fn new() -> Self {
+        // Start with a 3-segment snake at row 7, columns 3-5, heading east.
+        let mut segments = [(0u8, 0u8); SNAKE_MAX_LEN];
+        segments[0] = (5, 7);
+        segments[1] = (4, 7);
+        segments[2] = (3, 7);
+        SnakeState {
+            segments,
+            len: 3,
+            dir: SnakeDir::East,
+            next_dir: SnakeDir::East,
+            food: (12, 7),
+            score: 0,
+            game_over: false,
+            counter: 0,
+            rng: 0xC0FF_EE13,
+        }
+    }
+
+    fn xorshift(&mut self) -> u32 {
+        let mut x = self.rng;
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        self.rng = x.max(1);
+        self.rng
+    }
+
+    fn spawn_food(&mut self) {
+        // Up to a few tries to land on an empty cell — capped so a
+        // nearly-full board can't loop forever.
+        for _ in 0..32 {
+            let r = self.xorshift();
+            let fx = (r % SNAKE_COLS as u32) as u8;
+            let fy = ((r / SNAKE_COLS as u32) % SNAKE_ROWS as u32) as u8;
+            if !self.cell_occupied(fx, fy) {
+                self.food = (fx, fy);
+                return;
+            }
+        }
+        // Board full — game is essentially won.
+        self.game_over = true;
+    }
+
+    fn cell_occupied(&self, x: u8, y: u8) -> bool {
+        self.segments[..self.len as usize].iter().any(|&(sx, sy)| sx == x && sy == y)
+    }
+
+    /// Handle a key press.  Arrow keys steer (with no-reverse rule),
+    /// space/r restart after game-over. Returns `true` when something
+    /// observable changed.
+    pub fn press(&mut self, key: u8) -> bool {
+        if self.game_over {
+            if matches!(key, b' ' | b'r' | b'R') {
+                *self = SnakeState::new();
+                return true;
+            }
+            return false;
+        }
+        let want = match key {
+            // Arrow keys arrive as ANSI escape sequences — but for our
+            // virtio-input driver we map them to single bytes:
+            // 'w'/'a'/'s'/'d' or arrow keycodes (handled in irq.rs).
+            b'w' | b'W' | b'i' => Some(SnakeDir::North),
+            b'd' | b'D' | b'l' => Some(SnakeDir::East),
+            b's' | b'S' | b'k' => Some(SnakeDir::South),
+            b'a' | b'A' | b'j' => Some(SnakeDir::West),
+            // Bytes injected by the irq layer for the cursor keys
+            // (avoiding ANSI escape sequence parsing inside the GUI).
+            0xC1 => Some(SnakeDir::North),
+            0xC2 => Some(SnakeDir::South),
+            0xC3 => Some(SnakeDir::East),
+            0xC4 => Some(SnakeDir::West),
+            _ => None,
+        };
+        if let Some(d) = want {
+            // No 180° reversal — that would eat the neck instantly.
+            let opposite = matches!(
+                (self.dir, d),
+                (SnakeDir::North, SnakeDir::South) | (SnakeDir::South, SnakeDir::North)
+              | (SnakeDir::East,  SnakeDir::West)  | (SnakeDir::West,  SnakeDir::East),
+            );
+            if !opposite { self.next_dir = d; }
+            return true;
+        }
+        false
+    }
+
+    /// Advance the game one animation frame.  Returns `true` if the
+    /// state changed visibly (caller should recompose).
+    pub fn tick(&mut self) -> bool {
+        if self.game_over { return false; }
+        self.counter += 1;
+        if self.counter < Self::STEP_TICKS { return false; }
+        self.counter = 0;
+
+        self.dir = self.next_dir;
+        let head = self.segments[0];
+        let (dx, dy): (i16, i16) = match self.dir {
+            SnakeDir::North => (0, -1),
+            SnakeDir::South => (0,  1),
+            SnakeDir::East  => (1,  0),
+            SnakeDir::West  => (-1, 0),
+        };
+        let nx = head.0 as i16 + dx;
+        let ny = head.1 as i16 + dy;
+        // Wall collision.
+        if nx < 0 || ny < 0
+            || nx >= SNAKE_COLS as i16
+            || ny >= SNAKE_ROWS as i16
+        {
+            self.game_over = true;
+            return true;
+        }
+        let new_head = (nx as u8, ny as u8);
+        let eat = new_head == self.food;
+        // Self collision (excluding the very last segment, which will move out).
+        let occupied_len = if eat { self.len as usize } else { (self.len as usize).saturating_sub(1) };
+        for i in 0..occupied_len {
+            if self.segments[i] == new_head {
+                self.game_over = true;
+                return true;
+            }
+        }
+        // Shift segments back, head first.
+        let new_len = if eat { (self.len + 1).min(SNAKE_MAX_LEN as u16) } else { self.len };
+        for i in (1..new_len as usize).rev() {
+            self.segments[i] = self.segments[i - 1];
+        }
+        self.segments[0] = new_head;
+        self.len = new_len;
+        if eat {
+            self.score += 10;
+            self.spawn_food();
+        }
+        true
+    }
+
+    fn draw(&self, screen: &mut Surface, rect: &Rect) {
+        // Board background — slightly inset from the window content.
+        let board_w = SNAKE_COLS as i32 * SNAKE_CELL_PX;
+        let board_h = SNAKE_ROWS as i32 * SNAKE_CELL_PX;
+        let bx = rect.x + (rect.w - board_w) / 2;
+        let by = rect.y + 24; // leave room for score above
+        let board = Rect::new(bx, by, board_w, board_h);
+        screen.fill_rect(&board, color::BLACK);
+        screen.rect_outline(&board, color::WINDOW_FRAME);
+
+        // Faint grid so the cells are visible even without the snake.
+        for c in 1..SNAKE_COLS as i32 {
+            screen.vline(bx + c * SNAKE_CELL_PX, by, board_h, color::DARK_GRAY);
+        }
+        for r in 1..SNAKE_ROWS as i32 {
+            screen.hline(bx, by + r * SNAKE_CELL_PX, board_w, color::DARK_GRAY);
+        }
+
+        // Score line above the board.
+        let mut buf = [0u8; 24];
+        let s = format_score(self.score, &mut buf);
+        screen.draw_text(rect.x + 8, rect.y + 4, s, color::WHITE, color::WINDOW_BG);
+
+        // Food.
+        let fx = bx + self.food.0 as i32 * SNAKE_CELL_PX;
+        let fy = by + self.food.1 as i32 * SNAKE_CELL_PX;
+        screen.circle_filled(fx + SNAKE_CELL_PX / 2, fy + SNAKE_CELL_PX / 2,
+            SNAKE_CELL_PX / 2 - 2, color::BRIGHT_RED);
+
+        // Snake.
+        for (i, &(sx, sy)) in self.segments[..self.len as usize].iter().enumerate() {
+            let x = bx + sx as i32 * SNAKE_CELL_PX + 1;
+            let y = by + sy as i32 * SNAKE_CELL_PX + 1;
+            let c = if i == 0 { color::BRIGHT_GREEN } else { color::GREEN };
+            screen.fill_rect(&Rect::new(x, y, SNAKE_CELL_PX - 2, SNAKE_CELL_PX - 2), c);
+        }
+
+        if self.game_over {
+            // Big "GAME OVER" banner across the middle.
+            let banner = Rect::new(bx + board_w / 2 - 80, by + board_h / 2 - 12, 160, 24);
+            screen.fill_rect(&banner, color::BRIGHT_RED);
+            screen.draw_text(banner.x + 16, banner.y + 4, "GAME OVER", color::WHITE, color::BRIGHT_RED);
+            screen.draw_text(rect.x + 8, rect.bottom() - 18,
+                "press space / r to restart",
+                color::LIGHT_GRAY, color::WINDOW_BG);
+        } else {
+            screen.draw_text(rect.x + 8, rect.bottom() - 18,
+                "wasd or arrows to steer",
+                color::LIGHT_GRAY, color::WINDOW_BG);
+        }
+    }
+}
+
+/// Format `score` as `"score: NNNN"` into the given byte buffer.
+fn format_score(score: u16, buf: &mut [u8]) -> &str {
+    let prefix = b"score: ";
+    let pre_len = prefix.len();
+    buf[..pre_len].copy_from_slice(prefix);
+    let mut n = score as u32;
+    let mut tmp = [0u8; 6];
+    let mut idx = tmp.len();
+    if n == 0 { idx -= 1; tmp[idx] = b'0'; }
+    while n > 0 && idx > 0 {
+        idx -= 1;
+        tmp[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let digits = &tmp[idx..];
+    buf[pre_len..pre_len + digits.len()].copy_from_slice(digits);
+    core::str::from_utf8(&buf[..pre_len + digits.len()]).unwrap_or("score:")
+}
+
 /// A simple text pad. Append on printable keys, delete on backspace,
 /// newline on Enter. Wraps to the next line at the window edge.
 #[derive(Clone, Copy)]
@@ -448,6 +701,10 @@ impl Window {
                 // Cheap — WidgetGrid is ~600 B of POD.
                 let grid = calculator_grid(state.display());
                 grid.draw(screen, &content);
+            }
+            WindowKind::Snake(state) => {
+                screen.fill_rect(&content, self.bg);
+                state.draw(screen, &content);
             }
             WindowKind::Notes(state) => {
                 screen.fill_rect(&content, color::BLACK);
@@ -653,8 +910,24 @@ impl WindowManager {
         match &mut win.kind {
             WindowKind::Calc(state)  => state.press(key),
             WindowKind::Notes(state) => state.press(key),
+            WindowKind::Snake(state) => state.press(key),
             _ => false,
         }
+    }
+
+    /// Advance per-frame state in every interactive window (currently just
+    /// the snake game). Returns `true` if any state changed and the
+    /// desktop should be recomposed.
+    pub fn animation_step(&mut self) -> bool {
+        let mut changed = false;
+        for slot in self.windows.iter_mut() {
+            if let Some(w) = slot {
+                if let WindowKind::Snake(state) = &mut w.kind {
+                    if state.tick() { changed = true; }
+                }
+            }
+        }
+        changed
     }
 
     /// Re-paint with both uptime and a free-running animation frame
@@ -1370,6 +1643,74 @@ mod tests {
         // *bottom* of the new z-order. Just assert *something* moved.
         assert!(!wm.get(a).unwrap().focused);
         let _ = b; let _ = c;
+    }
+
+    #[test]
+    fn snake_moves_east_on_tick() {
+        let mut s = SnakeState::new();
+        // Burn STEP_TICKS - 1 frames without movement.
+        for _ in 0..(SnakeState::STEP_TICKS - 1) { assert!(!s.tick()); }
+        let head_before = s.segments[0];
+        assert!(s.tick());
+        let head_after = s.segments[0];
+        assert_eq!(head_after.0, head_before.0 + 1, "should have advanced east");
+        assert_eq!(head_after.1, head_before.1);
+    }
+
+    #[test]
+    fn snake_no_180_reversal() {
+        let mut s = SnakeState::new();
+        // We're going east; pressing west should be rejected (would eat
+        // the neck).
+        s.press(b'a');
+        assert_eq!(s.dir, SnakeDir::East);
+        // North/south are allowed.
+        s.press(b'w');
+        for _ in 0..SnakeState::STEP_TICKS { s.tick(); }
+        assert_eq!(s.dir, SnakeDir::North);
+    }
+
+    #[test]
+    fn snake_dies_on_wall() {
+        let mut s = SnakeState::new();
+        // Force-place the head at the east wall.
+        s.segments[0] = ((SNAKE_COLS - 1) as u8, 7);
+        s.dir = SnakeDir::East;
+        s.next_dir = SnakeDir::East;
+        for _ in 0..SnakeState::STEP_TICKS { s.tick(); }
+        assert!(s.game_over, "should have hit the east wall");
+    }
+
+    #[test]
+    fn snake_grows_on_food() {
+        let mut s = SnakeState::new();
+        let len_before = s.len;
+        // Drop food on the cell right in front of the head.
+        s.food = (s.segments[0].0 + 1, s.segments[0].1);
+        for _ in 0..SnakeState::STEP_TICKS { s.tick(); }
+        assert_eq!(s.len, len_before + 1);
+        assert_eq!(s.score, 10);
+    }
+
+    #[test]
+    fn snake_restart_after_game_over() {
+        let mut s = SnakeState::new();
+        s.game_over = true;
+        assert!(s.press(b' '));
+        assert!(!s.game_over);
+        assert_eq!(s.score, 0);
+    }
+
+    #[test]
+    fn snake_via_window_manager() {
+        let mut wm = WindowManager::new();
+        let id = wm.add(Window::new(Rect::new(0, 0, 400, 400),
+            "snake", WindowKind::Snake(SnakeState::new()))).unwrap();
+        wm.focus(id);
+        // North is allowed from east.
+        assert!(wm.handle_key(b'w'));
+        // Animation step advances state.
+        let _ = wm.animation_step();
     }
 
     #[test]

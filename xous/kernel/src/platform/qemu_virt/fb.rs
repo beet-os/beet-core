@@ -20,7 +20,7 @@ use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 use beetos::gfx::{color, Color, Rect, Surface};
 use beetos::gui::{
-    about_grid, CalcState, NotesState, TextLine, Window, WindowKind, WindowManager,
+    about_grid, CalcState, NotesState, SnakeState, TextLine, Window, WindowKind, WindowManager,
     MAX_TEXT_LINES,
 };
 use beetos::{phys_to_virt, virt_to_phys};
@@ -451,9 +451,19 @@ pub fn populate_demo_desktop() {
         );
         let _ = wm.add(about);
 
-        // Window 4 — gfx demo (top-right).
+        // Window 4 — Snake game (centre-top, the wow-factor demo).
+        // Board is 20x15 cells at 16 px each, so we size the content
+        // to roughly 340x300 to leave room for score + hint lines.
+        let snake = Window::new(
+            Rect::new(490, 60, 360, 320),
+            "Snake",
+            WindowKind::Snake(SnakeState::new()),
+        );
+        let snake_id = wm.add(snake).ok().unwrap_or(beetos::gui::WindowId(0));
+
+        // Window 5 — gfx demo (centre-bottom).
         let demo = Window::new(
-            Rect::new(490, 60, 420, 280),
+            Rect::new(490, 395, 360, 220),
             "gfx demo",
             WindowKind::Demo,
         );
@@ -479,9 +489,10 @@ pub fn populate_demo_desktop() {
         );
         let _ = wm.add(notes);
 
-        // Focus the calc so it gets the accent colour treatment and
-        // receives the first keystrokes from the kernel input router.
-        wm.focus(calc_id);
+        // Focus the snake so the first arrow keystrokes drive the
+        // game — Tab cycles to calc/notes if the user wants those.
+        let _ = calc_id;
+        wm.focus(snake_id);
     });
 
     compose_desktop();
@@ -508,6 +519,9 @@ pub fn tick_recompose_if_due(tick: u64) {
     // 10 Hz: smooth enough for the spinner and bouncing accent, well
     // below the 100 Hz timer so we don't melt the (software!) rasterizer.
     if tick % 10 == 0 {
+        // Advance any interactive content (snake game etc.) BEFORE
+        // composing so the frame we paint is the freshly-stepped one.
+        with_wm(|wm| { wm.animation_step(); });
         compose_desktop();
     }
 }

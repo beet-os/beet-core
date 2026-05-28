@@ -252,6 +252,15 @@ fn keycode_to_ascii(code: u16, shift: bool) -> Option<u8> {
         52 => if shift { b'>'  } else { b'.'  },
         53 => if shift { b'?'  } else { b'/'  },
 
+        // Cursor keys — encoded as four single-byte sentinels that
+        // beetos::gui treats as steering events (Snake game today,
+        // window navigation tomorrow). Avoids parsing ANSI escape
+        // sequences in the input layer.
+        103 => 0xC1, // KEY_UP
+        108 => 0xC2, // KEY_DOWN
+        106 => 0xC3, // KEY_RIGHT
+        105 => 0xC4, // KEY_LEFT
+
         // Numeric keypad — useful for driving the GUI calculator directly
         // without modifier juggling. Codes per Linux evdev (KEY_KP*).
         71 => b'7',
