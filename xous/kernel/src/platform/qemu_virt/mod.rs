@@ -74,7 +74,8 @@ pub fn init(fdt_phys: *const u8) {
 
     // Initialize framebuffer console (requires -device ramfb in QEMU args).
     // Failure is non-fatal — UART remains the primary output.
-    if unsafe { fb::init() } {
+    let fb_ready = unsafe { fb::init() };
+    if fb_ready {
         uart::puts("FB: ramfb initialized (1280x800)\n");
         // Paint the BeetOS boot screen and retroactively mark every phase
         // that already completed before the FB existed. Subsequent phases
@@ -92,6 +93,16 @@ pub fn init(fdt_phys: *const u8) {
     net::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
     net_stack::init();
     input::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
+
+    // Once every driver is up, flip from the boot screen to the demo
+    // desktop. This composes a few overlapping windows so the FB
+    // showcases the full GUI stack (gfx primitives + window manager +
+    // decorations + taskbar) instead of just the boot banner. Disables
+    // the FbConsole as a side effect so subsequent UART-mirrored
+    // diagnostics don't draw on top of the windows.
+    if fb_ready {
+        fb::populate_demo_desktop();
+    }
 }
 
 /// Reboot the system via PSCI SYSTEM_RESET (HVC #0).

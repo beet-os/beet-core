@@ -19,6 +19,7 @@
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 use beetos::gfx::{color, Color, Rect, Surface};
+use beetos::gui::{TextLine, Window, WindowKind, WindowManager, MAX_TEXT_LINES};
 use beetos::{phys_to_virt, virt_to_phys};
 
 use crate::fb_console::FbConsole;
@@ -98,6 +99,25 @@ static mut RAMFB_CFG:  RamFbCfg       = RamFbCfg { addr: 0, fourcc: 0, flags: 0,
 
 /// Global console instance (initialised once in `init()`).
 static mut FB_CONSOLE: Option<FbConsole> = None;
+
+/// Global window manager.
+///
+/// `WindowManager::new()` is `const`, so we can hold one as a static and
+/// keep the no_alloc invariant.  Access goes through `with_wm` to keep
+/// `unsafe { static mut … }` in one place and to surface the
+/// "single-threaded during boot, needs a lock for SMP" assumption.
+static mut WINDOW_MANAGER: WindowManager = WindowManager::new();
+
+/// Run a closure with mutable access to the global window manager.
+///
+/// # Safety
+///
+/// Currently safe in the single-CPU early-boot / panic / IRQ path. The
+/// day BeetOS goes SMP this needs a real lock — flagged here so a
+/// future audit catches it.
+pub fn with_wm<R>(f: impl FnOnce(&mut WindowManager) -> R) -> R {
+    unsafe { f(&mut *core::ptr::addr_of_mut!(WINDOW_MANAGER)) }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Low-level FW_CFG access
@@ -358,6 +378,84 @@ pub fn mark_phase_complete(phase_idx: usize, label: &str) {
     let tx = x + (box_w - (label.len() as i32 * 8)) / 2;
     let ty = row_y + (box_h - 16) / 2;
     s.draw_text(tx, ty, label, color::WHITE, color::BEET_PURPLE);
+}
+
+/// Populate the global [`WindowManager`] with a demo desktop showcasing
+/// the GUI stack — title bars, decorations, taskbar, a few overlapping
+/// windows with text and a Demo window that exercises every gfx
+/// primitive.  Idempotent: re-calling repopulates the same set so this
+/// can be triggered from a shell command later without leaking.
+pub fn populate_demo_desktop() {
+    // Stop the FbConsole from re-emitting text over the desktop — clamp
+    // its cursor into a small region the windows leave free, or just
+    // halt scrolling. For the demo we drop the existing console entirely
+    // so the screenshot is clean.
+    unsafe {
+        // SAFETY: only the boot/idle paths touch FB_CONSOLE today.
+        let con = &raw mut FB_CONSOLE;
+        *con = None;
+    }
+
+    with_wm(|wm| {
+        // Start fresh so re-runs don't pile up.
+        for i in 0..beetos::gui::MAX_WINDOWS {
+            wm.remove(beetos::gui::WindowId(i as u8));
+        }
+        wm.set_desktop_bg(color::DESKTOP_BG);
+
+        // Window 1 — system info.
+        let mut info_lines = [TextLine::EMPTY; MAX_TEXT_LINES];
+        info_lines[0] = TextLine::new("BeetOS v0.1.0");
+        info_lines[1] = TextLine::new("Platform: QEMU virt (AArch64)");
+        info_lines[2] = TextLine::new("Graphics: beetos::gfx software rasterizer");
+        info_lines[3] = TextLine::new("Window mgr: beetos::gui (no_alloc, MAX=8)");
+        info_lines[4] = TextLine::new("");
+        info_lines[5] = TextLine::new("MMIO addresses: from FDT");
+        info_lines[6] = TextLine::new("UART: PL011 at 0x09000000");
+        info_lines[7] = TextLine::new("GIC:  v3 at 0x08000000");
+        info_lines[8] = TextLine::new("FB:   ramfb 1280x800 XRGB8888");
+        let info = Window::new(
+            Rect::new(40, 80, 480, 240),
+            "System Info",
+            WindowKind::Text { lines: info_lines, count: 9 },
+        );
+        let info_id = wm.add(info).ok().unwrap_or(beetos::gui::WindowId(0));
+        wm.focus(info_id);
+
+        // Window 2 — graphics demo, overlapping with window 1.
+        let demo = Window::new(
+            Rect::new(440, 200, 520, 360),
+            "gfx demo",
+            WindowKind::Demo,
+        );
+        let _demo_id = wm.add(demo);
+
+        // Window 3 — boot log echo.
+        let mut boot_lines = [TextLine::EMPTY; MAX_TEXT_LINES];
+        boot_lines[0] = TextLine::new("[ OK ] platform::init");
+        boot_lines[1] = TextLine::new("[ OK ] FDT parsed (UART/GIC from DTB)");
+        boot_lines[2] = TextLine::new("[ OK ] GIC v3 initialised");
+        boot_lines[3] = TextLine::new("[ OK ] Generic Timer ticking");
+        boot_lines[4] = TextLine::new("[ OK ] ramfb 1280x800 mapped");
+        boot_lines[5] = TextLine::new("[ OK ] MMU enabled, MemoryManager up");
+        boot_lines[6] = TextLine::new("[ OK ] log/procman/fs/shell launched");
+        boot_lines[7] = TextLine::new("[ OK ] First preemption switch");
+        boot_lines[8] = TextLine::new("[INFO] Desktop ready.");
+        let boot = Window::new(
+            Rect::new(120, 380, 420, 200),
+            "boot log",
+            WindowKind::Text { lines: boot_lines, count: 9 },
+        );
+        let _ = wm.add(boot);
+    });
+
+    compose_desktop();
+}
+
+/// Re-render the live [`WindowManager`] onto the framebuffer.
+pub fn compose_desktop() {
+    let mut s = unsafe { surface() };
+    with_wm(|wm| wm.compose(&mut s));
 }
 
 /// Convenience: write a colored status line below the boot banner.
