@@ -94,6 +94,9 @@ pub enum WindowKind {
     /// A live Snake game. Arrow keys steer, space restarts, the
     /// game ticks forward each animation frame.
     Snake(SnakeState),
+    /// Animated Mandelbrot fractal — zooms slowly toward a fixed
+    /// pretty point. Pure CPU, exercises every gfx pixel path.
+    Mandelbrot(MandelState),
 }
 
 /// One line of text inside a `WindowKind::Text` window.
@@ -516,6 +519,121 @@ impl SnakeState {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Mandelbrot — slowly zooms toward an interesting point
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Animated Mandelbrot fractal state.  Renders at the window's
+/// content resolution each frame using a fixed iteration budget;
+/// the center + scale slowly walk toward a pre-chosen pretty
+/// coordinate so successive frames show the zoom evolve.
+#[derive(Clone, Copy)]
+pub struct MandelState {
+    pub center_re: f32,
+    pub center_im: f32,
+    pub scale:     f32, // width of the view in complex-plane units
+    pub frame:     u32,
+    pub max_iter:  u16,
+}
+
+impl MandelState {
+    pub const fn new() -> Self {
+        // Start zoomed all the way out, drifting in.
+        MandelState {
+            center_re: -0.75,
+            center_im:  0.10,
+            scale:      3.0,
+            frame:      0,
+            max_iter:   48,
+        }
+    }
+
+    /// Advance one animation tick — pulls the view slowly toward a
+    /// "Seahorse Valley" coordinate, then resets to a wide view when
+    /// it's tight enough.
+    pub fn tick(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+        // Target: classic Seahorse Valley point.
+        let target_re = -0.743643887037151;
+        let target_im =  0.131825904205330;
+        // Drift center toward target, scale toward something small.
+        self.center_re = self.center_re * 0.985 + (target_re as f32) * 0.015;
+        self.center_im = self.center_im * 0.985 + (target_im as f32) * 0.015;
+        self.scale *= 0.97;
+        // Reset every ~250 frames so the loop never ends.
+        if self.scale < 0.004 {
+            self.scale = 3.0;
+            self.center_re = -0.75;
+            self.center_im =  0.10;
+        }
+    }
+
+    fn draw(&self, screen: &mut Surface, rect: &Rect) {
+        screen.fill_rect(rect, color::BLACK);
+        let w = rect.w as i32;
+        let h = rect.h as i32;
+        if w <= 0 || h <= 0 { return; }
+        // For each pixel: map to complex plane, iterate z = z² + c.
+        // Step by 2 in both axes to keep frame-time tractable in software
+        // — that's a 4x speedup with a slight pixelisation that actually
+        // looks good given the demo size.
+        let scale_x = self.scale / w as f32;
+        let scale_y = self.scale * (h as f32 / w as f32) / h as f32;
+        let max_iter = self.max_iter;
+        let step: i32 = 2;
+        let mut y = 0;
+        while y < h {
+            let im = self.center_im + (y as f32 - h as f32 / 2.0) * scale_y;
+            let mut x = 0;
+            while x < w {
+                let re = self.center_re + (x as f32 - w as f32 / 2.0) * scale_x;
+                let mut zr = 0.0f32;
+                let mut zi = 0.0f32;
+                let mut iter: u16 = 0;
+                while iter < max_iter {
+                    let zr2 = zr * zr;
+                    let zi2 = zi * zi;
+                    if zr2 + zi2 > 4.0 { break; }
+                    zi = 2.0 * zr * zi + im;
+                    zr = zr2 - zi2 + re;
+                    iter += 1;
+                }
+                let color = if iter >= max_iter {
+                    color::BLACK
+                } else {
+                    palette_color(iter, max_iter)
+                };
+                // Draw a 2×2 block to match the step.
+                let bx = rect.x + x;
+                let by = rect.y + y;
+                screen.fill_rect(&Rect::new(bx, by, step, step), color);
+                x += step;
+            }
+            y += step;
+        }
+    }
+}
+
+/// Map an escape count to a smooth-ish palette across the
+/// purple/pink/green band — matches the BeetOS brand colors.
+fn palette_color(iter: u16, max_iter: u16) -> Color {
+    let t = iter as u32 * 255 / max_iter.max(1) as u32;
+    // 6-band rainbow rolled through the beet palette.
+    let phase = (iter as u32 * 6 / max_iter.max(1) as u32).min(5);
+    let local = (t * 6) % 256;
+    let local_u8 = local as u8;
+    let inv = 255u8.wrapping_sub(local_u8);
+    let rgb = match phase {
+        0 => super::gfx::rgb(local_u8, 0, inv),       // purple→pink
+        1 => super::gfx::rgb(inv, local_u8, 0),       // pink→orange
+        2 => super::gfx::rgb(0, inv, local_u8),       // green→cyan
+        3 => super::gfx::rgb(local_u8, inv, 0),
+        4 => super::gfx::rgb(0, local_u8, inv),
+        _ => super::gfx::rgb(inv, 0, local_u8),
+    };
+    rgb
+}
+
 /// Format `score` as `"score: NNNN"` into the given byte buffer.
 fn format_score(score: u16, buf: &mut [u8]) -> &str {
     let prefix = b"score: ";
@@ -704,6 +822,9 @@ impl Window {
             }
             WindowKind::Snake(state) => {
                 screen.fill_rect(&content, self.bg);
+                state.draw(screen, &content);
+            }
+            WindowKind::Mandelbrot(state) => {
                 state.draw(screen, &content);
             }
             WindowKind::Notes(state) => {
@@ -922,8 +1043,15 @@ impl WindowManager {
         let mut changed = false;
         for slot in self.windows.iter_mut() {
             if let Some(w) = slot {
-                if let WindowKind::Snake(state) = &mut w.kind {
-                    if state.tick() { changed = true; }
+                match &mut w.kind {
+                    WindowKind::Snake(state) => {
+                        if state.tick() { changed = true; }
+                    }
+                    WindowKind::Mandelbrot(state) => {
+                        state.tick();
+                        changed = true;
+                    }
+                    _ => {}
                 }
             }
         }

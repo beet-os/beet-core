@@ -20,8 +20,8 @@ use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 use beetos::gfx::{color, Color, Rect, Surface};
 use beetos::gui::{
-    about_grid, CalcState, NotesState, SnakeState, TextLine, Window, WindowKind, WindowManager,
-    MAX_TEXT_LINES,
+    about_grid, CalcState, MandelState, NotesState, SnakeState, TextLine, Window, WindowKind,
+    WindowManager, MAX_TEXT_LINES,
 };
 use beetos::{phys_to_virt, virt_to_phys};
 
@@ -461,13 +461,15 @@ pub fn populate_demo_desktop() {
         );
         let snake_id = wm.add(snake).ok().unwrap_or(beetos::gui::WindowId(0));
 
-        // Window 5 — gfx demo (centre-bottom).
-        let demo = Window::new(
+        // Window 5 — Mandelbrot fractal (centre-bottom). Pure CPU
+        // rasterizer eating its own dogfood — zooms toward Seahorse
+        // Valley once a frame and resets when too tight.
+        let fractal = Window::new(
             Rect::new(490, 395, 360, 220),
-            "gfx demo",
-            WindowKind::Demo,
+            "Mandelbrot",
+            WindowKind::Mandelbrot(MandelState::new()),
         );
-        let _ = wm.add(demo);
+        let _ = wm.add(fractal);
 
         // Window 5 — interactive calculator (right side, top half).
         // Pre-seed the display with "1234" so it looks alive before
