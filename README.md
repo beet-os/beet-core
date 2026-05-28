@@ -22,6 +22,7 @@ BeetOS is a microkernel OS where every driver runs in userspace. The kernel hand
 - **16KB pages** — native granule for Apple Silicon; used everywhere for consistency
 - **W^X enforced** — no page is ever writable and executable simultaneously
 - **no_std + alloc** — kernel, drivers, and apps compile with standard `rustup`, no custom toolchain
+- **Allocation-free GUI stack** — `beetos::gfx` software rasterizer with a wgpu-shaped `Surface` API, `beetos::gui` window manager + widgets + animation, interactive demos (Snake, Game of Life, Calculator, Notes, Mandelbrot). Today CPU-rendered; designed to swap in a real wgpu backend on top of native GPU drivers (Asahi for M1, v3d for RPi5) once M11 lands. See [`docs/gui.md`](docs/gui.md) and [`docs/wgpu-roadmap.md`](docs/wgpu-roadmap.md).
 
 ---
 
@@ -88,6 +89,9 @@ beet-core/
 | `cargo run`         | Run the OS in hosted mode (kernel as a normal process)       |
 | `cargo xtask build` | Cross-compile everything for `aarch64-unknown-none`          |
 | `cargo xtask qemu`  | Build + launch QEMU virt                                     |
+| `cargo xtask qemu-smoke`      | Boot QEMU and verify 9 progress markers (CI)       |
+| `cargo xtask qemu-screenshot` | Capture the framebuffer via QMP screendump → PNG   |
+| `cargo xtask qemu-animation`  | Capture N FB frames over time → animated GIF       |
 | `cargo xtask image` | Build m1n1 + loader + kernel payload (Apple M1)              |
 | `cargo xtask run`   | Push to Apple M1 via m1n1 USB proxy                          |
 
@@ -115,6 +119,8 @@ When you `cargo xtask qemu`, the following processes start:
 | `shell`   | EL0 | Interactive shell with UART I/O                             |
 
 The shell communicates with `fs` and `procman` via Xous blocking IPC. The kernel routes UART IRQ characters to the shell via the console server.
+
+A GUI desktop runs in parallel on the ramfb framebuffer with seven live windows: System Info, boot log, Game of Life, Snake, Mandelbrot fractal, Calculator, and Notes. The window manager (`beetos::gui::WindowManager`) lives kernel-side for now and composes at 10 Hz from the timer IRQ; keyboard input goes through it first (Tab cycles focus, Shift+arrows move the cursor, Ctrl+arrows drag the focused window, Shift+Enter clicks).
 
 ---
 
