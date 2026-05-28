@@ -139,31 +139,35 @@ fn handle_blocking_scalar(sender: xous::MessageSender, scalar: xous::ScalarMessa
     }
 }
 
-fn handle_mutable_borrow(_sender: xous::MessageSender, mem: &xous::MemoryMessage) {
+fn handle_mutable_borrow(sender: xous::MessageSender, mem: &xous::MemoryMessage) {
     // SAFETY: kernel handed us this memory range via the IPC borrow;
     // it's valid for the duration of this dispatch and aliased back
     // to the caller when we return.
     let buf = unsafe {
         core::slice::from_raw_parts_mut(mem.buf.as_mut_ptr(), mem.buf.len())
     };
-    if buf.len() < BUF_DATA_OFFSET {
+    if buf.len() >= BUF_DATA_OFFSET {
+        let (lba, n_blocks) = block::read_header(buf);
+        let status = match mem.id {
+            id if id == BlockOp::ReadBlocks as usize => {
+                handle_read(lba, n_blocks, block::data_mut(buf))
+            }
+            id if id == BlockOp::WriteBlocks as usize => {
+                handle_write(lba, n_blocks, block::data(buf))
+            }
+            _ => BlockResult::Other,
+        };
+        block::write_status(buf, status);
+    } else if !buf.is_empty() {
         // Buffer too small even for the header — best-effort status
         // stamp at offset 0 so the caller spots the problem.
-        if !buf.is_empty() { buf[0] = BlockResult::BadBuffer as u8; }
-        return;
+        buf[0] = BlockResult::BadBuffer as u8;
     }
 
-    let (lba, n_blocks) = block::read_header(buf);
-    let status = match mem.id {
-        id if id == BlockOp::ReadBlocks as usize => {
-            handle_read(lba, n_blocks, block::data_mut(buf))
-        }
-        id if id == BlockOp::WriteBlocks as usize => {
-            handle_write(lba, n_blocks, block::data(buf))
-        }
-        _ => BlockResult::Other,
-    };
-    block::write_status(buf, status);
+    // The kernel build pulls xous-rs with `forget-memory-messages`, which
+    // strips the Envelope Drop that would otherwise return the page. We
+    // must explicitly hand it back, otherwise the sender blocks forever.
+    xous::return_memory_offset_valid(sender, mem.buf, None, None).ok();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

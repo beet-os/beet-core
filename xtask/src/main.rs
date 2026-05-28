@@ -895,6 +895,7 @@ fn qemu_smoke() -> anyhow::Result<()> {
         "PREEMPT: timer switched",
         "[fs] started, disk=",
         "[block] started, disk=",
+        "[shell] block self-test: OK",
         "bsh>",
     ];
 
@@ -930,11 +931,15 @@ fn qemu_smoke() -> anyhow::Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
 
+    // Markers are matched as a *set* — every marker must appear in the
+    // log within the deadline, but the order between two unrelated
+    // services (fs / block / shell self-test) is up to the scheduler
+    // and would otherwise be a flake source.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut next_marker = 0usize;
+    let mut pending: Vec<&str> = markers.to_vec();
     let mut log_pos: u64 = 0;
 
-    while std::time::Instant::now() < deadline && next_marker < markers.len() {
+    while std::time::Instant::now() < deadline && !pending.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let Ok(file) = std::fs::File::open(&serial_log) else { continue };
@@ -947,10 +952,14 @@ fn qemu_smoke() -> anyhow::Result<()> {
         reader.seek(std::io::SeekFrom::Start(log_pos))?;
         for line in reader.lines().flatten() {
             println!("  {line}");
-            while next_marker < markers.len() && line.contains(markers[next_marker]) {
-                println!("    [ok] marker matched: {}", markers[next_marker]);
-                next_marker += 1;
-            }
+            pending.retain(|m| {
+                if line.contains(m) {
+                    println!("    [ok] marker matched: {m}");
+                    false
+                } else {
+                    true
+                }
+            });
         }
         log_pos = metadata.len();
     }
@@ -959,15 +968,15 @@ fn qemu_smoke() -> anyhow::Result<()> {
     let _ = child.wait();
 
     println!();
-    if next_marker == markers.len() {
+    if pending.is_empty() {
         println!("Result: SMOKE TEST PASSED ({} markers seen)", markers.len());
         Ok(())
     } else {
         anyhow::bail!(
-            "Result: SMOKE TEST FAILED — missing marker {}/{}: {:?}",
-            next_marker + 1,
+            "Result: SMOKE TEST FAILED — {} of {} markers missing: {:?}",
+            pending.len(),
             markers.len(),
-            markers[next_marker],
+            pending,
         );
     }
 }

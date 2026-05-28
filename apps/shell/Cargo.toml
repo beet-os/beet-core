@@ -14,6 +14,7 @@ beetos = { path = "../../beetos", features = ["fb"] }
 beetos-api-console = { path = "../../api/console" }
 beetos-api-procman = { path = "../../api/procman" }
 beetos-api-fs = { path = "../../api/fs" }
+beetos-api-block = { path = "../../api/block" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }

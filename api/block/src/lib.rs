@@ -168,7 +168,155 @@ pub fn data(buf: &[u8]) -> &[u8] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tests — pure header round-trip
+// Client helper — `BlockClient` wraps the connect + MutableBorrow dance so
+// every caller doesn't open-code the IPC envelope. Server stays untouched;
+// this is purely a sugar layer over `xous::rsyscall`.
+//
+// Buffer ownership: the caller allocates a `MemoryRange` (via
+// `xous::map_memory`) and lends it via the borrow. We never alloc on the
+// client side — keeps this crate suitable for callers that want a single,
+// reused IPC buffer for the lifetime of the process (the typical pattern
+// in tight no_alloc services).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Total buffer length (in bytes) required to carry `n_blocks` of
+/// 512-byte data plus the IPC header. Use this when sizing the page
+/// you'll lend to the block service.
+pub const fn buf_len_for_blocks(n_blocks: u32) -> usize {
+    BUF_DATA_OFFSET + (n_blocks as usize) * 512
+}
+
+/// Geometry returned by [`BlockClient::info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub block_size: u32,
+    pub capacity_blocks: u64,
+}
+
+/// Anything that can go wrong on the client side of a block call.
+/// `Block(BlockResult)` carries the server-stamped status when the IPC
+/// itself succeeded but the operation didn't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientError {
+    /// `Connect` to `BLOCK_SID` returned `ServerNotFound` — the service
+    /// either isn't spawned yet, or hasn't called `CreateServerWithAddress`.
+    NotConnected,
+    /// The lent buffer is smaller than `buf_len_for_blocks(n_blocks)`.
+    BufferTooSmall,
+    /// `SendMessage` returned an unexpected `Result` variant or a
+    /// kernel error.
+    KernelError,
+    /// IPC round-trip succeeded but the server returned a non-`Ok` status.
+    Block(BlockResult),
+}
+
+/// Strongly-typed client for the BeetOS block service.
+///
+/// Holds a connection ID; cheap to copy. Constructed via
+/// [`BlockClient::connect`] which performs the `SID` → `CID` handshake.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockClient {
+    cid: xous::CID,
+}
+
+impl BlockClient {
+    /// Open a connection to the block service. The block service must
+    /// have already registered its server (PID 6 on QEMU virt does this
+    /// during `_start`); if not, returns [`ClientError::NotConnected`].
+    pub fn connect() -> Result<Self, ClientError> {
+        let sid = xous::SID::from_array(BLOCK_SID);
+        match xous::rsyscall(xous::SysCall::Connect(sid)) {
+            Ok(xous::Result::ConnectionID(cid)) => Ok(Self { cid }),
+            _ => Err(ClientError::NotConnected),
+        }
+    }
+
+    /// Query the device geometry (block size + capacity in blocks).
+    /// Uses `BlockingScalar`/`Scalar2` — no buffer needed.
+    pub fn info(&self) -> Result<DeviceInfo, ClientError> {
+        let msg = xous::Message::BlockingScalar(xous::ScalarMessage {
+            id: BlockOp::GetInfo as usize,
+            arg1: 0, arg2: 0, arg3: 0, arg4: 0,
+        });
+        match xous::rsyscall(xous::SysCall::SendMessage(self.cid, msg)) {
+            Ok(xous::Result::Scalar2(bs, cap)) => Ok(DeviceInfo {
+                block_size: bs as u32,
+                capacity_blocks: cap as u64,
+            }),
+            _ => Err(ClientError::KernelError),
+        }
+    }
+
+    /// Read `n_blocks` blocks starting at `lba` into `buf`. The data
+    /// lands at `BUF_DATA_OFFSET` (use [`data`] to slice it out after).
+    /// `buf` must be at least [`buf_len_for_blocks`]`(n_blocks)`.
+    pub fn read_blocks(
+        &self,
+        lba: u64,
+        n_blocks: u32,
+        buf: xous::MemoryRange,
+    ) -> Result<(), ClientError> {
+        self.borrow_op(BlockOp::ReadBlocks, lba, n_blocks, buf)
+    }
+
+    /// Write `n_blocks` blocks starting at `lba` from `buf`. The caller
+    /// must have filled the data region at `BUF_DATA_OFFSET..` before
+    /// calling. The server's status byte is checked on return.
+    pub fn write_blocks(
+        &self,
+        lba: u64,
+        n_blocks: u32,
+        buf: xous::MemoryRange,
+    ) -> Result<(), ClientError> {
+        self.borrow_op(BlockOp::WriteBlocks, lba, n_blocks, buf)
+    }
+
+    /// Shared `MutableBorrow` path: stamp the header, send the message,
+    /// decode the server-written status byte. Both Read and Write use
+    /// the exact same envelope shape, only the opcode differs.
+    fn borrow_op(
+        &self,
+        op: BlockOp,
+        lba: u64,
+        n_blocks: u32,
+        buf: xous::MemoryRange,
+    ) -> Result<(), ClientError> {
+        let needed = buf_len_for_blocks(n_blocks);
+        if buf.len() < needed { return Err(ClientError::BufferTooSmall); }
+
+        // SAFETY: `buf` is a MemoryRange we own for the duration of the
+        // call (the borrow returns it before SendMessage completes).
+        let slice = unsafe {
+            core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len())
+        };
+        write_header(slice, lba, n_blocks);
+
+        let msg = xous::Message::MutableBorrow(xous::MemoryMessage {
+            id: op as usize,
+            buf,
+            offset: None,
+            valid: None,
+        });
+
+        match xous::rsyscall(xous::SysCall::SendMessage(self.cid, msg)) {
+            Ok(xous::Result::MemoryReturned(_, _)) | Ok(xous::Result::Ok) => {
+                let slice = unsafe {
+                    core::slice::from_raw_parts(buf.as_ptr(), buf.len())
+                };
+                match read_status(slice) {
+                    BlockResult::Ok => Ok(()),
+                    other => Err(ClientError::Block(other)),
+                }
+            }
+            _ => Err(ClientError::KernelError),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests — pure header round-trip (BlockClient itself needs a live xous
+// runtime, so its coverage comes from in-tree consumers like the shell's
+// boot-time self-test).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -218,5 +366,12 @@ mod tests {
         }
         // Unknown byte falls back to Other (forward-compat for new server variants).
         assert_eq!(BlockResult::from_u8(99), BlockResult::Other);
+    }
+
+    #[test]
+    fn buf_len_helper_matches_layout() {
+        assert_eq!(buf_len_for_blocks(0), BUF_DATA_OFFSET);
+        assert_eq!(buf_len_for_blocks(1), BUF_DATA_OFFSET + 512);
+        assert_eq!(buf_len_for_blocks(8), BUF_DATA_OFFSET + 8 * 512);
     }
 }

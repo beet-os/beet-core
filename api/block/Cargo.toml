@@ -6,3 +6,4 @@ license = "MIT OR Apache-2.0"
 description = "BeetOS block-service IPC types"
 
 [dependencies]
+xous = { path = "../../xous/xous-rs" }

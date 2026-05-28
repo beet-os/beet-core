@@ -839,6 +839,91 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
 }
 
 // ============================================================================
+// Boot-time block-service self-test
+// ============================================================================
+//
+// Runs once during shell startup, after the banner is printed but before
+// the prompt. Verifies the kernel → block-service → IPC client datapath
+// by connecting to `BLOCK_SID`, asking for geometry, reading LBA 0, and
+// checking the on-disk tar archive's `ustar` magic at offset 257.
+//
+// This is the first real IPC consumer of `os/block`; once the FS service
+// is migrated off direct disk-mapping (next commit) the same code path
+// will be exercised on every file read instead.
+
+/// Runs the self-test and prints exactly one line summarising the result.
+/// Never panics — IPC failure just emits a "FAILED" line and continues
+/// the shell's normal boot.
+fn block_selftest() {
+    use beetos_api_block::{BlockClient, ClientError};
+
+    // The block service is PID 6, spawned right after the shell — its
+    // `CreateServerWithAddress` may not have run yet when we get here.
+    // Retry a few times with a yield in between so the scheduler can
+    // run it. 32 × yield is plenty in practice (block has nothing to do
+    // before its server registration).
+    let mut client = None;
+    for _ in 0..32 {
+        if let Ok(c) = BlockClient::connect() {
+            client = Some(c);
+            break;
+        }
+        xous::yield_slice();
+    }
+    let Some(client) = client else {
+        puts("[shell] block self-test: connect FAILED\n");
+        return;
+    };
+
+    let info = match client.info() {
+        Ok(i) => i,
+        Err(_) => { puts("[shell] block self-test: info FAILED\n"); return; }
+    };
+
+    // A page is plenty for the one-block read (header + 512 bytes).
+    let page_size = match xous::MemorySize::new(beetos::PAGE_SIZE) {
+        Some(s) => s,
+        None => { puts("[shell] block self-test: bad page size\n"); return; }
+    };
+    let buf = match xous::rsyscall(xous::SysCall::MapMemory(
+        None, None, page_size, xous::MemoryFlags::W,
+    )) {
+        Ok(xous::Result::MemoryRange(r)) => r,
+        _ => { puts("[shell] block self-test: alloc FAILED\n"); return; }
+    };
+
+    let result = client.read_blocks(0, 1, buf);
+
+    let slice = unsafe { core::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+    let data = beetos_api_block::data(slice);
+
+    match result {
+        Ok(()) => {
+            // Standard POSIX ustar header: magic at bytes 257..262.
+            if data.len() >= 263 && &data[257..262] == b"ustar" {
+                let _ = write!(
+                    DualWriter,
+                    "[shell] block self-test: OK ({} B blocks, {} total, ustar @ 257)\n",
+                    info.block_size, info.capacity_blocks,
+                );
+            } else {
+                puts("[shell] block self-test: read OK but no ustar magic\n");
+            }
+        }
+        Err(ClientError::Block(status)) => {
+            let _ = write!(
+                DualWriter,
+                "[shell] block self-test: read FAILED (status={:?})\n",
+                status,
+            );
+        }
+        Err(_) => puts("[shell] block self-test: read FAILED\n"),
+    }
+
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -872,6 +957,7 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
     puts("\n");
     puts("BeetOS v0.1.0 — Type 'help' for commands.\n");
     puts("Shell running as userspace process (EL0)\n");
+    block_selftest();
     puts("\n");
     prompt();
     let (row, col) = fb_cursor();

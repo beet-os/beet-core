@@ -55,6 +55,9 @@ dependencies = [
 [[package]]
 name = "beetos-api-block"
 version = "0.1.0"
+dependencies = [
+ "xous",
+]
 
 [[package]]
 name = "beetos-api-console"
