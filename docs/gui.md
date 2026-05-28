@@ -71,6 +71,34 @@ this same `Surface` API with `wgpu` so the widget layer doesn't need
 to change. Today the rasterizer is pure CPU and Rust; same call
 sites, eventually different backend.
 
+For apps that want the **exact wgpu API shape today**, there's a
+parallel `beetos::wgpu_compat` module that mirrors wgpu's public
+surface (`Instance`, `Surface`, `Device`, `Queue`, `CommandEncoder`,
+`RenderPass`, `CommandBuffer`, `Color`). It's backed by `gfx` today,
+but the call sites read identically to a real wgpu renderer:
+
+```rust
+let instance = wgpu_compat::Instance::new();
+let mut surface = unsafe {
+    instance.create_surface_raw(fb_ptr, 1280, 800, 1280)
+};
+let device = instance.request_device();
+let queue  = device.queue();
+let mut frame = surface.get_current_texture();
+let view  = frame.texture_view();
+let mut encoder = device.create_command_encoder(view);
+{
+    let mut rpass = encoder.begin_render_pass(Some(Color::BLACK));
+    rpass.fill_rect(&rect, Color::from_rgb(0x6E, 0x29, 0x80));
+}
+queue.submit([encoder.finish()]);
+frame.present();
+```
+
+The kernel's `draw_boot_screen` is the first production caller. See
+[`wgpu-roadmap.md`](wgpu-roadmap.md) for the M7→M11 trajectory
+through to a real `wgpu-hal` backend on Asahi / v3d / virtio-gpu.
+
 ## beetos::gui — window manager + widgets
 
 ### Window + WindowManager

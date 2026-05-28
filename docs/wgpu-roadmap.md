@@ -31,12 +31,25 @@ For BeetOS the value is two-fold:
 
 ## Today (M0 → M6 — what's already in the tree)
 
-The `beetos::gfx` module exposes a [`Surface`] that mirrors wgpu's
-`Surface` at the conceptual level: a writable pixel buffer with
-width, height, stride, and a small library of draw operations
-(rect/line/circle/blit/text). Every widget in `beetos::gui` calls
-into `Surface` only. There is no direct framebuffer pointer in widget
-code, on purpose.
+Two layers, stacked:
+
+- `beetos::gfx` — software 2D rasterizer with a `Surface` type that
+  mirrors wgpu's `Surface` conceptually (writable pixel buffer with
+  width/height/stride, plus draw primitives). Every widget in
+  `beetos::gui` calls into `Surface` only. There is no direct
+  framebuffer pointer in widget code, on purpose.
+- `beetos::wgpu_compat` — a no_std shim that exposes a tiny subset of
+  wgpu's API (`Instance`, `Surface`, `SurfaceTexture`, `TextureView`,
+  `Device`, `Queue`, `CommandEncoder`, `RenderPass`, `CommandBuffer`,
+  `Color`) backed by `gfx`. **Apps can write rendering code that looks
+  identical to a real wgpu renderer today.** The boot screen in
+  `qemu_virt::fb::draw_boot_screen` is the first production caller —
+  it follows the exact `Instance → create_surface → encoder →
+  begin_render_pass → fill_rect/draw_text → submit → present` shape
+  a real wgpu app uses.
+
+Migration when real wgpu lands is `use beetos::wgpu_compat` →
+`use wgpu`. Same call sites. The widget framework doesn't even know.
 
 ```rust
 //   today                         post-M11
