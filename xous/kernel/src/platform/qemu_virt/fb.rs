@@ -19,7 +19,9 @@
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 use beetos::gfx::{color, Color, Rect, Surface};
-use beetos::gui::{TextLine, Window, WindowKind, WindowManager, MAX_TEXT_LINES};
+use beetos::gui::{
+    about_grid, calculator_grid, TextLine, Window, WindowKind, WindowManager, MAX_TEXT_LINES,
+};
 use beetos::{phys_to_virt, virt_to_phys};
 
 use crate::fb_console::FbConsole;
@@ -403,34 +405,26 @@ pub fn populate_demo_desktop() {
         }
         wm.set_desktop_bg(color::DESKTOP_BG);
 
-        // Window 1 — system info.
+        // Window 1 — system info (top-left).
         let mut info_lines = [TextLine::EMPTY; MAX_TEXT_LINES];
         info_lines[0] = TextLine::new("BeetOS v0.1.0");
         info_lines[1] = TextLine::new("Platform: QEMU virt (AArch64)");
-        info_lines[2] = TextLine::new("Graphics: beetos::gfx software rasterizer");
-        info_lines[3] = TextLine::new("Window mgr: beetos::gui (no_alloc, MAX=8)");
-        info_lines[4] = TextLine::new("");
-        info_lines[5] = TextLine::new("MMIO addresses: from FDT");
-        info_lines[6] = TextLine::new("UART: PL011 at 0x09000000");
-        info_lines[7] = TextLine::new("GIC:  v3 at 0x08000000");
-        info_lines[8] = TextLine::new("FB:   ramfb 1280x800 XRGB8888");
+        info_lines[2] = TextLine::new("Kernel: Xous (cherry-picked KeyOS)");
+        info_lines[3] = TextLine::new("Graphics: beetos::gfx software raster");
+        info_lines[4] = TextLine::new("Windows: beetos::gui no_alloc MAX=8");
+        info_lines[5] = TextLine::new("");
+        info_lines[6] = TextLine::new("MMIO addresses: from FDT");
+        info_lines[7] = TextLine::new("UART: PL011 at 0x09000000");
+        info_lines[8] = TextLine::new("GIC:  v3 at 0x08000000");
+        info_lines[9] = TextLine::new("FB:   ramfb 1280x800 XRGB8888");
         let info = Window::new(
-            Rect::new(40, 80, 480, 240),
+            Rect::new(40, 60, 420, 240),
             "System Info",
-            WindowKind::Text { lines: info_lines, count: 9 },
+            WindowKind::Text { lines: info_lines, count: 10 },
         );
-        let info_id = wm.add(info).ok().unwrap_or(beetos::gui::WindowId(0));
-        wm.focus(info_id);
+        let _ = wm.add(info);
 
-        // Window 2 — graphics demo, overlapping with window 1.
-        let demo = Window::new(
-            Rect::new(440, 200, 520, 360),
-            "gfx demo",
-            WindowKind::Demo,
-        );
-        let _demo_id = wm.add(demo);
-
-        // Window 3 — boot log echo.
+        // Window 2 — boot log (mid-left).
         let mut boot_lines = [TextLine::EMPTY; MAX_TEXT_LINES];
         boot_lines[0] = TextLine::new("[ OK ] platform::init");
         boot_lines[1] = TextLine::new("[ OK ] FDT parsed (UART/GIC from DTB)");
@@ -442,11 +436,38 @@ pub fn populate_demo_desktop() {
         boot_lines[7] = TextLine::new("[ OK ] First preemption switch");
         boot_lines[8] = TextLine::new("[INFO] Desktop ready.");
         let boot = Window::new(
-            Rect::new(120, 380, 420, 200),
+            Rect::new(40, 320, 420, 200),
             "boot log",
             WindowKind::Text { lines: boot_lines, count: 9 },
         );
         let _ = wm.add(boot);
+
+        // Window 3 — about dialog (bottom-left, partly overlapping boot log).
+        let about = Window::new(
+            Rect::new(120, 540, 340, 180),
+            "About BeetOS",
+            WindowKind::Widgets(about_grid()),
+        );
+        let _ = wm.add(about);
+
+        // Window 4 — gfx demo (top-right).
+        let demo = Window::new(
+            Rect::new(490, 60, 420, 280),
+            "gfx demo",
+            WindowKind::Demo,
+        );
+        let _ = wm.add(demo);
+
+        // Window 5 — calculator (right side).
+        let calc = Window::new(
+            Rect::new(940, 60, 290, 510),
+            "Calculator",
+            WindowKind::Widgets(calculator_grid("1234.56")),
+        );
+        let calc_id = wm.add(calc).ok().unwrap_or(beetos::gui::WindowId(0));
+        // Focus the calc so it gets the accent colour treatment — most
+        // eye-catching widget on the screenshot.
+        wm.focus(calc_id);
     });
 
     compose_desktop();

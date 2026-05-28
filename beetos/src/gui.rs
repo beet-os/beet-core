@@ -79,6 +79,10 @@ pub enum WindowKind {
     /// circle, lines, text).  Mostly for the M12 demo screen and to
     /// keep the rasterizer covered in screenshots.
     Demo,
+    /// A widget tree — currently a single grid container, which is enough
+    /// for the calculator demo. Once input wiring lands the grid will be
+    /// driven by KeyDown / Click events; for now it renders statically.
+    Widgets(WidgetGrid),
 }
 
 /// One line of text inside a `WindowKind::Text` window.
@@ -217,6 +221,9 @@ impl Window {
             }
             WindowKind::Demo => {
                 draw_demo(screen, &content, self.bg);
+            }
+            WindowKind::Widgets(grid) => {
+                grid.draw(screen, &content);
             }
         }
     }
@@ -404,8 +411,301 @@ impl Default for WindowManager {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Widgets — fixed-depth tree (Container → LeafWidget), no_alloc.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum widgets inside one container.  A 4x4 calculator (16 cells)
+/// fits exactly; anything larger should split across multiple windows.
+pub const MAX_WIDGETS: usize = 24;
+
+/// State of a button — toggled by the eventual mouse/keyboard wiring
+/// (Phase 5).  Today we just render the default; ButtonState::Pressed
+/// gives a darker shade so the API is already there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ButtonState {
+    Normal,
+    Pressed,
+    Disabled,
+}
+
+/// A label widget — fixed text, foreground, background.
+#[derive(Clone, Copy)]
+pub struct LabelW {
+    pub text: TextLine,
+    pub fg: Color,
+    pub bg: Color,
+    /// Horizontal alignment inside the cell. 0 = left, 1 = centre, 2 = right.
+    pub align: u8,
+}
+
+impl LabelW {
+    pub fn new(text: &str) -> Self {
+        LabelW { text: TextLine::new(text), fg: color::WHITE, bg: color::WINDOW_BG, align: 1 }
+    }
+
+    pub fn with_colors(mut self, fg: Color, bg: Color) -> Self { self.fg = fg; self.bg = bg; self }
+    pub fn align_left(mut self)  -> Self { self.align = 0; self }
+    pub fn align_right(mut self) -> Self { self.align = 2; self }
+
+    fn draw(&self, screen: &mut Surface, rect: &Rect) {
+        screen.fill_rect(rect, self.bg);
+        let text_w = self.text.as_str().len() as i32 * font::CHAR_W as i32;
+        let tx = match self.align {
+            0 => rect.x + 4,
+            1 => rect.x + (rect.w - text_w) / 2,
+            _ => rect.right() - text_w - 4,
+        };
+        let ty = rect.y + (rect.h - font::CHAR_H as i32) / 2;
+        screen.draw_text(tx, ty, self.text.as_str(), self.fg, self.bg);
+    }
+}
+
+/// A click-able button — currently keyboard/mouse wiring lives in
+/// Phase 5; today the widget just renders. The `id` field lets the
+/// app distinguish which button was hit when events finally land.
+#[derive(Clone, Copy)]
+pub struct ButtonW {
+    pub label: TextLine,
+    pub state: ButtonState,
+    pub bg: Color,
+    pub fg: Color,
+    pub id: u16,
+}
+
+impl ButtonW {
+    pub fn new(label: &str, id: u16) -> Self {
+        ButtonW {
+            label: TextLine::new(label),
+            state: ButtonState::Normal,
+            bg: color::WINDOW_FRAME,
+            fg: color::WHITE,
+            id,
+        }
+    }
+
+    pub fn accent(mut self) -> Self { self.bg = color::BEET_PURPLE; self }
+    pub fn warning(mut self) -> Self { self.bg = color::BRIGHT_RED; self }
+
+    fn draw(&self, screen: &mut Surface, rect: &Rect) {
+        let (bg, border) = match self.state {
+            ButtonState::Normal   => (self.bg,                 color::TITLE_FG),
+            ButtonState::Pressed  => (darken(self.bg),         color::WHITE),
+            ButtonState::Disabled => (color::DARK_GRAY,        color::LIGHT_GRAY),
+        };
+        screen.fill_rect(rect, bg);
+        screen.rect_outline(rect, border);
+        let text_w = self.label.as_str().len() as i32 * font::CHAR_W as i32;
+        let tx = rect.x + (rect.w - text_w) / 2;
+        let ty = rect.y + (rect.h - font::CHAR_H as i32) / 2;
+        screen.draw_text(tx, ty, self.label.as_str(), self.fg, bg);
+    }
+}
+
+/// Multiply RGB channels by 75 % — used for pressed button shading.
+fn darken(c: Color) -> Color {
+    let r = ((c >> 16) & 0xFF) * 3 / 4;
+    let g = ((c >>  8) & 0xFF) * 3 / 4;
+    let b = ( c        & 0xFF) * 3 / 4;
+    (r << 16) | (g << 8) | b
+}
+
+/// A single leaf in a [`WidgetGrid`].
+#[derive(Clone, Copy)]
+pub enum LeafWidget {
+    Label(LabelW),
+    Button(ButtonW),
+    Spacer,
+}
+
+impl LeafWidget {
+    fn draw(&self, screen: &mut Surface, rect: &Rect) {
+        match self {
+            LeafWidget::Label(l)  => l.draw(screen, rect),
+            LeafWidget::Button(b) => b.draw(screen, rect),
+            LeafWidget::Spacer    => {}
+        }
+    }
+}
+
+/// A grid layout of leaf widgets.
+///
+/// Cells are placed left-to-right, top-to-bottom — like CSS grid with
+/// `grid-auto-flow: row`. `row_span` / `col_span` aren't supported
+/// yet (a Label spans `span_cols` columns instead, which is enough
+/// for the calculator display).
+#[derive(Clone, Copy)]
+pub struct WidgetGrid {
+    pub cells: [LeafWidget; MAX_WIDGETS],
+    pub spans: [u8;          MAX_WIDGETS], // column span per cell (≥1)
+    pub count: u8,
+    pub cols:  u8,
+    pub gap:   i32,
+    pub padding: i32,
+}
+
+impl WidgetGrid {
+    pub const fn new(cols: u8) -> Self {
+        WidgetGrid {
+            cells: [LeafWidget::Spacer; MAX_WIDGETS],
+            spans: [1; MAX_WIDGETS],
+            count: 0,
+            cols,
+            gap: 6,
+            padding: 8,
+        }
+    }
+
+    /// Append a widget that occupies one column.
+    pub fn push(&mut self, widget: LeafWidget) -> &mut Self {
+        if (self.count as usize) < MAX_WIDGETS {
+            self.cells[self.count as usize] = widget;
+            self.spans[self.count as usize] = 1;
+            self.count += 1;
+        }
+        self
+    }
+
+    /// Append a widget that spans `span` columns (clamped to `cols`).
+    pub fn push_span(&mut self, widget: LeafWidget, span: u8) -> &mut Self {
+        if (self.count as usize) < MAX_WIDGETS {
+            self.cells[self.count as usize] = widget;
+            self.spans[self.count as usize] = span.max(1).min(self.cols);
+            self.count += 1;
+        }
+        self
+    }
+
+    /// Compute layout + draw every cell inside `rect`.
+    fn draw(&self, screen: &mut Surface, rect: &Rect) {
+        if self.count == 0 || self.cols == 0 { return; }
+        let cols = self.cols as i32;
+        // Sum spans to figure out per-row geometry.  We greedy-pack
+        // each row until the running span tally reaches `cols`, then
+        // start a new row.
+        let inner_w = rect.w - 2 * self.padding;
+        let inner_h = rect.h - 2 * self.padding;
+        // Rows are computed from the same packing the draw loop uses.
+        let row_count = self.row_count() as i32;
+        if row_count == 0 { return; }
+        let cell_w  = (inner_w - (cols - 1) * self.gap) / cols;
+        let cell_h  = (inner_h - (row_count - 1) * self.gap) / row_count;
+
+        let mut col_cursor: i32 = 0;
+        let mut row_cursor: i32 = 0;
+        for i in 0..(self.count as usize) {
+            let span = self.spans[i] as i32;
+            if col_cursor + span > cols {
+                col_cursor = 0;
+                row_cursor += 1;
+            }
+            let x = rect.x + self.padding + col_cursor * (cell_w + self.gap);
+            let y = rect.y + self.padding + row_cursor * (cell_h + self.gap);
+            let w = cell_w * span + self.gap * (span - 1);
+            let cell_rect = Rect::new(x, y, w, cell_h);
+            self.cells[i].draw(screen, &cell_rect);
+            col_cursor += span;
+            if col_cursor >= cols { col_cursor = 0; row_cursor += 1; }
+        }
+    }
+
+    /// How many rows the current cells would occupy with greedy
+    /// row-major packing.
+    fn row_count(&self) -> usize {
+        let cols = self.cols as i32;
+        let mut col_cursor: i32 = 0;
+        let mut rows: i32 = if self.count > 0 { 1 } else { 0 };
+        for i in 0..(self.count as usize) {
+            let span = self.spans[i] as i32;
+            if col_cursor + span > cols {
+                rows += 1;
+                col_cursor = 0;
+            }
+            col_cursor += span;
+            if col_cursor >= cols { col_cursor = 0; if i + 1 < self.count as usize { rows += 1; } }
+        }
+        rows as usize
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Demo content
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sample widget trees — these are templates apps will reuse once the
+// shell can spawn GUI processes (Phase 7 demo apps).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the calculator widget grid: a wide display label at the top,
+/// then a 4×5 keypad — clear / sign / percent / divide, 7/8/9/×,
+/// 4/5/6/-, 1/2/3/+, ±/0/./=.  Each button has an id that maps to
+/// `CalcKey` once we wire input.
+pub fn calculator_grid(display: &str) -> WidgetGrid {
+    let mut g = WidgetGrid::new(4);
+    g.padding = 10;
+    g.gap = 6;
+
+    // Row 0 — display, spanning all 4 columns.
+    let display_label = LabelW::new(display)
+        .with_colors(color::BRIGHT_GREEN, color::BLACK)
+        .align_right();
+    g.push_span(LeafWidget::Label(display_label), 4);
+
+    // Row 1 — clear, sign, percent, divide.
+    g.push(LeafWidget::Button(ButtonW::new("AC", 1).warning()));
+    g.push(LeafWidget::Button(ButtonW::new("+/-", 2)));
+    g.push(LeafWidget::Button(ButtonW::new("%", 3)));
+    g.push(LeafWidget::Button(ButtonW::new("/", 4).accent()));
+
+    // Row 2 — 7 8 9 ×
+    g.push(LeafWidget::Button(ButtonW::new("7", 7)));
+    g.push(LeafWidget::Button(ButtonW::new("8", 8)));
+    g.push(LeafWidget::Button(ButtonW::new("9", 9)));
+    g.push(LeafWidget::Button(ButtonW::new("x", 10).accent()));
+
+    // Row 3 — 4 5 6 -
+    g.push(LeafWidget::Button(ButtonW::new("4", 13)));
+    g.push(LeafWidget::Button(ButtonW::new("5", 14)));
+    g.push(LeafWidget::Button(ButtonW::new("6", 15)));
+    g.push(LeafWidget::Button(ButtonW::new("-", 16).accent()));
+
+    // Row 4 — 1 2 3 +
+    g.push(LeafWidget::Button(ButtonW::new("1", 19)));
+    g.push(LeafWidget::Button(ButtonW::new("2", 20)));
+    g.push(LeafWidget::Button(ButtonW::new("3", 21)));
+    g.push(LeafWidget::Button(ButtonW::new("+", 22).accent()));
+
+    // Row 5 — 0 spanning 2, then ., =.
+    g.push_span(LeafWidget::Button(ButtonW::new("0", 25)), 2);
+    g.push(LeafWidget::Button(ButtonW::new(".", 26)));
+    g.push(LeafWidget::Button(ButtonW::new("=", 27).accent()));
+
+    g
+}
+
+/// Build a small "about BeetOS" widget grid — a couple of labels and
+/// an OK button. Exercises mixed widget types in a single grid.
+pub fn about_grid() -> WidgetGrid {
+    let mut g = WidgetGrid::new(2);
+    g.padding = 12;
+    g.gap = 8;
+    g.push_span(LeafWidget::Label(
+        LabelW::new("BeetOS v0.1.0")
+            .with_colors(color::WHITE, color::WINDOW_BG)
+    ), 2);
+    g.push_span(LeafWidget::Label(
+        LabelW::new("Secure microkernel OS on AArch64")
+            .with_colors(color::LIGHT_GRAY, color::WINDOW_BG)
+    ), 2);
+    g.push_span(LeafWidget::Label(
+        LabelW::new("github.com/beet-os/beet-core")
+            .with_colors(color::BRIGHT_CYAN, color::WINDOW_BG)
+    ), 2);
+    g.push_span(LeafWidget::Spacer, 2);
+    g.push(LeafWidget::Button(ButtonW::new("Close", 99)));
+    g.push(LeafWidget::Button(ButtonW::new("OK", 100).accent()));
+    g
+}
 
 /// Paint a quick showcase inside `content` using every gfx primitive.
 /// Doubles as a visual regression target for [`crate::gfx`].
@@ -556,6 +856,67 @@ mod tests {
         assert_eq!(s.get_pixel(40, 20 + 60 - 1), color::WINDOW_FRAME);
         // Content area pixel (window bg) — well inside the body.
         assert_eq!(s.get_pixel(40, 50), color::WINDOW_BG);
+    }
+
+    #[test]
+    fn widget_grid_packs_rows() {
+        let mut g = WidgetGrid::new(4);
+        g.push(LeafWidget::Spacer);
+        g.push(LeafWidget::Spacer);
+        g.push(LeafWidget::Spacer);
+        g.push(LeafWidget::Spacer);
+        // One row exactly, no overflow.
+        assert_eq!(g.row_count(), 1);
+        g.push(LeafWidget::Spacer);
+        // 5th cell wraps into a second row.
+        assert_eq!(g.row_count(), 2);
+    }
+
+    #[test]
+    fn widget_grid_span_consumes_columns() {
+        let mut g = WidgetGrid::new(4);
+        g.push_span(LeafWidget::Spacer, 4); // a full-row label
+        g.push(LeafWidget::Spacer);         // single cell on next row
+        assert_eq!(g.row_count(), 2);
+    }
+
+    #[test]
+    fn calculator_grid_has_expected_buttons() {
+        let g = calculator_grid("0");
+        // 1 display + 4 fn keys + 4×3 number rows + 3 keys on bottom row
+        // = 1 + 4 + 12 + 3 = 20 cells.
+        assert_eq!(g.count, 20);
+        // First cell is the display Label spanning 4 columns.
+        assert_eq!(g.spans[0], 4);
+        match g.cells[0] {
+            LeafWidget::Label(_) => {}
+            _ => panic!("expected Label as first cell"),
+        }
+        // Last row should end with the "=" button.
+        match g.cells[19] {
+            LeafWidget::Button(b) => assert_eq!(b.label.as_str(), "="),
+            _ => panic!("expected = button as last cell"),
+        }
+    }
+
+    #[test]
+    fn widgets_window_renders_pixels() {
+        let (_buf, mut s) = surface(400, 240);
+        let mut wm = WindowManager::new();
+        let _ = wm.add(Window::new(
+            Rect::new(10, 10, 380, 220),
+            "calc",
+            WindowKind::Widgets(calculator_grid("42")),
+        ));
+        wm.compose(&mut s);
+        // Display label sits near the top of the content area — count
+        // accent-coloured pixels to make sure something was actually drawn.
+        let mut accent = 0;
+        for y in 30..220 { for x in 12..390 {
+            let px = s.get_pixel(x, y);
+            if px == color::BEET_PURPLE || px == color::WINDOW_FRAME { accent += 1; }
+        }}
+        assert!(accent > 200, "expected painted widget pixels, accent={accent}");
     }
 
     #[test]
