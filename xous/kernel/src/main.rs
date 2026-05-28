@@ -37,6 +37,11 @@ mod sdhci;
 /// slot work.
 mod nvme;
 
+/// Generic block-device abstraction shared by every storage backend
+/// (sdhci, nvme, hosted file). The seam the FS service eventually
+/// plugs into to mount real storage instead of the embedded tar.
+mod block;
+
 #[cfg(beetos)]
 mod fb_console;
 
