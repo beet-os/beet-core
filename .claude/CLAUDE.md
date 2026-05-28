@@ -75,10 +75,17 @@ BeetOS has an allocation-free GUI layer living in the `beetos` crate
   (lines/rects/circles/blit/text). API shape is intentionally close
   to wgpu's `Surface`/`Texture` so a future GPU backend (M11) can
   swap in without touching widget code.
+- `beetos::wgpu_compat` — wgpu-shaped shim (`Instance`, `Surface`,
+  `SurfaceTexture`, `TextureView`, `Device`, `Queue`,
+  `CommandEncoder`, `RenderPass`, `CommandBuffer`, `Color`) backed
+  by `gfx`. Apps written against this read identically to a real
+  wgpu app; the kernel boot screen is the first production caller.
 - `beetos::gui` — `WindowManager` (fixed slab, no_alloc),
   `Window` + decorations, `WidgetGrid` with `Label`/`Button`/`Spacer`,
-  stateful `CalcState`/`NotesState`, keyboard routing via
-  `handle_key`, `compose_animated` for timer-driven animation.
+  stateful `CalcState`/`NotesState`/`SnakeState`/`LifeState`/
+  `MandelState`, mouse cursor sprite, keyboard routing via
+  `handle_key` (Tab/Shift+arrow/Ctrl+arrow/Shift+Enter),
+  `compose_animated` for timer-driven animation.
 - Kernel-side seam: `qemu_virt::fb::with_wm`, `compose_desktop`,
   `tick_recompose_if_due` (called from the 100 Hz timer IRQ at ~10 Hz).
   Keyboard events from virtio-input go through the WindowManager
