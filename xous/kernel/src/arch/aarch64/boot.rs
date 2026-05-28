@@ -248,13 +248,27 @@ pub unsafe fn parse_fdt_mmio(fdt_ptr: *const u8) -> MmioAddrs {
     let strings_base = fdt_ptr.add(off_dt_strings);
     let struct_limit = total_size - off_dt_struct;
 
+    // Per-depth accumulator: a node's `reg` property and its matched
+    // `compatible` kind are gathered as we scan its body, then committed
+    // to `result` on FDT_END_NODE.  QEMU virt emits `reg` *before*
+    // `compatible` for both arm,pl011 and arm,gic-v3, so a strictly
+    // in-order parser (the previous one) silently dropped both — leaving
+    // every boot on "address from default (FDT not found)".
+    //
+    // Depth 16 is far more than QEMU virt (or any real DTB) actually
+    // produces; if we ever overflow it we bail safely instead of
+    // recursing.
     #[derive(Clone, Copy, PartialEq)]
     enum Kind { None, Uart, Gic }
+    #[derive(Clone, Copy)]
+    struct NodeState { kind: Kind, reg_ptr: *const u8, reg_len: usize }
+    const MAX_DEPTH: usize = 16;
+    let mut stack: [NodeState; MAX_DEPTH] = [
+        NodeState { kind: Kind::None, reg_ptr: core::ptr::null(), reg_len: 0 }; MAX_DEPTH
+    ];
 
     let mut pos: usize = 0;
     let mut depth: usize = 0;
-    let mut kind = Kind::None;
-    let mut kind_depth: usize = 0;
 
     loop {
         if pos + 4 > struct_limit { break; }
@@ -263,8 +277,10 @@ pub unsafe fn parse_fdt_mmio(fdt_ptr: *const u8) -> MmioAddrs {
 
         match token {
             FDT_BEGIN_NODE => {
+                if depth >= MAX_DEPTH { break; }
+                stack[depth] = NodeState { kind: Kind::None, reg_ptr: core::ptr::null(), reg_len: 0 };
                 depth += 1;
-                // Skip null-terminated node name.
+                // Skip null-terminated node name, padded to 4 bytes.
                 let mut name_len = 0;
                 while pos + name_len < struct_limit && *struct_base.add(pos + name_len) != 0 {
                     name_len += 1;
@@ -273,10 +289,26 @@ pub unsafe fn parse_fdt_mmio(fdt_ptr: *const u8) -> MmioAddrs {
                 pos = (pos + 3) & !3;
             }
             FDT_END_NODE => {
-                if kind != Kind::None && depth == kind_depth {
-                    kind = Kind::None;
+                if depth > 0 {
+                    let node = stack[depth - 1];
+                    match node.kind {
+                        // UART: one reg entry = [addr(2 cells) size(2 cells)] = 16 B
+                        Kind::Uart if !node.reg_ptr.is_null() && node.reg_len >= 16
+                            && result.uart0_phys.is_none() =>
+                        {
+                            result.uart0_phys = Some(be64(node.reg_ptr) as usize);
+                        }
+                        // GIC: two reg entries = [GICD, GICR] = 2 × 16 B = 32 B
+                        Kind::Gic if !node.reg_ptr.is_null() && node.reg_len >= 32
+                            && result.gicd_phys.is_none() =>
+                        {
+                            result.gicd_phys = Some(be64(node.reg_ptr) as usize);
+                            result.gicr_phys = Some(be64(node.reg_ptr.add(16)) as usize);
+                        }
+                        _ => {}
+                    }
+                    depth -= 1;
                 }
-                depth = depth.saturating_sub(1);
             }
             FDT_PROP => {
                 if pos + 8 > struct_limit { break; }
@@ -289,26 +321,17 @@ pub unsafe fn parse_fdt_mmio(fdt_ptr: *const u8) -> MmioAddrs {
                 let prop_name = strings_base.add(nameoff);
                 let prop_data = struct_base.add(pos);
 
-                if cstr_starts_with(prop_name, b"compatible\0") {
-                    if result.uart0_phys.is_none() && compat_has(prop_data, len, b"arm,pl011") {
-                        kind = Kind::Uart;
-                        kind_depth = depth;
-                    } else if result.gicd_phys.is_none() && compat_has(prop_data, len, b"arm,gic-v3") {
-                        kind = Kind::Gic;
-                        kind_depth = depth;
-                    }
-                } else if cstr_starts_with(prop_name, b"reg\0") {
-                    match kind {
-                        // UART: one reg entry = [addr_hi addr_lo size_hi size_lo] (2+2 cells × 4B = 16B)
-                        Kind::Uart if len >= 16 => {
-                            result.uart0_phys = Some(be64(prop_data) as usize);
+                if depth > 0 {
+                    let node = &mut stack[depth - 1];
+                    if cstr_starts_with(prop_name, b"compatible\0") {
+                        if compat_has(prop_data, len, b"arm,pl011") {
+                            node.kind = Kind::Uart;
+                        } else if compat_has(prop_data, len, b"arm,gic-v3") {
+                            node.kind = Kind::Gic;
                         }
-                        // GIC: two reg entries = [GICD addr/size, GICR addr/size] (2×16B = 32B)
-                        Kind::Gic if len >= 32 => {
-                            result.gicd_phys = Some(be64(prop_data) as usize);
-                            result.gicr_phys = Some(be64(prop_data.add(16)) as usize);
-                        }
-                        _ => {}
+                    } else if cstr_starts_with(prop_name, b"reg\0") {
+                        node.reg_ptr = prop_data;
+                        node.reg_len = len;
                     }
                 }
 

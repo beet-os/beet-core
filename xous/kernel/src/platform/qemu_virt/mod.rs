@@ -40,9 +40,8 @@ mod defaults {
 /// All addresses are converted to kernel VA via `phys_to_virt`.
 pub fn init(fdt_phys: *const u8) {
     // Resolve MMIO addresses: prefer FDT, fall back to compiled-in defaults.
-    let mmio = unsafe {
-        crate::arch::boot::parse_fdt_mmio(beetos::phys_to_virt(fdt_phys as usize) as *const u8)
-    };
+    let fdt_va = beetos::phys_to_virt(fdt_phys as usize) as *const u8;
+    let mmio = unsafe { crate::arch::boot::parse_fdt_mmio(fdt_va) };
 
     let uart0_phys = mmio.uart0_phys.unwrap_or(defaults::UART0_PHYS);
     let gicd_phys  = mmio.gicd_phys.unwrap_or(defaults::GICD_PHYS);

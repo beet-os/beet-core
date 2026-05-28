@@ -341,6 +341,32 @@ fn rpi5() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Convert the ELF kernel to a flat binary image alongside it.
+///
+/// QEMU's `-kernel <elf>` jumps straight to the ELF entry point and does
+/// NOT run the Linux-style boot trampoline that puts the FDT physical
+/// address in x0 — so an ELF-booted kernel sees `x0 = 0` and falls back
+/// to compiled-in MMIO defaults instead of parsing the FDT. Booting via
+/// the flat image triggers the Image-format path and gives us x0 = FDT,
+/// matching the contract m1n1 and the RPi5 firmware use on real hardware.
+fn elf_to_image(elf: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let img = elf.with_extension("img");
+    let status = Command::new("llvm-objcopy")
+        .args(["-O", "binary"])
+        .arg(elf)
+        .arg(&img)
+        .status()
+        .or_else(|_| {
+            Command::new("rust-objcopy")
+                .args(["-O", "binary"])
+                .arg(elf)
+                .arg(&img)
+                .status()
+        })?;
+    anyhow::ensure!(status.success(), "objcopy failed");
+    Ok(img)
+}
+
 /// Create a test disk image (tar archive) for virtio-blk testing.
 fn create_test_disk(root: &std::path::Path) -> anyhow::Result<PathBuf> {
     let disk_dir = root.join("target/disk");
@@ -375,13 +401,17 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
     })?;
 
     let root = workspace_root();
-    let kernel = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
 
     anyhow::ensure!(
-        kernel.exists(),
+        kernel_elf.exists(),
         "kernel binary not found at {}",
-        kernel.display()
+        kernel_elf.display()
     );
+
+    // Hand QEMU the flat image so x0 = FDT phys when entering _start
+    // (see elf_to_image for the why).
+    let kernel = elf_to_image(&kernel_elf)?;
 
     // Create test disk image
     let disk_img = create_test_disk(&root)?;
@@ -534,8 +564,9 @@ fn qemu_smoke() -> anyhow::Result<()> {
 
     build(&["--platform".to_string(), "qemu-virt".to_string()])?;
 
-    let kernel = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
-    anyhow::ensure!(kernel.exists(), "kernel binary not found at {}", kernel.display());
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
+    let kernel = elf_to_image(&kernel_elf)?;
 
     let serial_log = root.join("target/qemu-smoke-serial.log");
     let _ = std::fs::remove_file(&serial_log);
@@ -549,6 +580,8 @@ fn qemu_smoke() -> anyhow::Result<()> {
     // banner, which is re-emitted by the shell once it starts).
     let markers: &[&str] = &[
         "Platform: QEMU virt",
+        "UART: address from FDT",
+        "GIC: initialized (address from FDT)",
         "Timer: initialized",
         "MMU: enabled",
         "EL0: loading shell ELF",
@@ -644,8 +677,9 @@ fn test() -> anyhow::Result<()> {
     // Build the kernel with test-mode enabled.
     build_test_kernel(&root)?;
 
-    let kernel = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
-    anyhow::ensure!(kernel.exists(), "kernel binary not found at {}", kernel.display());
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
+    let kernel = elf_to_image(&kernel_elf)?;
 
     let disk_img = create_test_disk(&root)?;
 
