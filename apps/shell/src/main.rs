@@ -857,22 +857,9 @@ fn try_spawn_via_procman(cmd: &str, args: &[&str]) {
 fn block_selftest() {
     use beetos_api_block::{BlockClient, ClientError};
 
-    // The block service is PID 6, spawned right after the shell — its
-    // `CreateServerWithAddress` may not have run yet when we get here.
-    // Retry a few times with a yield in between so the scheduler can
-    // run it. 32 × yield is plenty in practice (block has nothing to do
-    // before its server registration).
-    let mut client = None;
-    for _ in 0..32 {
-        if let Ok(c) = BlockClient::connect() {
-            client = Some(c);
-            break;
-        }
-        xous::yield_slice();
-    }
-    let Some(client) = client else {
-        puts("[shell] block self-test: connect FAILED\n");
-        return;
+    let client = match BlockClient::connect_with_retries(32) {
+        Ok(c) => c,
+        Err(_) => { puts("[shell] block self-test: connect FAILED\n"); return; }
     };
 
     let info = match client.info() {

@@ -89,19 +89,9 @@ fn get_disk_archive() -> Option<tarfs::TarArchive<'static>> {
 fn populate_disk_cache_via_ipc() -> usize {
     use beetos_api_block::BlockClient;
 
-    // Block service is PID 6, spawned right after us. Retry until it
-    // registers — same pattern the shell uses for its self-test.
-    let mut client = None;
-    for _ in 0..32 {
-        if let Ok(c) = BlockClient::connect() {
-            client = Some(c);
-            break;
-        }
-        xous::yield_slice();
-    }
-    let Some(client) = client else {
-        puts("[fs] no block service available\n");
-        return 0;
+    let client = match BlockClient::connect_with_retries(32) {
+        Ok(c) => c,
+        Err(_) => { puts("[fs] no block service available\n"); return 0; }
     };
 
     let info = match client.info() {

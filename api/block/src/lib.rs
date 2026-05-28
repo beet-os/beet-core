@@ -231,6 +231,30 @@ impl BlockClient {
         }
     }
 
+    /// Like [`connect`] but retries up to `max_attempts` times, yielding
+    /// between attempts so a not-yet-registered block service has a
+    /// chance to run its `CreateServerWithAddress`.
+    ///
+    /// Use this from any process that may race the block service at
+    /// startup (today: the fs service on PID 5 → block PID 6, and the
+    /// shell's boot-time self-test). A `max_attempts` of 32 is plenty
+    /// in practice — block has nothing to do before registering.
+    ///
+    /// Returns the last error if every attempt fails.
+    ///
+    /// [`connect`]: Self::connect
+    pub fn connect_with_retries(max_attempts: u32) -> Result<Self, ClientError> {
+        let mut last_err = ClientError::NotConnected;
+        for _ in 0..max_attempts {
+            match Self::connect() {
+                Ok(c) => return Ok(c),
+                Err(e) => last_err = e,
+            }
+            xous::yield_slice();
+        }
+        Err(last_err)
+    }
+
     /// Query the device geometry (block size + capacity in blocks).
     /// Uses `BlockingScalar`/`Scalar2` — no buffer needed.
     pub fn info(&self) -> Result<DeviceInfo, ClientError> {
