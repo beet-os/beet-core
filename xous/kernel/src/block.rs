@@ -293,6 +293,88 @@ fn scratch_buffer(len: usize) -> Scratch {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SDHCI Host → BlockDevice adapter
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wraps an SDHCI [`Host`](crate::sdhci::Host) + the negotiated
+/// [`CardInfo`](crate::sdhci::CardInfo) into a [`BlockDevice`].
+/// Inherits the Host's lifetime over the underlying [`Mmio`](crate::sdhci::Mmio).
+///
+/// Single-block PIO reads / writes today — multi-block requests
+/// are decomposed into a loop of single-block transfers so callers
+/// don't have to know what the controller's current command set
+/// supports. CMD18 / CMD25 batching lands once we have IRQ-driven
+/// completion.
+pub struct SdBlockDevice<'a, M: crate::sdhci::Mmio> {
+    host:       crate::sdhci::Host<'a, M>,
+    block_size: u32,
+    capacity:   u64,
+}
+
+impl<'a, M: crate::sdhci::Mmio> SdBlockDevice<'a, M> {
+    /// Build the adapter from an already-initialised Host + the
+    /// `CardInfo` returned by [`platform::bcm2712::sdhci_brcm::init`].
+    /// (The protocol layer requires the card to be in the Tran state
+    /// before any block I/O is issued — caller's responsibility.)
+    pub fn new(host: crate::sdhci::Host<'a, M>, card: crate::sdhci::CardInfo) -> Self {
+        Self {
+            host,
+            block_size: card.csd.block_len_bytes,
+            capacity:   card.blocks,
+        }
+    }
+}
+
+impl<'a, M: crate::sdhci::Mmio> BlockDevice for SdBlockDevice<'a, M> {
+    fn block_size(&self) -> u32 { self.block_size }
+    fn capacity_blocks(&self) -> u64 { self.capacity }
+
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        if buf.len() as u64 % self.block_size as u64 != 0 { return Err(BlockError::BadBuffer); }
+        let n = (buf.len() / self.block_size as usize) as u64;
+        if lba + n > self.capacity { return Err(BlockError::OutOfRange); }
+        // SDHCI LBA arg is 32-bit; bail on cards we can't address
+        // (would need CMD23 + extended addressing — not yet).
+        if lba + n > u32::MAX as u64 { return Err(BlockError::OutOfRange); }
+
+        let bs = self.block_size as usize;
+        for i in 0..n {
+            let chunk = &mut buf[(i as usize) * bs..(i as usize + 1) * bs];
+            // Host::read_block takes a 32-bit LBA + a 512 B buffer
+            // exactly. Translate the BlockError surface.
+            self.host.read_block((lba + i) as u32, chunk)
+                .map_err(map_sdhci_err)?;
+        }
+        Ok(())
+    }
+
+    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if buf.len() as u64 % self.block_size as u64 != 0 { return Err(BlockError::BadBuffer); }
+        let n = (buf.len() / self.block_size as usize) as u64;
+        if lba + n > self.capacity { return Err(BlockError::OutOfRange); }
+        if lba + n > u32::MAX as u64 { return Err(BlockError::OutOfRange); }
+
+        let bs = self.block_size as usize;
+        for i in 0..n {
+            let chunk = &buf[(i as usize) * bs..(i as usize + 1) * bs];
+            self.host.write_block((lba + i) as u32, chunk)
+                .map_err(map_sdhci_err)?;
+        }
+        Ok(())
+    }
+}
+
+fn map_sdhci_err(e: crate::sdhci::HostError) -> BlockError {
+    use crate::sdhci::HostError as H;
+    match e {
+        H::Timeout | H::CommandTimeout | H::DataTimeout => BlockError::Timeout,
+        H::CommandCrc | H::CommandIndex | H::CommandEndBit
+            | H::DataCrc | H::DataEndBit => BlockError::Io,
+        H::BadResponse => BlockError::Other,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests — exercise the BlockDevice contract on every backend
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -449,6 +531,67 @@ mod tests {
             assert_eq!(back[i], ((i * 13 + 7) & 0xFF) as u8);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── SDHCI adapter — capacity + validation tests ────────────────────
+    //
+    // The SDHCI Host owns a 'a borrow of the Mmio so we can't trivially
+    // reuse the existing in-crate sdhci::tests::MockMmio across module
+    // boundaries. We test the adapter's *validation* surface here
+    // (block size, capacity, misalignment, out-of-range) which doesn't
+    // require simulating a full controller — that side is already
+    // covered by sdhci's own 31 tests of Host::{read,write}_block.
+
+    struct MinimalSdhciMmio;
+    impl crate::sdhci::Mmio for MinimalSdhciMmio {
+        fn read32(&self, _: usize) -> u32 { 0 }
+        fn write32(&self, _: usize, _: u32) {}
+    }
+
+    fn fake_card(block_size: u32, n_blocks: u64) -> crate::sdhci::CardInfo {
+        crate::sdhci::CardInfo {
+            rca: 0,
+            csd: crate::sdhci::Csd {
+                structure_version: 1,
+                capacity_bytes:    block_size as u64 * n_blocks,
+                block_len_bytes:   block_size,
+                read_bl_partial:   false,
+                write_bl_partial:  false,
+            },
+            blocks: n_blocks,
+        }
+    }
+
+    #[test]
+    fn sd_block_device_reports_card_geometry() {
+        let mmio = MinimalSdhciMmio;
+        let host = crate::sdhci::Host::new(&mmio);
+        let card = fake_card(512, 4096);
+        let dev = SdBlockDevice::new(host, card);
+        assert_eq!(dev.block_size(), 512);
+        assert_eq!(dev.capacity_blocks(), 4096);
+        assert_eq!(dev.capacity_bytes(), 512 * 4096);
+    }
+
+    #[test]
+    fn sd_block_device_rejects_misaligned_and_out_of_range() {
+        let mmio = MinimalSdhciMmio;
+        // poll_budget = 0 keeps the test fast — it'll never actually
+        // submit a command before the bounds checks reject the call.
+        let host = crate::sdhci::Host { mmio: &mmio, poll_budget: 0 };
+        let card = fake_card(512, 4);
+        let mut dev = SdBlockDevice::new(host, card);
+
+        // Misaligned buffer.
+        let mut bad = [0u8; 100];
+        assert_eq!(dev.read_blocks(0, &mut bad), Err(BlockError::BadBuffer));
+        let bad_w = [0u8; 100];
+        assert_eq!(dev.write_blocks(0, &bad_w), Err(BlockError::BadBuffer));
+
+        // LBA out of range (capacity is 4 blocks).
+        let mut buf = [0u8; 512];
+        assert_eq!(dev.read_blocks(99, &mut buf), Err(BlockError::OutOfRange));
+        assert_eq!(dev.write_blocks(99, &buf), Err(BlockError::OutOfRange));
     }
 
     #[test]

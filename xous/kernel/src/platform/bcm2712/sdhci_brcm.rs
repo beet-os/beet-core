@@ -61,13 +61,11 @@ impl Mmio for RealMmio {
     }
 }
 
-/// One slot of cached card info discovered during init.
-#[derive(Clone, Copy, Debug)]
-pub struct CardInfo {
-    pub rca: u16,
-    pub csd: sdhci::Csd,
-    pub blocks: u64,
-}
+// CardInfo moved to crate::sdhci::CardInfo so the BlockDevice
+// adapter (and other generic consumers) don't depend on a
+// platform module. Re-exported here for back-compat with existing
+// callers that say sdhci_brcm::CardInfo.
+pub use crate::sdhci::CardInfo;
 
 /// Try to bring up the SD card: reset the host, walk the init state
 /// machine, and return the negotiated [`CardInfo`] on success.

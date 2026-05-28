@@ -620,6 +620,18 @@ impl HostResponse {
     pub fn long(&self) -> [u32; 4] { self.r }
 }
 
+/// One slot of cached card info discovered during init — the result
+/// every per-platform SDHCI bring-up returns once the card is in
+/// the Tran state.  Lives in the generic protocol module so the
+/// BlockDevice adapter (crate::block::SdBlockDevice) can name it
+/// without depending on any platform module.
+#[derive(Clone, Copy, Debug)]
+pub struct CardInfo {
+    pub rca:    u16,
+    pub csd:    Csd,
+    pub blocks: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TRANSFER_MODE register
 // ─────────────────────────────────────────────────────────────────────────────
