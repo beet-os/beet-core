@@ -657,20 +657,26 @@ impl WindowManager {
         }
     }
 
-    /// Re-paint the desktop and every visible window onto `screen`,
-    /// with an optional uptime in seconds shown on the taskbar.
+    /// Re-paint with both uptime and a free-running animation frame
+    /// counter (lower bits drive the spinner / pulses; higher bits
+    /// derive the clock).
+    pub fn compose_animated(&self, screen: &mut Surface, uptime_seconds: u64, frame: u64) {
+        self.compose_inner(screen, Some(uptime_seconds), Some(frame));
+    }
+
+    /// Re-paint with an uptime clock but no per-frame animation.
     pub fn compose_with_uptime(&self, screen: &mut Surface, uptime_seconds: u64) {
-        self.compose_inner(screen, Some(uptime_seconds));
+        self.compose_inner(screen, Some(uptime_seconds), None);
     }
 
     /// Re-paint the desktop and every visible window onto `screen`.
     /// O(windows × pixels) — fine for the static demo screens, will
     /// move to dirty-rect tracking when input lands.
     pub fn compose(&self, screen: &mut Surface) {
-        self.compose_inner(screen, None);
+        self.compose_inner(screen, None, None);
     }
 
-    fn compose_inner(&self, screen: &mut Surface, uptime: Option<u64>) {
+    fn compose_inner(&self, screen: &mut Surface, uptime: Option<u64>, frame: Option<u64>) {
         screen.fill(self.desktop_bg);
 
         // Top accent bar + taskbar across the bottom so the desktop
@@ -686,6 +692,29 @@ impl WindowManager {
         // Brand label on the taskbar.
         screen.draw_text(8, h - taskbar_h + (taskbar_h - font::CHAR_H as i32) / 2,
             "BeetOS", color::TITLE_FG, color::TITLE_BAR);
+
+        // Background animation: a few softly-shifted "stars" on the
+        // desktop, plus a slow-moving bouncing accent circle. Skipped
+        // when `frame` is None so unit tests stay deterministic.
+        if let Some(f) = frame {
+            // Bouncing ball — clamps inside the desktop area, avoiding
+            // the title bar / taskbar.
+            let area_top = 8;
+            let area_bot = h - taskbar_h - 8;
+            let area_left = 8;
+            let area_right = w - 8;
+            let span_x = (area_right - area_left).max(1);
+            let span_y = (area_bot - area_top).max(1);
+            // Cheap sawtooth bounce so we don't need sin/cos.
+            let px_cycle = (f * 7 % (span_x as u64 * 2)) as i32;
+            let py_cycle = (f * 5 % (span_y as u64 * 2)) as i32;
+            let bx = area_left + if px_cycle < span_x { px_cycle } else { 2 * span_x - px_cycle };
+            let by = area_top  + if py_cycle < span_y { py_cycle } else { 2 * span_y - py_cycle };
+            // Pulse the radius too.
+            let r = 10 + ((f % 16) as i32 - 8).abs();
+            screen.circle_filled(bx, by, r,   color::BEET_PINK);
+            screen.circle(bx, by, r + 4, color::BEET_PURPLE);
+        }
 
         // Uptime clock on the right of the taskbar.
         if let Some(uptime) = uptime {
@@ -710,6 +739,16 @@ impl WindowManager {
             let pill = Rect::new(cx - 8, cy - 4, clock_w + 16, font::CHAR_H as i32 + 8);
             screen.fill_rect(&pill, color::BEET_PURPLE);
             screen.draw_text(cx, cy, s, color::WHITE, color::BEET_PURPLE);
+
+            // Spinner just left of the clock when frame is supplied.
+            if let Some(f) = frame {
+                let spinners = b"|/-\\";
+                let sp = spinners[(f as usize) % spinners.len()];
+                let spx = cx - 24;
+                let spbg = Rect::new(spx - 4, cy - 4, font::CHAR_W as i32 + 8, font::CHAR_H as i32 + 8);
+                screen.fill_rect(&spbg, color::TITLE_BAR);
+                screen.draw_char(spx, cy, sp, color::BRIGHT_GREEN, color::TITLE_BAR);
+            }
         }
 
         // Taskbar entries — one per window.

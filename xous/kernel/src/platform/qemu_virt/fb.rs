@@ -489,24 +489,25 @@ pub fn populate_demo_desktop() {
 
 /// Re-render the live [`WindowManager`] onto the framebuffer.
 ///
-/// Reads the current timer tick count to drive the taskbar clock so
-/// every recompose reflects the latest uptime without each caller
-/// having to plumb that through.
+/// Reads the current timer tick count to drive both the taskbar clock
+/// and the desktop's animated elements (spinner, bouncing accent).
 pub fn compose_desktop() {
     let tick = super::timer::tick_count();
     // 100 timer ticks per second — see TICK_RATE_HZ in timer.rs.
     let uptime_seconds = tick / 100;
+    // Animation frame counter — runs at the recompose rate (~10 Hz).
+    let frame = tick / 10;
     let mut s = unsafe { surface() };
-    with_wm(|wm| wm.compose_with_uptime(&mut s, uptime_seconds));
+    with_wm(|wm| wm.compose_animated(&mut s, uptime_seconds, frame));
 }
 
-/// Trigger a periodic recompose from the timer IRQ — used to animate
-/// the taskbar clock and surface any state that drifts without explicit
-/// input (e.g. spinners).  Called by `handle_irq` once per second.
+/// Trigger a periodic recompose from the timer IRQ — drives the
+/// taskbar clock, spinner, and background animation without needing
+/// explicit input.  Called by `handle_irq` ~10 times a second.
 pub fn tick_recompose_if_due(tick: u64) {
-    // Once a second is plenty for an HH:MM:SS clock; cheap enough that
-    // we don't bother with dirty tracking for the demo.
-    if tick % 100 == 0 {
+    // 10 Hz: smooth enough for the spinner and bouncing accent, well
+    // below the 100 Hz timer so we don't melt the (software!) rasterizer.
+    if tick % 10 == 0 {
         compose_desktop();
     }
 }
