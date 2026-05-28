@@ -3,14 +3,20 @@
 
 //! BeetOS Filesystem service.
 //!
-//! Owns the in-memory ramfs and the read-only disk (tar archive).
-//! Serves file operations to other processes via Xous IPC.
-//! For data output (ls, cat), the FS service writes directly to UART.
+//! Owns the in-memory ramfs and a snapshot of the read-only disk
+//! (tar archive). Serves file operations to other processes via Xous
+//! IPC. For data output (ls, cat), the FS service writes directly to
+//! UART.
 //!
-//! Boot parameters (set by kernel via x0-x2):
+//! Disk access goes through the block service (`api/block::BlockClient`)
+//! — no direct MMIO or kernel-mapped disk region here. At startup we
+//! read the whole tar image into [`DISK_CACHE`] via IPC; subsequent
+//! `find` / `list` calls hit the cache. Once we grow past one cache
+//! page the populate path can chunk reads, but the protocol is the
+//! same.
+//!
+//! Boot parameters (set by kernel via x0):
 //!   x0 = UART MMIO VA
-//!   x1 = disk data VA (0 if no disk)
-//!   x2 = disk data size in bytes (0 if no disk)
 
 #![no_std]
 #![no_main]
@@ -57,18 +63,102 @@ impl Write for UartWriter {
 }
 
 // ============================================================================
-// Disk data
+// Disk cache — populated once at startup from the block service via IPC.
 // ============================================================================
 
-static mut DISK_BASE: usize = 0;
-static mut DISK_SIZE: usize = 0;
+/// Maximum disk image size the fs will mirror locally. The QEMU test
+/// disk is 10 KiB and Apple's tar payloads we ship at boot will fit
+/// comfortably; anything bigger would need a real block cache rather
+/// than a single static slab.
+const MAX_DISK_SIZE: usize = 64 * 1024;
+
+static mut DISK_CACHE: [u8; MAX_DISK_SIZE] = [0; MAX_DISK_SIZE];
+static mut DISK_CACHE_LEN: usize = 0;
 
 fn get_disk_archive() -> Option<tarfs::TarArchive<'static>> {
     unsafe {
-        if DISK_SIZE == 0 || DISK_BASE == 0 { return None; }
-        let data = core::slice::from_raw_parts(DISK_BASE as *const u8, DISK_SIZE);
+        if DISK_CACHE_LEN == 0 { return None; }
+        let data = &DISK_CACHE[..DISK_CACHE_LEN];
         Some(tarfs::TarArchive::new(data))
     }
+}
+
+/// Connect to the block service and slurp the entire disk into
+/// [`DISK_CACHE`]. Returns the number of bytes cached on success, 0 if
+/// the block service is unavailable or the disk is empty/too large.
+fn populate_disk_cache_via_ipc() -> usize {
+    use beetos_api_block::BlockClient;
+
+    // Block service is PID 6, spawned right after us. Retry until it
+    // registers — same pattern the shell uses for its self-test.
+    let mut client = None;
+    for _ in 0..32 {
+        if let Ok(c) = BlockClient::connect() {
+            client = Some(c);
+            break;
+        }
+        xous::yield_slice();
+    }
+    let Some(client) = client else {
+        puts("[fs] no block service available\n");
+        return 0;
+    };
+
+    let info = match client.info() {
+        Ok(i) => i,
+        Err(_) => { puts("[fs] block info FAILED\n"); return 0; }
+    };
+
+    let block_size = info.block_size as usize;
+    let total_bytes = (info.capacity_blocks as usize) * block_size;
+    if total_bytes == 0 { return 0; }
+    if total_bytes > MAX_DISK_SIZE {
+        let _ = write!(UartWriter, "[fs] disk {} B exceeds cache {} B\n",
+            total_bytes, MAX_DISK_SIZE);
+        return 0;
+    }
+
+    // One page is the IPC buffer; (PAGE_SIZE - BUF_DATA_OFFSET)/block_size
+    // tells us how many blocks we can move per round-trip.
+    let page_size = match xous::MemorySize::new(beetos::PAGE_SIZE) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let buf_range = match xous::rsyscall(xous::SysCall::MapMemory(
+        None, None, page_size, xous::MemoryFlags::W,
+    )) {
+        Ok(xous::Result::MemoryRange(r)) => r,
+        _ => { puts("[fs] cache buffer alloc FAILED\n"); return 0; }
+    };
+
+    let blocks_per_round =
+        ((beetos::PAGE_SIZE - beetos_api_block::BUF_DATA_OFFSET) / block_size) as u32;
+    let mut lba: u64 = 0;
+    let mut bytes_done: usize = 0;
+    while bytes_done < total_bytes {
+        let remaining_blocks = info.capacity_blocks - lba;
+        let n = (remaining_blocks as u32).min(blocks_per_round);
+        if client.read_blocks(lba, n, buf_range).is_err() {
+            puts("[fs] cache read FAILED\n");
+            xous::rsyscall(xous::SysCall::UnmapMemory(buf_range)).ok();
+            return 0;
+        }
+        let slice = unsafe {
+            core::slice::from_raw_parts(buf_range.as_ptr(), buf_range.len())
+        };
+        let data = beetos_api_block::data(slice);
+        let n_bytes = (n as usize) * block_size;
+        unsafe {
+            DISK_CACHE[bytes_done..bytes_done + n_bytes]
+                .copy_from_slice(&data[..n_bytes]);
+        }
+        bytes_done += n_bytes;
+        lba += n as u64;
+    }
+
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf_range)).ok();
+    unsafe { DISK_CACHE_LEN = total_bytes; }
+    total_bytes
 }
 
 fn ipc_reply(sender: xous::MessageSender, val: usize) {
@@ -94,17 +184,13 @@ fn disk_subpath(path: &str) -> &str {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let uart_base: usize;
-    let disk_base: usize;
-    let disk_size: usize;
     unsafe {
         core::arch::asm!(
-            "mov {0}, x0", "mov {1}, x1", "mov {2}, x2",
-            out(reg) uart_base, out(reg) disk_base, out(reg) disk_size,
+            "mov {0}, x0",
+            out(reg) uart_base,
             options(nomem, nostack),
         );
         UART_BASE = uart_base;
-        DISK_BASE = disk_base;
-        DISK_SIZE = disk_size;
     }
 
     ramfs::init();
@@ -112,7 +198,8 @@ pub extern "C" fn _start() -> ! {
     let _ = ramfs::mkdir("/etc");
     let _ = ramfs::write("/etc/motd", b"Welcome to BeetOS!\n");
 
-    let _ = write!(UartWriter, "[fs] started, disk={} bytes\n", disk_size);
+    let disk_size = populate_disk_cache_via_ipc();
+    let _ = write!(UartWriter, "[fs] started, disk={} bytes via IPC\n", disk_size);
 
     let sid = xous::SID::from_array(FS_SID);
     let _server = xous::rsyscall(xous::SysCall::CreateServerWithAddress(sid, 0..0));
@@ -176,7 +263,7 @@ fn handle_blocking_scalar(sender: xous::MessageSender, scalar: xous::ScalarMessa
         }
         id if id == FsOp::Stats as usize => {
             let (used, total, bytes) = ramfs::stats();
-            let disk_size = unsafe { DISK_SIZE };
+            let disk_size = unsafe { DISK_CACHE_LEN };
             let disk_files = get_disk_archive().map(|a| a.count()).unwrap_or(0);
 
             if xous::return_scalar5(sender, used, total, bytes, disk_size, disk_files).is_err() {

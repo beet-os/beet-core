@@ -768,29 +768,27 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
                     }
 
                     if read_ok {
-                        // Map disk pages read-only into BOTH fs and block services.
-                        // Transitional: fs still reads tarfs directly while we
-                        // wire the IPC path; block needs the same pages so it
-                        // can serve ReadBlocks once fs is migrated.
+                        // Map disk pages read-only into the block service
+                        // only. The fs service reaches them via IPC
+                        // (BlockClient → BLOCK_SID → ReadBlocks) — the
+                        // direct mapping was the transitional shim.
                         crate::services::SystemServices::with_mut(|ss| {
                             crate::mem::MemoryManager::with_mut(|mm| {
-                                for &pid in &[fs_pid, block_pid] {
-                                    let process = ss.process_mut(pid).expect("disk-map process");
-                                    for i in 0..disk_pages {
-                                        let va = DISK_DATA_VA + i * beetos::PAGE_SIZE;
-                                        process.mapping.map_page(
-                                            mm,
-                                            disk_phys_pages[i],
-                                            va as *mut usize,
-                                            xous::MemoryFlags::empty(),
-                                            true,
-                                        ).ok();
-                                    }
+                                let process = ss.process_mut(block_pid).expect("disk-map block");
+                                for i in 0..disk_pages {
+                                    let va = DISK_DATA_VA + i * beetos::PAGE_SIZE;
+                                    process.mapping.map_page(
+                                        mm,
+                                        disk_phys_pages[i],
+                                        va as *mut usize,
+                                        xous::MemoryFlags::empty(),
+                                        true,
+                                    ).ok();
                                 }
                             });
                         });
 
-                        crate::platform::qemu_virt::uart::puts("Disk: mapped into fs+block services\n");
+                        crate::platform::qemu_virt::uart::puts("Disk: mapped into block service\n");
                         (DISK_DATA_VA, disk_bytes)
                     } else {
                         crate::platform::qemu_virt::uart::puts("Disk: read failed\n");
@@ -825,8 +823,10 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         super::process::set_thread_arg0(idx, SHELL_UART_VA);
     }
     {
+        // fs no longer touches the disk directly — drop the disk_va /
+        // disk_size args, only UART_VA stays.
         let idx = fs_pid.get() as usize - 1;
-        super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
+        super::process::set_thread_arg0(idx, SHELL_UART_VA);
     }
     {
         let idx = block_pid.get() as usize - 1;
