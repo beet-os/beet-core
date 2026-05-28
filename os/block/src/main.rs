@@ -208,11 +208,17 @@ pub extern "C" fn _start() -> ! {
                         handle_blocking_scalar(env.sender, *scalar);
                     }
                     xous::Message::MutableBorrow(mem) => {
+                        // The page return is two-step in this tree:
+                        // `handle_mutable_borrow` explicitly calls
+                        // `return_memory_offset_valid` (the kernel ships
+                        // xous-rs with `forget-memory-messages`, which
+                        // strips `Envelope::Drop` on this build), and
+                        // `forget(env)` is defensive — guards against
+                        // that feature ever flipping back off and Drop
+                        // double-returning the page. See the matching
+                        // comment in `os/fs/src/main.rs` for the long
+                        // form.
                         handle_mutable_borrow(env.sender, mem);
-                        // MutableBorrow returns the page to the
-                        // caller automatically on Drop; forget the
-                        // envelope so we don't double-free in the
-                        // xous-rs Drop impl.
                         core::mem::forget(env);
                     }
                     _ => {}

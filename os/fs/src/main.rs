@@ -203,6 +203,19 @@ pub extern "C" fn _start() -> ! {
                         handle_blocking_scalar(env.sender, *scalar);
                     }
                     xous::Message::MutableBorrow(mem) => {
+                        // Two-step page return — order matters and both
+                        // pieces are non-obvious. See the comment on
+                        // `return_memory_offset_valid` inside
+                        // `handle_mutable_borrow` for the long version;
+                        // the short version is:
+                        //   1. the handler explicitly returns the page
+                        //      (the kernel ships xous-rs with the
+                        //      `forget-memory-messages` feature, which
+                        //      strips Envelope::Drop on this build);
+                        //   2. `forget(env)` is defensive — if that
+                        //      feature ever flips back off, Drop would
+                        //      call return_memory a second time and the
+                        //      sender would observe a DoubleFree.
                         handle_mutable_borrow(env.sender, mem);
                         core::mem::forget(env);
                     }
@@ -480,6 +493,22 @@ fn handle_mutable_borrow(sender: xous::MessageSender, mem: &xous::MemoryMessage)
         mem.buf.as_mut_ptr().add(BUF_STATUS_OFFSET).write_volatile(status as u8);
     }
 
+    // Explicitly hand the page back to the sender.
+    //
+    // In a vanilla xous-rs build, `MessageEnvelope::Drop` would call
+    // this for us as the envelope goes out of scope. BeetOS's kernel,
+    // however, depends on xous-rs with the `forget-memory-messages`
+    // feature enabled (see xous/kernel/Cargo.toml), and Cargo's feature
+    // unification turns that feature on for every reverse-dep in the
+    // workspace — including this binary. The result: `Drop for
+    // Envelope` is *not compiled in*, so without this explicit call
+    // the borrowed page is never returned and the sender blocks
+    // forever waiting for it. (We learned that the hard way when the
+    // shell self-test landed against `os/block`.)
+    //
+    // Any new IPC server in this tree that handles a MutableBorrow
+    // *must* call this. See also the matching `forget(env)` in the
+    // receive loop above for the second half of the pattern.
     xous::return_memory_offset_valid(sender, mem.buf, None, None).ok();
 }
 
