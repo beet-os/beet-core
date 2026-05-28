@@ -35,6 +35,8 @@
 pub mod font;
 #[cfg(feature = "fb")]
 pub mod fb_console;
+#[cfg(feature = "fb")]
+pub mod gfx;
 
 /// AArch64 translation granule — set by the `page-4k` / `page-16k` / `page-64k` feature.
 /// Exactly one feature must be enabled. Default: `page-16k` (Apple Silicon).
