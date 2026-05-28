@@ -89,14 +89,24 @@ fn get_disk_archive() -> Option<tarfs::TarArchive<'static>> {
 fn populate_disk_cache_via_ipc() -> usize {
     use beetos_api_block::BlockClient;
 
-    let client = match BlockClient::connect_with_retries(32) {
+    const CONNECT_ATTEMPTS: u32 = 32;
+
+    let client = match BlockClient::connect_with_retries(CONNECT_ATTEMPTS) {
         Ok(c) => c,
-        Err(_) => { puts("[fs] no block service available\n"); return 0; }
+        Err(e) => {
+            let _ = write!(UartWriter,
+                "[fs] no block service available (connect: {:?} after {} attempts)\n",
+                e, CONNECT_ATTEMPTS);
+            return 0;
+        }
     };
 
     let info = match client.info() {
         Ok(i) => i,
-        Err(_) => { puts("[fs] block info FAILED\n"); return 0; }
+        Err(e) => {
+            let _ = write!(UartWriter, "[fs] block info FAILED: {:?}\n", e);
+            return 0;
+        }
     };
 
     let block_size = info.block_size as usize;
@@ -118,7 +128,12 @@ fn populate_disk_cache_via_ipc() -> usize {
         None, None, page_size, xous::MemoryFlags::W,
     )) {
         Ok(xous::Result::MemoryRange(r)) => r,
-        _ => { puts("[fs] cache buffer alloc FAILED\n"); return 0; }
+        _ => {
+            let _ = write!(UartWriter,
+                "[fs] cache buffer alloc FAILED ({} B requested)\n",
+                beetos::PAGE_SIZE);
+            return 0;
+        }
     };
 
     let blocks_per_round =
@@ -128,8 +143,10 @@ fn populate_disk_cache_via_ipc() -> usize {
     while bytes_done < total_bytes {
         let remaining_blocks = info.capacity_blocks - lba;
         let n = (remaining_blocks as u32).min(blocks_per_round);
-        if client.read_blocks(lba, n, buf_range).is_err() {
-            puts("[fs] cache read FAILED\n");
+        if let Err(e) = client.read_blocks(lba, n, buf_range) {
+            let _ = write!(UartWriter,
+                "[fs] cache read FAILED at LBA {} ({} blocks, {}/{} B done): {:?}\n",
+                lba, n, bytes_done, total_bytes, e);
             xous::rsyscall(xous::SysCall::UnmapMemory(buf_range)).ok();
             return 0;
         }
