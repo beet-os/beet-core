@@ -11,6 +11,7 @@ fn main() -> anyhow::Result<()> {
         Some("qemu") => qemu(&args[1..])?,
         Some("qemu-smoke") => qemu_smoke()?,
         Some("qemu-screenshot") => qemu_screenshot(&args[1..])?,
+        Some("qemu-animation") => qemu_animation(&args[1..])?,
         Some("rpi5") => rpi5()?,
         Some("test") => test()?,
         Some(cmd) => anyhow::bail!("unknown command: {cmd}"),
@@ -26,6 +27,8 @@ fn main() -> anyhow::Result<()> {
             println!("  qemu-smoke         Boot QEMU and verify expected progress markers (CI)");
             println!("  qemu-screenshot [--wait SECS] [--out PATH]");
             println!("                     Boot QEMU and capture the framebuffer (default: 6s, target/beetos-fb.png)");
+            println!("  qemu-animation [--frames N] [--interval SECS] [--out PATH]");
+            println!("                     Capture N frames at given interval and stitch into an animated GIF");
             println!("  test               Build and run self-test suite on QEMU (CI)");
             println!();
             println!("Platforms:");
@@ -663,6 +666,146 @@ fn qemu_screenshot(args: &[String]) -> anyhow::Result<()> {
     let size = std::fs::metadata(&out_path)?.len();
     println!();
     println!("Screenshot saved: {} ({} bytes)", out_path.display(), size);
+    Ok(())
+}
+
+/// Capture a sequence of N framebuffer snapshots over time and stitch
+/// them into an animated GIF. Useful for showing off animations
+/// (clock, spinner, Mandelbrot zoom, Game of Life, Snake) in a single
+/// asset.
+///
+/// Implementation: boot the qemu-virt kernel once, hold a QMP socket
+/// open, issue successive `screendump` commands sleeping between each,
+/// then convert the resulting PPMs to a single GIF via ImageMagick.
+///
+/// Flags:
+///   --frames N        — number of frames (default 8)
+///   --interval SECS   — seconds between captures (default 1)
+///   --wait SECS       — initial settle delay (default 5)
+///   --out PATH        — output GIF path (default target/beetos-anim.gif)
+fn qemu_animation(args: &[String]) -> anyhow::Result<()> {
+    let root = workspace_root();
+    let mut frames: u32 = 8;
+    let mut interval: f64 = 1.0;
+    let mut wait_secs: u64 = 5;
+    let mut out_path = root.join("target/beetos-anim.gif");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--frames"   => { frames = args[i+1].parse()?; i += 2; }
+            "--interval" => { interval = args[i+1].parse()?; i += 2; }
+            "--wait"     => { wait_secs = args[i+1].parse()?; i += 2; }
+            "--out"      => { out_path = PathBuf::from(&args[i+1]); i += 2; }
+            o => anyhow::bail!("unknown flag: {o}"),
+        }
+    }
+
+    // Same dummy-stub trick as qemu_screenshot so we don't need stage1 rustc.
+    let nostd_target = root.join("target/aarch64-unknown-none/debug");
+    std::fs::create_dir_all(&nostd_target)?;
+    let hello_std = nostd_target.join("hello-std.stripped");
+    if !hello_std.exists() {
+        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
+    }
+
+    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    let kernel = elf_to_image(&kernel_elf)?;
+
+    let qmp_sock = root.join("target/qemu-animation.qmp");
+    let serial_log = root.join("target/qemu-animation-serial.log");
+    let _ = std::fs::remove_file(&qmp_sock);
+    let _ = std::fs::remove_file(&serial_log);
+    let frames_dir = root.join("target/qemu-animation-frames");
+    let _ = std::fs::remove_dir_all(&frames_dir);
+    std::fs::create_dir_all(&frames_dir)?;
+
+    println!();
+    println!("Launching QEMU for animation (frames: {frames}, interval: {interval}s, wait: {wait_secs}s)...");
+
+    let mut child = Command::new("qemu-system-aarch64")
+        .args([
+            "-machine", "virt,gic-version=3",
+            "-cpu", "neoverse-n1",
+            "-m", "2G",
+            "-display", "none",
+            "-device", "ramfb",
+            "-device", "virtio-keyboard-device",
+            "-chardev", &format!("file,id=c0,path={}", serial_log.display()),
+            "-serial", "chardev:c0",
+            "-qmp", &format!("unix:{},server,nowait", qmp_sock.display()),
+            "-kernel", kernel.to_str().expect("non-UTF8 path"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    // Wait for QEMU + initial boot.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+
+    // Build the QMP script: handshake, N screendumps separated by `interval`, then quit.
+    let mut script = String::from(r#"{"execute":"qmp_capabilities"}"#);
+    script.push('\n');
+    for f in 0..frames {
+        let ppm = frames_dir.join(format!("frame-{:03}.ppm", f));
+        script.push_str(&format!(
+            r#"{{"execute":"screendump","arguments":{{"filename":"{}"}}}}"#,
+            ppm.display(),
+        ));
+        script.push('\n');
+    }
+    script.push_str(r#"{"execute":"quit"}"#);
+    script.push('\n');
+
+    // Pipe the script into socat, but pace it so QEMU has time to actually
+    // render between screendumps. We could do that with separate socat calls;
+    // simpler is to interleave sleeps via a small shell loop.  Spawn one
+    // process per command instead.
+    use std::io::Write;
+    for line in script.lines() {
+        let mut proc = Command::new("socat")
+            .arg("-")
+            .arg(format!("UNIX-CONNECT:{}", qmp_sock.display()))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        if let Some(mut stdin) = proc.stdin.take() {
+            let _ = stdin.write_all(line.as_bytes());
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+            drop(stdin);
+        }
+        let _ = proc.wait();
+        if line.contains("screendump") {
+            std::thread::sleep(std::time::Duration::from_millis((interval * 1000.0) as u64));
+        }
+    }
+
+    let _ = child.wait();
+
+    // Convert all PPMs to a single animated GIF via ImageMagick.
+    let delay_centisec = (interval * 100.0).round() as u64;
+    let pattern = frames_dir.join("frame-*.ppm");
+    let conv = Command::new("magick")
+        .args(["-delay", &delay_centisec.to_string(), "-loop", "0"])
+        .arg(&pattern)
+        .arg(&out_path)
+        .status()
+        .or_else(|_| {
+            Command::new("convert")
+                .args(["-delay", &delay_centisec.to_string(), "-loop", "0"])
+                .arg(&pattern)
+                .arg(&out_path)
+                .status()
+        })?;
+    anyhow::ensure!(conv.success(), "PPM -> GIF conversion failed");
+
+    let size = std::fs::metadata(&out_path)?.len();
+    println!();
+    println!("Animation saved: {} ({} bytes, {} frames @ {}s interval)",
+        out_path.display(), size, frames, interval);
     Ok(())
 }
 
