@@ -539,12 +539,15 @@ pub struct MandelState {
 impl MandelState {
     pub const fn new() -> Self {
         // Start zoomed all the way out, drifting in.
+        // max_iter kept modest because each pixel costs `max_iter` fmul +
+        // fcmp on a software FPU — at 360x220 / step 4 we still get ~5k
+        // blocks per frame, plenty visible.
         MandelState {
             center_re: -0.75,
             center_im:  0.10,
             scale:      3.0,
             frame:      0,
-            max_iter:   48,
+            max_iter:   28,
         }
     }
 
@@ -580,7 +583,11 @@ impl MandelState {
         let scale_x = self.scale / w as f32;
         let scale_y = self.scale * (h as f32 / w as f32) / h as f32;
         let max_iter = self.max_iter;
-        let step: i32 = 2;
+        // step=4 → 4x4 px blocks. 16x cheaper than per-pixel, and
+        // at the demo window size still gives ~90x55 cells (~5k blocks
+        // per frame). Worth the chunkier look to keep the 10 Hz
+        // recompose pipeline above water.
+        let step: i32 = 4;
         let mut y = 0;
         while y < h {
             let im = self.center_im + (y as f32 - h as f32 / 2.0) * scale_y;
@@ -879,6 +886,12 @@ pub struct WindowManager {
     windows: [Option<Window>; MAX_WINDOWS],
     next_z: u8,
     desktop_bg: Color,
+    /// Cursor position in screen coordinates.  Drawn as an arrow
+    /// sprite in compose() so any caller can see it, even without
+    /// a mouse driver.  Today moved by Shift+arrow keys; later by
+    /// virtio-tablet ABS events.
+    cursor: (i32, i32),
+    cursor_visible: bool,
 }
 
 impl WindowManager {
@@ -889,7 +902,27 @@ impl WindowManager {
             windows: [None; MAX_WINDOWS],
             next_z: 0,
             desktop_bg: color::DESKTOP_BG,
+            cursor: (640, 400),
+            cursor_visible: true,
         }
+    }
+
+    pub fn cursor(&self) -> (i32, i32) { self.cursor }
+
+    pub fn set_cursor(&mut self, x: i32, y: i32) {
+        self.cursor = (x, y);
+    }
+
+    pub fn move_cursor(&mut self, dx: i32, dy: i32) {
+        self.cursor.0 += dx;
+        self.cursor.1 += dy;
+    }
+
+    pub fn click_at_cursor(&mut self) -> Option<WindowId> {
+        let (x, y) = self.cursor;
+        let id = self.hit_test(x, y)?;
+        self.focus(id);
+        Some(id)
     }
 
     pub fn set_desktop_bg(&mut self, color: Color) { self.desktop_bg = color; }
@@ -1021,6 +1054,15 @@ impl WindowManager {
         match key {
             b'\t' => { self.cycle_focus(true);  return true; }
             0x19  => { self.cycle_focus(false); return true; }
+            // Shift+arrow → move cursor (special sentinels from
+            // virtio-input). 16 px steps so the cursor is steerable
+            // without dozens of keystrokes.
+            0xD1 => { self.move_cursor(0,   -16); return true; }
+            0xD2 => { self.move_cursor(0,    16); return true; }
+            0xD3 => { self.move_cursor(16,   0);  return true; }
+            0xD4 => { self.move_cursor(-16,  0);  return true; }
+            // Shift+Enter (0xD5) → click at cursor.
+            0xD5 => { self.click_at_cursor(); return true; }
             _ => {}
         }
         let focused_id = self.windows.iter().enumerate()
@@ -1168,6 +1210,64 @@ impl WindowManager {
         // Actual windows, bottom → top.
         for (_id, win) in self.iter_by_z() {
             win.draw(screen);
+        }
+
+        // Cursor sprite drawn last so it overlays everything else.
+        // A tiny 8x12 arrow — outlined in black, filled white — at the
+        // current cursor coordinates. Keeps the cursor visible against
+        // both the dark desktop and a focused window's title bar.
+        if self.cursor_visible {
+            draw_cursor_sprite(screen, self.cursor.0, self.cursor.1);
+        }
+    }
+}
+
+/// Paint a small white-on-black arrow cursor at `(x, y)`.
+///
+/// The shape is encoded as a 12-row 8-bit mask: bit set = white pixel,
+/// bit unset = black outline pixel (or transparent — we draw black
+/// behind the outline so the cursor stays visible on bright backgrounds).
+fn draw_cursor_sprite(screen: &mut Surface, x: i32, y: i32) {
+    // Bit pattern, row by row, MSB = leftmost pixel.
+    // 1 = white fill, 0 = transparent, but we also draw a 1-px black
+    // border around the fill so the cursor stays visible on light
+    // backgrounds. Outline is the union of 8-neighbourhoods.
+    const ROWS: [u8; 12] = [
+        0b1000_0000,
+        0b1100_0000,
+        0b1110_0000,
+        0b1111_0000,
+        0b1111_1000,
+        0b1111_1100,
+        0b1111_1110,
+        0b1111_0000,
+        0b1101_1000,
+        0b1001_1000,
+        0b0000_1100,
+        0b0000_1100,
+    ];
+    // First pass: outline (1 pixel border in BLACK).
+    for r in 0..ROWS.len() as i32 {
+        let bits = ROWS[r as usize];
+        for c in 0..8 {
+            if (bits >> (7 - c)) & 1 != 0 {
+                // Splat 3x3 black around each fill pixel — the unset
+                // pixels among the 9 form the outline.
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        screen.set_pixel(x + c + dx, y + r + dy, color::BLACK);
+                    }
+                }
+            }
+        }
+    }
+    // Second pass: white fill on top of the outline.
+    for r in 0..ROWS.len() as i32 {
+        let bits = ROWS[r as usize];
+        for c in 0..8 {
+            if (bits >> (7 - c)) & 1 != 0 {
+                screen.set_pixel(x + c, y + r, color::WHITE);
+            }
         }
     }
 }

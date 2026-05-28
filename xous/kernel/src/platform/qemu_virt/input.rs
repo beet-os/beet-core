@@ -196,7 +196,7 @@ fn keycode_to_ascii(code: u16, shift: bool) -> Option<u8> {
         1       => 0x1b,  // ESC
         14      => 0x7f,  // Backspace → DEL
         15      => b'\t', // Tab
-        28 | 96 => b'\n', // Enter / KP Enter
+        28 | 96 => if shift { 0xD5 } else { b'\n' }, // Enter / KP Enter (Shift = click)
         57      => b' ',  // Space
 
         // Letters (a–z / A–Z)
@@ -256,10 +256,15 @@ fn keycode_to_ascii(code: u16, shift: bool) -> Option<u8> {
         // beetos::gui treats as steering events (Snake game today,
         // window navigation tomorrow). Avoids parsing ANSI escape
         // sequences in the input layer.
-        103 => 0xC1, // KEY_UP
-        108 => 0xC2, // KEY_DOWN
-        106 => 0xC3, // KEY_RIGHT
-        105 => 0xC4, // KEY_LEFT
+        //
+        // Shift switches the role: plain cursor keys steer the focused
+        // interactive window (Snake), shifted cursor keys move the
+        // mouse cursor across the desktop (range 0xD1-0xD4); Shift+Enter
+        // is a click at the current cursor position (0xD5).
+        103 => if shift { 0xD1 } else { 0xC1 }, // KEY_UP
+        108 => if shift { 0xD2 } else { 0xC2 }, // KEY_DOWN
+        106 => if shift { 0xD3 } else { 0xC3 }, // KEY_RIGHT
+        105 => if shift { 0xD4 } else { 0xC4 }, // KEY_LEFT
 
         // Numeric keypad — useful for driving the GUI calculator directly
         // without modifier juggling. Codes per Linux evdev (KEY_KP*).
