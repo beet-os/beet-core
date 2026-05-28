@@ -105,7 +105,7 @@ unsafe extern "C" fn _user_irq_handler_rust(context: *mut u8) {
             if FIRST_PREEMPT.swap(false, Ordering::Relaxed) {
                 use core::fmt::Write;
                 let _ = write!(
-                    crate::platform::qemu_virt::uart::UartWriter,
+                    crate::platform::Console,
                     "PREEMPT: timer switched PID {} -> {}\n",
                     interrupted_pid, resume_pid,
                 );
@@ -244,7 +244,6 @@ fn dispatch_input_char(c: u8) {
 /// (draining the buffer to the new owner).
 ///
 /// `ss` must already be locked by the caller.
-#[cfg(feature = "platform-qemu-virt")]
 pub(crate) fn deliver_char_to_sid(
     ss: &mut crate::services::SystemServices,
     sid_words: [u32; 4],
@@ -331,15 +330,12 @@ unsafe fn _handle_svc(context: *mut u8, _iss: u64) {
     ) {
         Ok(call) => call,
         Err(_e) => {
-            #[cfg(feature = "platform-qemu-virt")]
-            {
-                use core::fmt::Write;
-                let _ = write!(
-                    crate::platform::qemu_virt::uart::UartWriter,
-                    "[SVC] InvalidSyscall a0={} pid={}\n",
-                    args[0], caller_pid.get(),
-                );
-            }
+            use core::fmt::Write;
+            let _ = write!(
+                crate::platform::Console,
+                "[SVC] InvalidSyscall a0={} pid={}\n",
+                args[0], caller_pid.get(),
+            );
             let result = XousResult::Error(xous::Error::InvalidSyscall);
             (*frame).set_args(&result.to_args());
             return;
@@ -412,14 +408,12 @@ unsafe fn _handle_abort(context: *mut u8, esr: u64, is_instruction: bool) {
 
     let pid = crate::arch::process::current_pid();
     let abort_type = if is_instruction { "IABT" } else { "DABT" };
-    let iss = esr & 0x01FF_FFFF;
-    let dfsc = iss & 0x3F; // Data/Instruction Fault Status Code
+    let dfsc = esr & 0x3F; // Data/Instruction Fault Status Code
 
-    #[cfg(feature = "platform-qemu-virt")]
     {
         use core::fmt::Write;
         let _ = write!(
-            crate::platform::qemu_virt::uart::UartWriter,
+            crate::platform::Console,
             "ABORT: PID {} {} at PC={:#x} FAR={:#x} ESR={:#x} DFSC={:#x}\n",
             pid, abort_type, elr, far, esr, dfsc,
         );
@@ -444,11 +438,10 @@ unsafe fn _handle_abort(context: *mut u8, esr: u64, is_instruction: bool) {
 unsafe fn _handle_unknown(_context: *mut u8, esr: u64) {
     let pid = crate::arch::process::current_pid();
 
-    #[cfg(feature = "platform-qemu-virt")]
     {
         use core::fmt::Write;
         let _ = write!(
-            crate::platform::qemu_virt::uart::UartWriter,
+            crate::platform::Console,
             "UNKNOWN EXCEPTION: PID {} ESR={:#x}\n",
             pid, esr,
         );

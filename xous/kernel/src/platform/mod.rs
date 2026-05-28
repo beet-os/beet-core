@@ -22,6 +22,41 @@ pub fn fb_write(s: &str) { self::qemu_virt::fb::write_str(s); }
 #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
 pub fn fb_write(_s: &str) {}
 
+/// Platform-agnostic kernel console writer.
+///
+/// Dispatches to whichever character sink the current platform exposes —
+/// PL011 UART on qemu_virt, mini-UART on bcm2712, framebuffer on
+/// apple_t8103 once wired up. Implements [`core::fmt::Write`] so callers
+/// can use `write!`/`writeln!` directly:
+///
+/// ```ignore
+/// use core::fmt::Write;
+/// let _ = writeln!(crate::platform::Console, "ABORT: pid={}", pid);
+/// ```
+///
+/// Diagnostic call sites in `arch/aarch64` (panic, abort, SVC handlers,
+/// boot logs) use this instead of platform-specific writers so that
+/// `pid`, `esr`, `far`, … stay live on every platform — eliminating the
+/// "unused variable on non-qemu-virt builds" warnings that the previous
+/// `#[cfg(feature = "platform-qemu-virt")]` print blocks produced, and
+/// giving future platforms a single seam to plug their console into.
+#[cfg(beetos)]
+pub struct Console;
+
+#[cfg(beetos)]
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        #[cfg(feature = "platform-qemu-virt")]
+        self::qemu_virt::uart::puts(s);
+        #[cfg(feature = "platform-bcm2712")]
+        self::bcm2712::uart::puts(s);
+        #[cfg(feature = "platform-apple-t8103")]
+        self::apple_t8103::console::puts(s);
+        let _ = s;
+        Ok(())
+    }
+}
+
 /// Platform specific initialization.
 ///
 /// `fdt_phys` is the FDT physical address passed by the bootloader (x0 on

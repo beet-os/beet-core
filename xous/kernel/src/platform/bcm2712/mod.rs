@@ -49,12 +49,6 @@ pub fn shutdown() -> ! {
     }
 }
 
-pub mod rand {
-    pub fn get_u32() -> u32 {
-        crate::arch::rand::get_u32()
-    }
-}
-
 pub mod cache {
     #[allow(dead_code)]
     pub fn clean_cache() {}

@@ -1034,8 +1034,9 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             let mut buf = [0u8; crate::services::INPUT_BUF_CAP];
             match ss.acquire_input_focus(pid, sid_words, &mut buf) {
                 Ok(n) => {
-                    // Drain buffered chars to the newly-registered SID.
-                    #[cfg(feature = "platform-qemu-virt")]
+                    // Drain buffered chars to the newly-registered SID. On
+                    // platforms without a kernel input source the buffer is
+                    // always empty, so this is a no-op loop.
                     for i in 0..n {
                         crate::arch::irq::deliver_char_to_sid(ss, sid_words, buf[i]);
                     }

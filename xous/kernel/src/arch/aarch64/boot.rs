@@ -178,6 +178,10 @@ pub unsafe fn parse_fdt_ram(fdt_ptr: *const u8) -> Option<RamRegion> {
 
 /// MMIO base physical addresses discovered from the FDT.
 /// Fields are `None` when the corresponding node was not found.
+///
+/// Currently only the qemu_virt platform consumes this — the other
+/// platforms still rely on hardcoded defaults pending FDT wiring.
+#[cfg(feature = "platform-qemu-virt")]
 pub struct MmioAddrs {
     pub uart0_phys: Option<usize>,
     pub gicd_phys:  Option<usize>,
@@ -189,6 +193,7 @@ pub struct MmioAddrs {
 /// Compatible values are lists of null-terminated strings, e.g.
 /// `"arm,pl011\0arm,primecell\0"`.  We match whole entries to avoid
 /// false positives (e.g. `"arm,pl011-r2"` would be a different peripheral).
+#[cfg(feature = "platform-qemu-virt")]
 unsafe fn compat_has(data: *const u8, len: usize, target: &[u8]) -> bool {
     let haystack = core::slice::from_raw_parts(data, len);
     let mut start = 0;
@@ -223,6 +228,7 @@ unsafe fn compat_has(data: *const u8, len: usize, target: &[u8]) -> bool {
 /// # Safety
 ///
 /// `fdt_ptr` must point to a valid FDT blob accessible through TTBR1.
+#[cfg(feature = "platform-qemu-virt")]
 pub unsafe fn parse_fdt_mmio(fdt_ptr: *const u8) -> MmioAddrs {
     let mut result = MmioAddrs { uart0_phys: None, gicd_phys: None, gicr_phys: None };
 
@@ -394,18 +400,19 @@ pub unsafe fn init_memory(fdt_phys: *const u8) -> BootInfo {
         (beetos::PLAINTEXT_DRAM_BASE, beetos::RAM_SIZE)
     };
 
-    // Cap to compile-time max (bitmap size is fixed)
-    let mut ram_size = ram_size_raw.min(beetos::RAM_SIZE);
-
-    // Reserve framebuffer at the top of RAM so the MemoryManager never
-    // allocates that region.  Only applies on QEMU virt.
-    #[cfg(feature = "platform-qemu-virt")]
-    {
-        use crate::platform::qemu_virt::fb::FB_SIZE;
-        if ram_size >= FB_SIZE {
-            ram_size -= FB_SIZE;
+    // Cap to compile-time max (bitmap size is fixed). Reserve framebuffer
+    // at the top of RAM on platforms with a kernel-side FB so the
+    // MemoryManager never hands those pages out.
+    let ram_size = {
+        let capped = ram_size_raw.min(beetos::RAM_SIZE);
+        #[cfg(feature = "platform-qemu-virt")]
+        {
+            use crate::platform::qemu_virt::fb::FB_SIZE;
+            if capped >= FB_SIZE { capped - FB_SIZE } else { capped }
         }
-    }
+        #[cfg(not(feature = "platform-qemu-virt"))]
+        capped
+    };
 
     // 2. Set up bump allocator after kernel _end (high VA)
     let mut bump = BumpAllocator::new(kernel_end());
@@ -563,7 +570,9 @@ const UART_PHYS: usize = 0x0900_0000;
 pub const SHELL_UART_VA: usize = 0x0000_0010_0100_0000; // L1[1], well after code
 
 /// Virtual address where disk data is mapped read-only in user processes.
-/// Placed well after UART VA to avoid collisions.
+/// Placed well after UART VA to avoid collisions. Only used by the
+/// qemu_virt virtio-blk path; other platforms have no disk wired up yet.
+#[cfg(feature = "platform-qemu-virt")]
 pub const DISK_DATA_VA: usize = 0x0000_0010_0200_0000;
 
 /// Create a user process from an ELF binary using the kernel's standard
@@ -617,11 +626,10 @@ unsafe fn create_elf_process(
 pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     use xous::PID;
 
-    #[cfg(feature = "platform-qemu-virt")]
     {
         use core::fmt::Write;
         let _ = write!(
-            crate::platform::qemu_virt::uart::UartWriter,
+            crate::platform::Console,
             "EL0: loading shell ELF ({} bytes)...\n",
             SHELL_ELF.len(),
         );

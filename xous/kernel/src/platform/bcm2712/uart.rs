@@ -22,7 +22,6 @@ mod regs {
     pub const DR: usize = 0x00;
     pub const FR: usize = 0x18;
     pub const CR: usize = 0x30;
-    pub const IMSC: usize = 0x38;
     pub const ICR: usize = 0x44;
     pub const FR_TXFF: u32 = 1 << 5;
     pub const FR_RXFE: u32 = 1 << 4;
@@ -96,11 +95,6 @@ pub fn try_getc() -> Option<u8> {
         }
     }
 }
-
-/// GIC SPI for UART0 on BCM2712.
-/// Verify from FDT: `uart0 { interrupts = <GIC_SPI N ...> }` → INTID = N + 32.
-/// Placeholder until confirmed from real hardware FDT dump.
-pub const UART_IRQ: u32 = 153; // SPI 121 = INTID 153 (tentative)
 
 #[allow(dead_code)]
 pub fn clear_rx_interrupt() {

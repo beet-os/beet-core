@@ -15,16 +15,15 @@ fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)) };
 
-    // Write directly to platform UART (println! may not work on bare metal)
-    #[cfg(feature = "platform-qemu-virt")]
-    {
-        let mut w = crate::platform::qemu_virt::uart::UartWriter;
-        let _ = write!(w, "\n!!! KERNEL PANIC !!!\n");
-        if let Some(location) = info.location() {
-            let _ = write!(w, "  at {}:{}:{}\n", location.file(), location.line(), location.column());
-        }
-        let _ = write!(w, "  {}\n", info.message());
+    // Best-effort print to the platform console. On platforms whose console
+    // backend isn't wired up yet, the writes are silently dropped — the
+    // panic still halts cleanly.
+    let mut w = crate::platform::Console;
+    let _ = write!(w, "\n!!! KERNEL PANIC !!!\n");
+    if let Some(location) = info.location() {
+        let _ = write!(w, "  at {}:{}:{}\n", location.file(), location.line(), location.column());
     }
+    let _ = write!(w, "  {}\n", info.message());
 
     // Halt: infinite WFE loop
     loop {

@@ -7,6 +7,7 @@
 //! All MMIO addresses come from the FDT passed by m1n1 at boot.
 
 pub mod cache;
+pub mod console;
 pub mod rand;
 pub mod wdt;
 

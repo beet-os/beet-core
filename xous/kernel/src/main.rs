@@ -83,10 +83,9 @@ pub unsafe extern "C" fn _start_rust(arg_offset: *const u32) -> ! {
     // initialize the MemoryManager.
     let boot_info = arch::boot::init_memory(arg_offset as *const u8);
 
-    #[cfg(feature = "platform-qemu-virt")]
     {
         use core::fmt::Write;
-        let _ = write!(platform::qemu_virt::uart::UartWriter,
+        let _ = write!(platform::Console,
             "MMU: enabled (RAM {:#x}+{:#x}, {} free pages)\n",
             boot_info.ram_base, boot_info.ram_size,
             boot_info.ram_size / beetos::PAGE_SIZE
