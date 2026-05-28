@@ -1,0 +1,17 @@
+[package]
+name = "block"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "BeetOS block-device IPC service"
+
+[[bin]]
+name = "block"
+path = "src/main.rs"
+
+[dependencies]
+xous = { path = "../../xous/xous-rs" }
+beetos-api-block = { path = "../../api/block" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }

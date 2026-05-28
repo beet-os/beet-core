@@ -138,10 +138,10 @@ fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
     let target_dir = ws_target.join("aarch64-unknown-none/debug");
 
     // Build all app/service crates (excluded from workspace, so use --manifest-path)
-    for app in &["hello", "shell", "procman", "fs", "log"] {
+    for app in &["hello", "shell", "procman", "fs", "log", "block"] {
         println!("Building app: {app}");
-        // procman, fs, and log live in os/, everything else in apps/
-        let manifest = if *app == "procman" || *app == "fs" || *app == "log" {
+        // procman, fs, log, and block live in os/, everything else in apps/
+        let manifest = if matches!(*app, "procman" | "fs" | "log" | "block") {
             root.join(format!("os/{app}/Cargo.toml"))
         } else {
             root.join(format!("apps/{app}/Cargo.toml"))
@@ -869,6 +869,10 @@ fn qemu_smoke() -> anyhow::Result<()> {
     anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
     let kernel = elf_to_image(&kernel_elf)?;
 
+    // Build a test disk image so we exercise the virtio-blk + disk-mapping
+    // path. Both the fs and block services depend on these pages.
+    let disk_img = create_test_disk(&root)?;
+
     let serial_log = root.join("target/qemu-smoke-serial.log");
     let _ = std::fs::remove_file(&serial_log);
 
@@ -886,8 +890,11 @@ fn qemu_smoke() -> anyhow::Result<()> {
         "Timer: initialized",
         "MMU: enabled",
         "EL0: loading shell ELF",
+        "Disk: mapped into fs+block services",
         "EL0: launching shell",
         "PREEMPT: timer switched",
+        "[fs] started, disk=",
+        "[block] started, disk=",
         "bsh>",
     ];
 
@@ -896,7 +903,7 @@ fn qemu_smoke() -> anyhow::Result<()> {
     println!("  serial log: {}", serial_log.display());
     println!();
 
-    let qemu_args = vec![
+    let mut qemu_args = vec![
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
         "-m".to_string(), "2G".to_string(),
@@ -907,6 +914,15 @@ fn qemu_smoke() -> anyhow::Result<()> {
         "-serial".to_string(), "chardev:c0".to_string(),
         "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
     ];
+
+    if disk_img.exists() {
+        qemu_args.extend_from_slice(&[
+            "-drive".to_string(),
+            format!("file={},format=raw,if=none,id=disk0", disk_img.display()),
+            "-device".to_string(),
+            "virtio-blk-device,drive=disk0".to_string(),
+        ]);
+    }
 
     let mut child = Command::new("qemu-system-aarch64")
         .args(&qemu_args)

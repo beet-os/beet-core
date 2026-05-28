@@ -17,6 +17,7 @@ members = [
     "api/procman",
     "api/fs",
     "api/storage",
+    "api/block",
     "os/app-manifest",
     "xous/async-rt",
     "examples/async-demo",
@@ -31,6 +32,7 @@ exclude = [
     "os/procman",
     "os/fs",
     "os/log",
+    "os/block",
     "apps/coreutils",
     "apps/beetos-test",
 ]

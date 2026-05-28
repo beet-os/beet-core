@@ -516,6 +516,12 @@ static PROCMAN_ELF: &[u8] = include_bytes!(
 static FS_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/fs.stripped")
 );
+/// Block service: per-platform storage drivers behind a single IPC
+/// interface. Owns the disk mapping (transitionally also mapped into
+/// fs for back-compat with the current tarfs reader).
+static BLOCK_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/block.stripped")
+);
 /// Log server: forwards stdout/stderr/panic IPC messages to the UART.
 /// Must be launched before any std process that calls println!.
 static LOG_ELF: &[u8] = include_bytes!(
@@ -542,6 +548,7 @@ static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("shell", SHELL_ELF),
     ("procman", PROCMAN_ELF),
     ("fs", FS_ELF),
+    ("block", BLOCK_ELF),
 ];
 
 #[cfg(feature = "test-mode")]
@@ -552,6 +559,7 @@ static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("shell", SHELL_ELF),
     ("procman", PROCMAN_ELF),
     ("fs", FS_ELF),
+    ("block", BLOCK_ELF),
 ];
 
 /// Look up a binary by name in the embedded binary table.
@@ -564,7 +572,7 @@ pub fn lookup_binary(name: &str) -> Option<&'static [u8]> {
     None
 }
 
-const INTERNAL_SERVICES: &[&str] = &["log", "idle", "shell", "procman", "fs", "beetos-test"];
+const INTERNAL_SERVICES: &[&str] = &["log", "idle", "shell", "procman", "fs", "block", "beetos-test"];
 
 /// Return the nth user-spawnable program name (skipping internal services).
 /// Returns None when index is out of range.
@@ -675,19 +683,26 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let fs_pid = PID::new(5).unwrap();
     create_elf_process(fs_pid, FS_ELF, b"fs", beetos::PERM_FS_SERVER);
 
-    // PID 6: beetos-test in test-mode only (hello-std is spawnable from the shell).
+    // PID 6: block service. Owns the storage drivers and serves IPC
+    // to the FS service (today still parallel-mapped into FS for the
+    // existing tarfs reader; transitional, will become the sole disk
+    // accessor once FS is migrated).
+    let block_pid = PID::new(6).unwrap();
+    create_elf_process(block_pid, BLOCK_ELF, b"block", beetos::PERM_FS_SERVER);
+
+    // PID 7: beetos-test in test-mode only (hello-std is spawnable from the shell).
     #[cfg(feature = "test-mode")]
-    let app_pid = PID::new(6).unwrap();
+    let app_pid = PID::new(7).unwrap();
     #[cfg(feature = "test-mode")]
     create_elf_process(app_pid, TEST_ELF, b"beetos-test", beetos::PERM_USER_PROGRAM);
 
-    // Map UART MMIO into log, procman, shell, fs (and beetos-test in test-mode).
+    // Map UART MMIO into log, procman, shell, fs, block (and beetos-test in test-mode).
     #[cfg(feature = "platform-qemu-virt")]
     {
         #[cfg(not(feature = "test-mode"))]
-        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid];
+        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid, block_pid];
         #[cfg(feature = "test-mode")]
-        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid, app_pid];
+        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid, block_pid, app_pid];
         crate::services::SystemServices::with_mut(|ss| {
             crate::mem::MemoryManager::with_mut(|mm| {
                 for &pid in uart_pids {
@@ -753,24 +768,29 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
                     }
 
                     if read_ok {
-                        // Map disk pages read-only into the fs service's address space
+                        // Map disk pages read-only into BOTH fs and block services.
+                        // Transitional: fs still reads tarfs directly while we
+                        // wire the IPC path; block needs the same pages so it
+                        // can serve ReadBlocks once fs is migrated.
                         crate::services::SystemServices::with_mut(|ss| {
                             crate::mem::MemoryManager::with_mut(|mm| {
-                                let process = ss.process_mut(fs_pid).expect("fs process");
-                                for i in 0..disk_pages {
-                                    let va = DISK_DATA_VA + i * beetos::PAGE_SIZE;
-                                    process.mapping.map_page(
-                                        mm,
-                                        disk_phys_pages[i],
-                                        va as *mut usize,
-                                        xous::MemoryFlags::empty(),
-                                        true,
-                                    ).ok();
+                                for &pid in &[fs_pid, block_pid] {
+                                    let process = ss.process_mut(pid).expect("disk-map process");
+                                    for i in 0..disk_pages {
+                                        let va = DISK_DATA_VA + i * beetos::PAGE_SIZE;
+                                        process.mapping.map_page(
+                                            mm,
+                                            disk_phys_pages[i],
+                                            va as *mut usize,
+                                            xous::MemoryFlags::empty(),
+                                            true,
+                                        ).ok();
+                                    }
                                 }
                             });
                         });
 
-                        crate::platform::qemu_virt::uart::puts("Disk: mapped into fs service\n");
+                        crate::platform::qemu_virt::uart::puts("Disk: mapped into fs+block services\n");
                         (DISK_DATA_VA, disk_bytes)
                     } else {
                         crate::platform::qemu_virt::uart::puts("Disk: read failed\n");
@@ -789,6 +809,7 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     //   procman: x0 = UART VA
     //   shell:   x0 = UART VA
     //   fs:      x0 = UART VA, x1 = disk VA, x2 = disk size
+    //   block:   x0 = UART VA, x1 = disk VA, x2 = disk size
     // The framebuffer is no longer passed via register — processes acquire
     // it through the AcquireDisplay syscall, which maps it at SHELL_FB_VA.
     {
@@ -805,6 +826,10 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     }
     {
         let idx = fs_pid.get() as usize - 1;
+        super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
+    }
+    {
+        let idx = block_pid.get() as usize - 1;
         super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
     }
     #[cfg(feature = "test-mode")]

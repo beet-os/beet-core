@@ -53,6 +53,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "beetos-api-block"
+version = "0.1.0"
+
+[[package]]
 name = "beetos-api-console"
 version = "0.1.0"
 dependencies = [
