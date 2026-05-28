@@ -220,7 +220,13 @@ fn handle_irq() -> bool {
         let is_timer = irq == timer::TIMER_IRQ;
 
         match irq {
-            timer::TIMER_IRQ => { timer::handle_tick(); }
+            timer::TIMER_IRQ => {
+                let count = timer::handle_tick();
+                // Same 10 Hz GUI recompose path as qemu_virt, so the
+                // RPi5 desktop animates (clock, Snake, Life, Mandel,
+                // spinner) without explicit input.
+                crate::platform::bcm2712::fb::tick_recompose_if_due(count);
+            }
             irq_id => {
                 use core::fmt::Write;
                 let _ = write!(crate::platform::bcm2712::uart::UartWriter, "IRQ {}\n", irq_id);
