@@ -184,24 +184,23 @@ pub enum BlkError {
 pub struct VirtioBlk;
 
 impl beetos_api_storage::BlockDevice for VirtioBlk {
-    fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), beetos_api_storage::BlockError> {
+    fn block_size(&self) -> u32 { 512 }
+    fn capacity_blocks(&self) -> u64 { capacity() }
+
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), beetos_api_storage::BlockError> {
         read_sectors(lba, buf).map_err(|e| match e {
             BlkError::OutOfRange => beetos_api_storage::BlockError::OutOfRange,
             BlkError::NoDevice   => beetos_api_storage::BlockError::NotReady,
-            _                    => beetos_api_storage::BlockError::IoError,
+            _                    => beetos_api_storage::BlockError::Io,
         })
     }
 
-    fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), beetos_api_storage::BlockError> {
+    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), beetos_api_storage::BlockError> {
         write_sectors(lba, buf).map_err(|e| match e {
             BlkError::OutOfRange => beetos_api_storage::BlockError::OutOfRange,
             BlkError::NoDevice   => beetos_api_storage::BlockError::NotReady,
-            _                    => beetos_api_storage::BlockError::IoError,
+            _                    => beetos_api_storage::BlockError::Io,
         })
-    }
-
-    fn capacity_sectors(&self) -> u64 {
-        capacity()
     }
 }
 

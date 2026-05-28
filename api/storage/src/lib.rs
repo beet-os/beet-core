@@ -3,54 +3,72 @@
 
 //! BeetOS block storage API.
 //!
-//! Platform-agnostic traits for block devices (virtio-blk on QEMU,
-//! SD card on RPi5, NVMe on Apple M1). Drivers implement `BlockDevice`;
-//! the filesystem service depends only on this crate, not on any
-//! platform-specific driver.
+//! Platform-agnostic traits for block devices. Drivers implement
+//! [`BlockDevice`]; the filesystem service depends only on this
+//! crate, not on any platform-specific driver.
+//!
+//! Implementations today live in `xous/kernel/src/block.rs`:
+//!
+//!   - `SdBlockDevice<'_, M>` — wraps an SDHCI host (RPi5 SD slot)
+//!   - `NvmeBlockDevice<T>`   — wraps an NVMe transport (Apple ANS,
+//!                              future PCIe NVMe)
+//!   - `MemBlockDevice`       — hosted-mode Vec<u8>-backed
+//!   - `FileBlockDevice`      — hosted-mode std::fs::File-backed
+//!     (the `cargo run` dev loop reads a `target/sd.img` through this)
 
 #![no_std]
 
-/// Size of a single block in bytes. All I/O is aligned to this boundary.
-pub const BLOCK_SIZE: usize = 512;
+/// Legacy hint — every "SDHC-class" card uses this. Modern NVMe
+/// drives use 4 KB. Call [`BlockDevice::block_size`] for the
+/// real per-device value rather than relying on this constant.
+pub const SECTOR_SIZE: usize = 512;
 
 /// Errors returned by block device operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockError {
-    /// Hardware or transport error during the operation.
-    IoError,
-    /// Requested LBA is beyond the end of the device.
+    /// `lba + n_blocks` would extend past `capacity_blocks()`.
     OutOfRange,
-    /// Device is not yet initialized or not present.
+    /// Buffer length is not an exact non-zero multiple of `block_size()`.
+    BadBuffer,
+    /// Underlying hardware / transport timed out.
+    Timeout,
+    /// Hardware reported an error status (CRC, data, controller-specific).
+    Io,
+    /// Device is not initialised yet.
     NotReady,
+    /// Anything else we don't yet model.
+    Other,
 }
 
 /// Platform-agnostic block device interface.
 ///
-/// Implementors: `VirtioBlk` (QEMU), SD card driver (RPi5), NVMe (Apple M1).
-///
-/// All operations are synchronous (polling). IRQ-driven I/O is a future
-/// optimization and will not change this interface.
+/// All methods take `&mut self` because real drivers serialise on
+/// per-device state (controller command queues, mailbox channels,
+/// MMIO registers). Backends that genuinely want shared access can
+/// wrap themselves in `Mutex` / `RefCell` at the call site.
 ///
 /// # Buffer requirements
 ///
-/// `buf` must be a multiple of `BLOCK_SIZE` bytes. The number of sectors
-/// transferred equals `buf.len() / BLOCK_SIZE`.
+/// Every read / write buffer must be a non-zero multiple of
+/// [`BlockDevice::block_size`]. The number of blocks transferred is
+/// `buf.len() / block_size()`.
 pub trait BlockDevice {
-    /// Read sectors starting at `lba` into `buf`.
-    ///
-    /// `buf.len()` must be a non-zero multiple of `BLOCK_SIZE`.
-    fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError>;
+    /// Bytes per logical block. Almost always 512 on SDHC and 4096
+    /// on modern NVMe; the FS layer treats this as the device's
+    /// native I/O granularity.
+    fn block_size(&self) -> u32;
 
-    /// Write sectors from `buf` starting at `lba`.
-    ///
-    /// `buf.len()` must be a non-zero multiple of `BLOCK_SIZE`.
-    fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
+    /// Number of logical blocks the device exposes.
+    fn capacity_blocks(&self) -> u64;
 
-    /// Total device capacity in 512-byte sectors.
-    fn capacity_sectors(&self) -> u64;
-
-    /// Total device capacity in bytes.
+    /// Convenience: `block_size() * capacity_blocks()`.
     fn capacity_bytes(&self) -> u64 {
-        self.capacity_sectors() * BLOCK_SIZE as u64
+        self.block_size() as u64 * self.capacity_blocks()
     }
+
+    /// Read `buf.len() / block_size()` blocks starting at `lba` into `buf`.
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError>;
+
+    /// Write `buf.len() / block_size()` blocks starting at `lba` from `buf`.
+    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
 }

@@ -1,69 +1,27 @@
 // SPDX-FileCopyrightText: 2025 BeetOS contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Generic block-device abstraction over [`crate::sdhci`],
-//! [`crate::nvme`], and any future storage transport (virtio-blk,
-//! PCIe NVMe, hosted-mode file-backed).
+//! Kernel-side block-device backends. The shared
+//! [`BlockDevice`](beetos_api_storage::BlockDevice) trait + error
+//! enum live in `api/storage` so the FS service (and any future
+//! raw-block tool) can consume them without depending on a
+//! platform module.
 //!
-//! Why this lives at the kernel top level:
+//! Implementations in this file:
 //!
-//! - The protocol layers (`sdhci`, `nvme`) describe **commands**
-//!   on a wire. The platform glue (`platform/bcm2712/sdhci_brcm`,
-//!   future `platform/apple_t8103/ans`) wires those commands to
-//!   real MMIO. Neither of them is what a filesystem or an app
-//!   wants to use — both want "give me block N" or "write block N".
-//! - A single shared trait lets the FS service (and future raw-
-//!   block tools) treat every storage backend identically. SDHCI on
-//!   RPi5, ANS NVMe on M1, hosted-mode file under `cargo run`,
-//!   virtio-blk on QEMU virt — same call, different impl.
-//! - Tests live here so the contract is enforced by code, not
-//!   docstrings: the suite below runs the same WRITE-then-READ
-//!   round-trip against three different backends and asserts they
-//!   all behave identically.
+//!   - `SdBlockDevice<'_, M>`  — wraps an SDHCI Host (RPi5 SD slot)
+//!   - `NvmeBlockDevice<T>`    — wraps an NVMe Transport (Apple ANS,
+//!                               future PCIe NVMe)
+//!   - `MemBlockDevice`        — hosted-mode Vec<u8> backing
+//!   - `FileBlockDevice`       — hosted-mode std::fs::File backing
+//!
+//! Why both kernel-internal SD/NVMe AND hosted Mem/File live here:
+//! both flavours target the same trait, so they share the same
+//! contract test (the `round_trip<D: BlockDevice>` body below) and
+//! the same docstring story. The hosted backends are what the
+//! `cargo run` dev loop uses; the SD/NVMe ones drive real hardware.
 
-use core::result::Result;
-
-/// Errors common to every block device.  Backend-specific failure
-/// modes get mapped onto these on the way out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockError {
-    /// `lba + n_blocks` would extend past `capacity_blocks()`.
-    OutOfRange,
-    /// Buffer length is not an exact multiple of `block_size()`.
-    BadBuffer,
-    /// Underlying hardware / transport timed out.
-    Timeout,
-    /// Underlying hardware returned an error status (CRC, data, etc.).
-    Io,
-    /// Device reported a condition we don't yet handle.
-    Other,
-}
-
-/// What a storage backend has to provide. All methods take `&mut self`
-/// because real drivers serialise on per-device state (controller
-/// command queues, mailbox channels, MMIO registers).
-pub trait BlockDevice {
-    /// Bytes per logical block. Almost always 512 on SDHC and 4096 on
-    /// modern NVMe; the FS layer treats this as "device's native
-    /// granularity".
-    fn block_size(&self) -> u32;
-
-    /// Number of logical blocks the device exposes. `capacity_bytes()`
-    /// is `block_size() * capacity_blocks()`.
-    fn capacity_blocks(&self) -> u64;
-
-    fn capacity_bytes(&self) -> u64 {
-        self.block_size() as u64 * self.capacity_blocks()
-    }
-
-    /// Read `buf.len() / block_size()` blocks starting at `lba` into
-    /// `buf`. `buf` must be an exact multiple of `block_size()`.
-    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError>;
-
-    /// Write `buf.len() / block_size()` blocks starting at `lba`
-    /// from `buf`.
-    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
-}
+pub use beetos_api_storage::{BlockDevice, BlockError};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hosted backend: file-backed block device for `cargo run` / tests.
