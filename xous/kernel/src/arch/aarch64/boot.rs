@@ -181,7 +181,7 @@ pub unsafe fn parse_fdt_ram(fdt_ptr: *const u8) -> Option<RamRegion> {
 ///
 /// Currently only the qemu_virt platform consumes this — the other
 /// platforms still rely on hardcoded defaults pending FDT wiring.
-#[cfg(feature = "platform-qemu-virt")]
+#[cfg(any(feature = "platform-qemu-virt", feature = "platform-bcm2712"))]
 pub struct MmioAddrs {
     pub uart0_phys: Option<usize>,
     pub gicd_phys:  Option<usize>,
@@ -193,7 +193,7 @@ pub struct MmioAddrs {
 /// Compatible values are lists of null-terminated strings, e.g.
 /// `"arm,pl011\0arm,primecell\0"`.  We match whole entries to avoid
 /// false positives (e.g. `"arm,pl011-r2"` would be a different peripheral).
-#[cfg(feature = "platform-qemu-virt")]
+#[cfg(any(feature = "platform-qemu-virt", feature = "platform-bcm2712"))]
 unsafe fn compat_has(data: *const u8, len: usize, target: &[u8]) -> bool {
     let haystack = core::slice::from_raw_parts(data, len);
     let mut start = 0;
@@ -228,7 +228,7 @@ unsafe fn compat_has(data: *const u8, len: usize, target: &[u8]) -> bool {
 /// # Safety
 ///
 /// `fdt_ptr` must point to a valid FDT blob accessible through TTBR1.
-#[cfg(feature = "platform-qemu-virt")]
+#[cfg(any(feature = "platform-qemu-virt", feature = "platform-bcm2712"))]
 pub unsafe fn parse_fdt_mmio(fdt_ptr: *const u8) -> MmioAddrs {
     let mut result = MmioAddrs { uart0_phys: None, gicd_phys: None, gicr_phys: None };
 

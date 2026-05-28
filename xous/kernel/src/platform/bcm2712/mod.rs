@@ -28,15 +28,43 @@ mod defaults {
 
 /// Initialize the BCM2712 platform.
 ///
-/// `fdt_phys` is the FDT physical address (reserved for future FDT-based
-/// address discovery). Currently uses hardcoded defaults from the RPi5 device tree.
-pub fn init(_fdt_phys: *const u8) {
-    uart::init(defaults::UART0_BASE);
+/// `fdt_phys` is the FDT physical address passed by the RPi firmware
+/// (kernel8.img is jumped to with x0 = FDT phys per the standard
+/// Linux ARM64 boot protocol). We discover the UART and GIC MMIO
+/// addresses from the FDT — RPi5's device tree advertises
+/// `arm,pl011` and `arm,gic-v3` exactly like QEMU virt does, so the
+/// same parser in arch/aarch64/boot.rs handles both. If FDT parsing
+/// finds nothing (e.g. when chain-loaded from a non-Linux bootloader
+/// that doesn't pass a DTB), we fall back to the compiled-in
+/// BCM2712-defaults so the boot at least tries something sensible.
+pub fn init(fdt_phys: *const u8) {
+    let mmio = unsafe {
+        crate::arch::boot::parse_fdt_mmio(
+            beetos::phys_to_virt(fdt_phys as usize) as *const u8,
+        )
+    };
+
+    let uart0_phys = mmio.uart0_phys.unwrap_or(defaults::UART0_BASE);
+    let gicd_phys  = mmio.gicd_phys.unwrap_or(defaults::GICD_BASE);
+    let gicr_phys  = mmio.gicr_phys.unwrap_or(defaults::GICR_BASE);
+
+    uart::init(uart0_phys);
     uart::puts("BeetOS v0.1.0\n");
     uart::puts("Platform: Raspberry Pi 5 (BCM2712 / AArch64)\n");
 
-    gic::init(defaults::GICD_BASE, defaults::GICR_BASE);
-    uart::puts("GIC: initialized\n");
+    if mmio.uart0_phys.is_some() {
+        uart::puts("UART: address from FDT\n");
+    } else {
+        uart::puts("UART: address from default (FDT not found)\n");
+    }
+
+    gic::init(gicd_phys, gicr_phys);
+
+    if mmio.gicd_phys.is_some() {
+        uart::puts("GIC: initialized (address from FDT)\n");
+    } else {
+        uart::puts("GIC: initialized (address from default)\n");
+    }
 
     timer::init();
     uart::puts("Timer: initialized\n");
