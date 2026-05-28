@@ -252,6 +252,24 @@ fn keycode_to_ascii(code: u16, shift: bool) -> Option<u8> {
         52 => if shift { b'>'  } else { b'.'  },
         53 => if shift { b'?'  } else { b'/'  },
 
+        // Numeric keypad — useful for driving the GUI calculator directly
+        // without modifier juggling. Codes per Linux evdev (KEY_KP*).
+        71 => b'7',
+        72 => b'8',
+        73 => b'9',
+        75 => b'4',
+        76 => b'5',
+        77 => b'6',
+        79 => b'1',
+        80 => b'2',
+        81 => b'3',
+        82 => b'0',
+        83 => b'.',
+        55 => b'*',
+        74 => b'-',
+        78 => b'+',
+        98 => b'/',
+
         _ => return None,
     };
     Some(c)

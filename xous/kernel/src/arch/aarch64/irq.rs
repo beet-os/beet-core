@@ -229,6 +229,17 @@ fn handle_irq() -> bool {
 fn dispatch_input_char(c: u8) {
     use crate::services::SystemServices;
 
+    // GUI-first routing: if any GUI window is focused, the kernel-side
+    // WindowManager consumes the keystroke and triggers a recompose.
+    // We only fall through to the IPC path when no window wanted the
+    // key. This lets the shell keep working when the desktop has no
+    // focused interactive window.
+    let consumed = crate::platform::qemu_virt::fb::with_wm(|wm| wm.handle_key(c));
+    if consumed {
+        crate::platform::qemu_virt::fb::compose_desktop();
+        return;
+    }
+
     SystemServices::with_mut(|ss| {
         match ss.display_input_sid() {
             Some(sid_words) => deliver_char_to_sid(ss, sid_words, c),

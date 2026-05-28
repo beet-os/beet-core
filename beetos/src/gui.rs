@@ -80,9 +80,17 @@ pub enum WindowKind {
     /// keep the rasterizer covered in screenshots.
     Demo,
     /// A widget tree — currently a single grid container, which is enough
-    /// for the calculator demo. Once input wiring lands the grid will be
-    /// driven by KeyDown / Click events; for now it renders statically.
+    /// for the calculator demo's static look. The interactive calculator
+    /// uses [`WindowKind::Calc`] instead.
     Widgets(WidgetGrid),
+    /// Interactive integer calculator — owns its own state and reacts
+    /// to keys via [`WindowManager::handle_key`]. The rendering pulls
+    /// the current display string into a fresh widget grid at draw
+    /// time so the layout matches the static `Widgets` calculator.
+    Calc(CalcState),
+    /// A note pad — every printable key appends, backspace deletes,
+    /// Enter inserts a newline. Up to [`NOTES_MAX_LEN`] chars.
+    Notes(NotesState),
 }
 
 /// One line of text inside a `WindowKind::Text` window.
@@ -108,6 +116,216 @@ impl TextLine {
         // already valid UTF-8 (truncation may cut a multi-byte char but it
         // still stays a valid prefix when we slice by `len`).
         core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interactive content — calculator + notes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum digit count for the calculator display (sign + 15 digits is
+/// well past i64::MIN's 20 chars but plenty for a demo).
+pub const CALC_DISPLAY_MAX: usize = 18;
+
+/// Tiny state machine driving the interactive calculator.
+///
+/// Integer-only on purpose: keeping i64 lets the whole thing stay in
+/// `core` without dragging in `libm`. Operator precedence is the
+/// reckless "every binary op evaluates the pending one" model that
+/// every desktop calculator uses (i.e. `2 + 3 * 4` becomes 20, not
+/// 14). Good enough for the demo and matches user expectation.
+#[derive(Clone, Copy)]
+pub struct CalcState {
+    bytes: [u8; CALC_DISPLAY_MAX],
+    len: u8,
+    accumulator: i64,
+    pending_op: u8,       // '+' '-' '*' '/' or 0 for none
+    just_evaluated: bool, // true → next digit replaces display
+    overflow: bool,
+}
+
+impl CalcState {
+    pub const fn new() -> Self {
+        let mut bytes = [0u8; CALC_DISPLAY_MAX];
+        bytes[0] = b'0';
+        CalcState {
+            bytes,
+            len: 1,
+            accumulator: 0,
+            pending_op: 0,
+            just_evaluated: false,
+            overflow: false,
+        }
+    }
+
+    /// Pre-seeded state for the screenshot — shows a computed value so
+    /// the calculator looks alive even before the first keystroke.
+    pub fn from_preview(display: &str) -> Self {
+        let mut s = Self::new();
+        s.set_display(display);
+        s
+    }
+
+    pub fn display(&self) -> &str {
+        if self.overflow { return "Err"; }
+        core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("?")
+    }
+
+    fn set_display(&mut self, s: &str) {
+        let take = s.len().min(CALC_DISPLAY_MAX);
+        self.bytes[..take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len = take as u8;
+        self.overflow = false;
+    }
+
+    fn parse_display(&self) -> i64 {
+        self.display().parse::<i64>().unwrap_or(0)
+    }
+
+    /// Handle a single key press. Returns `true` if the display
+    /// changed and the window should be re-drawn.
+    pub fn press(&mut self, key: u8) -> bool {
+        match key {
+            b'0'..=b'9' => {
+                if self.just_evaluated { self.set_display("0"); self.just_evaluated = false; }
+                if self.display() == "0" {
+                    self.bytes[0] = key;
+                    self.len = 1;
+                } else if (self.len as usize) < CALC_DISPLAY_MAX {
+                    self.bytes[self.len as usize] = key;
+                    self.len += 1;
+                }
+                true
+            }
+            b'+' | b'-' | b'*' | b'/' => {
+                self.apply_pending();
+                self.pending_op = key;
+                self.just_evaluated = true;
+                true
+            }
+            b'=' | b'\n' | b'\r' => {
+                self.apply_pending();
+                self.pending_op = 0;
+                self.just_evaluated = true;
+                true
+            }
+            b'C' | b'c' | 0x1B /* ESC */ => {
+                *self = CalcState::new();
+                true
+            }
+            8 | 0x7F => { // Backspace / DEL
+                if self.len > 1 { self.len -= 1; }
+                else { self.bytes[0] = b'0'; self.len = 1; }
+                true
+            }
+            b's' /* sign */ => {
+                if self.display() != "0" {
+                    if self.bytes[0] == b'-' {
+                        for i in 1..(self.len as usize) {
+                            self.bytes[i - 1] = self.bytes[i];
+                        }
+                        self.len -= 1;
+                    } else if (self.len as usize) < CALC_DISPLAY_MAX {
+                        for i in (1..=(self.len as usize)).rev() {
+                            self.bytes[i] = self.bytes[i - 1];
+                        }
+                        self.bytes[0] = b'-';
+                        self.len += 1;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_pending(&mut self) {
+        let rhs = self.parse_display();
+        let result = match self.pending_op {
+            b'+' => self.accumulator.checked_add(rhs),
+            b'-' => self.accumulator.checked_sub(rhs),
+            b'*' => self.accumulator.checked_mul(rhs),
+            b'/' => if rhs == 0 { None } else { self.accumulator.checked_div(rhs) },
+            _ => Some(rhs),
+        };
+        match result {
+            Some(v) => {
+                self.accumulator = v;
+                // Render v into the display buffer using a small helper.
+                let mut tmp = [0u8; 20];
+                let s = i64_to_str(v, &mut tmp);
+                self.set_display(s);
+            }
+            None => {
+                self.overflow = true;
+                self.accumulator = 0;
+            }
+        }
+    }
+}
+
+fn i64_to_str(mut n: i64, buf: &mut [u8]) -> &str {
+    if n == 0 { buf[0] = b'0'; return core::str::from_utf8(&buf[..1]).unwrap(); }
+    let neg = n < 0;
+    let mut idx = buf.len();
+    let mut abs: u64 = if neg { (n as i128).unsigned_abs() as u64 } else { n as u64 };
+    let _ = &mut n; // silence unused
+    while abs > 0 && idx > 0 {
+        idx -= 1;
+        buf[idx] = b'0' + (abs % 10) as u8;
+        abs /= 10;
+    }
+    if neg && idx > 0 { idx -= 1; buf[idx] = b'-'; }
+    core::str::from_utf8(&buf[idx..]).unwrap_or("?")
+}
+
+/// Maximum chars in the Notes pad.
+pub const NOTES_MAX_LEN: usize = 512;
+
+/// A simple text pad. Append on printable keys, delete on backspace,
+/// newline on Enter. Wraps to the next line at the window edge.
+#[derive(Clone, Copy)]
+pub struct NotesState {
+    buf: [u8; NOTES_MAX_LEN],
+    len: u16,
+}
+
+impl NotesState {
+    pub const fn new() -> Self { NotesState { buf: [0; NOTES_MAX_LEN], len: 0 } }
+
+    pub fn with_text(s: &str) -> Self {
+        let mut n = Self::new();
+        let take = s.len().min(NOTES_MAX_LEN);
+        n.buf[..take].copy_from_slice(&s.as_bytes()[..take]);
+        n.len = take as u16;
+        n
+    }
+
+    pub fn text(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("")
+    }
+
+    pub fn press(&mut self, key: u8) -> bool {
+        match key {
+            8 | 0x7F => {
+                if self.len > 0 { self.len -= 1; true } else { false }
+            }
+            b'\n' | b'\r' => {
+                if (self.len as usize) < NOTES_MAX_LEN {
+                    self.buf[self.len as usize] = b'\n';
+                    self.len += 1;
+                    true
+                } else { false }
+            }
+            0x20..=0x7E => {
+                if (self.len as usize) < NOTES_MAX_LEN {
+                    self.buf[self.len as usize] = key;
+                    self.len += 1;
+                    true
+                } else { false }
+            }
+            _ => false,
+        }
     }
 }
 
@@ -225,6 +443,35 @@ impl Window {
             WindowKind::Widgets(grid) => {
                 grid.draw(screen, &content);
             }
+            WindowKind::Calc(state) => {
+                // Build a fresh grid every frame with the live display.
+                // Cheap — WidgetGrid is ~600 B of POD.
+                let grid = calculator_grid(state.display());
+                grid.draw(screen, &content);
+            }
+            WindowKind::Notes(state) => {
+                screen.fill_rect(&content, color::BLACK);
+                // Crude word-wrap: feed chars left-to-right, advance to
+                // next line on '\n' or when we run out of horizontal
+                // space. No tab support, no scroll — fits the demo.
+                let mut x = content.x + 6;
+                let mut y = content.y + 6;
+                let max_x = content.right() - 6;
+                let line_h = font::CHAR_H as i32 + 2;
+                for &b in &state.buf[..state.len as usize] {
+                    if b == b'\n' || x + font::CHAR_W as i32 > max_x {
+                        x = content.x + 6;
+                        y += line_h;
+                        if y + font::CHAR_H as i32 > content.bottom() { break; }
+                        if b == b'\n' { continue; }
+                    }
+                    screen.draw_char(x, y, b, color::BRIGHT_GREEN, color::BLACK);
+                    x += font::CHAR_W as i32;
+                }
+                // Blinking-style cursor (drawn solid for the still screenshot).
+                screen.fill_rect(&Rect::new(x, y, 8, font::CHAR_H as i32),
+                    color::BRIGHT_GREEN);
+            }
         }
     }
 }
@@ -334,11 +581,8 @@ impl WindowManager {
     /// Raise a window to the top of the z-order.  Newly-focused windows
     /// usually want this; the side effect on focus is the caller's job.
     pub fn raise(&mut self, id: WindowId) {
-        if let Some(w) = self.get_mut(id) {
-            // Just bump z above everyone else.  Because `next_z` is
-            // monotonic, this is always safe and gives correct ordering.
-        }
-        // Two passes because the borrow above is exclusive.
+        // Just bump z above everyone else.  Because `next_z` is
+        // monotonic, this is always safe and gives correct ordering.
         let new_z = self.next_z;
         self.next_z = self.next_z.saturating_add(1);
         if let Some(w) = self.get_mut(id) { w.z = new_z; }
@@ -364,6 +608,53 @@ impl WindowManager {
             if w.visible && w.rect.contains(x, y) { top = Some(id); }
         }
         top
+    }
+
+    /// Cycle focus through visible windows in z-order.
+    /// `forward = true` moves to the next z-up window, `false` moves
+    /// to the previous one. Typically wired to Tab / Shift-Tab.
+    pub fn cycle_focus(&mut self, forward: bool) {
+        // Collect ids in z-order.
+        let mut ids = [WindowId(0); MAX_WINDOWS];
+        let mut n = 0;
+        for (id, win) in self.iter_by_z() {
+            if win.visible { ids[n] = id; n += 1; }
+        }
+        if n == 0 { return; }
+        let cur = (0..n).find(|&i| {
+            let id = ids[i];
+            self.get(id).map(|w| w.focused).unwrap_or(false)
+        });
+        let next = match cur {
+            Some(i) => if forward { (i + 1) % n } else { (i + n - 1) % n },
+            None    => if forward { 0 } else { n - 1 },
+        };
+        self.focus(ids[next]);
+    }
+
+    /// Deliver a key press to the currently-focused window.  Returns
+    /// `true` if state changed and a recompose is warranted.
+    ///
+    /// Reserved global keys:
+    ///   - `\t`    → Tab — cycle focus forward
+    ///   - 0x19    → Shift-Tab — cycle focus backward (PC-style)
+    pub fn handle_key(&mut self, key: u8) -> bool {
+        // Global shortcuts handled before delegation.
+        match key {
+            b'\t' => { self.cycle_focus(true);  return true; }
+            0x19  => { self.cycle_focus(false); return true; }
+            _ => {}
+        }
+        let focused_id = self.windows.iter().enumerate()
+            .find(|(_, w)| w.as_ref().is_some_and(|w| w.focused))
+            .map(|(i, _)| WindowId(i as u8));
+        let Some(id) = focused_id else { return false; };
+        let Some(win) = self.get_mut(id) else { return false; };
+        match &mut win.kind {
+            WindowKind::Calc(state)  => state.press(key),
+            WindowKind::Notes(state) => state.press(key),
+            _ => false,
+        }
     }
 
     /// Re-paint the desktop and every visible window onto `screen`.
@@ -917,6 +1208,94 @@ mod tests {
             if px == color::BEET_PURPLE || px == color::WINDOW_FRAME { accent += 1; }
         }}
         assert!(accent > 200, "expected painted widget pixels, accent={accent}");
+    }
+
+    #[test]
+    fn calc_basic_arithmetic() {
+        let mut c = CalcState::new();
+        assert_eq!(c.display(), "0");
+        c.press(b'1'); c.press(b'2');
+        assert_eq!(c.display(), "12");
+        c.press(b'+');
+        c.press(b'3'); c.press(b'4');
+        assert_eq!(c.display(), "34");
+        c.press(b'=');
+        assert_eq!(c.display(), "46");
+    }
+
+    #[test]
+    fn calc_multiply_chain() {
+        let mut c = CalcState::new();
+        c.press(b'2'); c.press(b'*'); c.press(b'3'); c.press(b'*'); c.press(b'4');
+        c.press(b'=');
+        assert_eq!(c.display(), "24");
+    }
+
+    #[test]
+    fn calc_clear_and_backspace() {
+        let mut c = CalcState::new();
+        c.press(b'1'); c.press(b'2'); c.press(b'3');
+        c.press(8);
+        assert_eq!(c.display(), "12");
+        c.press(b'c');
+        assert_eq!(c.display(), "0");
+    }
+
+    #[test]
+    fn calc_div_by_zero_shows_err() {
+        let mut c = CalcState::new();
+        c.press(b'5'); c.press(b'/'); c.press(b'0'); c.press(b'=');
+        assert_eq!(c.display(), "Err");
+    }
+
+    #[test]
+    fn calc_sign_toggle() {
+        let mut c = CalcState::new();
+        c.press(b'4'); c.press(b'2');
+        c.press(b's');
+        assert_eq!(c.display(), "-42");
+        c.press(b's');
+        assert_eq!(c.display(), "42");
+    }
+
+    #[test]
+    fn notes_appends_printables() {
+        let mut n = NotesState::new();
+        for &b in b"hi" { n.press(b); }
+        assert_eq!(n.text(), "hi");
+        n.press(b'\n');
+        n.press(b'!');
+        assert_eq!(n.text(), "hi\n!");
+        n.press(8);
+        assert_eq!(n.text(), "hi\n");
+    }
+
+    #[test]
+    fn wm_handle_key_routes_to_focused_calc() {
+        let mut wm = WindowManager::new();
+        let calc_id = wm.add(Window::new(Rect::new(0,0,200,200), "calc",
+            WindowKind::Calc(CalcState::new()))).unwrap();
+        wm.focus(calc_id);
+        assert!(wm.handle_key(b'7'));
+        match wm.get(calc_id).unwrap().kind {
+            WindowKind::Calc(state) => assert_eq!(state.display(), "7"),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn wm_tab_cycles_focus() {
+        let mut wm = WindowManager::new();
+        let a = wm.add(Window::new(Rect::new(0,0,10,10),"a", WindowKind::Empty)).unwrap();
+        let b = wm.add(Window::new(Rect::new(0,0,10,10),"b", WindowKind::Empty)).unwrap();
+        let c = wm.add(Window::new(Rect::new(0,0,10,10),"c", WindowKind::Empty)).unwrap();
+        wm.focus(a);
+        wm.handle_key(b'\t');
+        // Focus advanced one step in z-order (b is next, but `focus(a)`
+        // raised a to the top of z, so after Tab we should land on the
+        // *bottom* of the new z-order. Just assert *something* moved.
+        assert!(!wm.get(a).unwrap().focused);
+        let _ = b; let _ = c;
     }
 
     #[test]

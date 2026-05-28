@@ -20,7 +20,8 @@ use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 use beetos::gfx::{color, Color, Rect, Surface};
 use beetos::gui::{
-    about_grid, calculator_grid, TextLine, Window, WindowKind, WindowManager, MAX_TEXT_LINES,
+    about_grid, CalcState, NotesState, TextLine, Window, WindowKind, WindowManager,
+    MAX_TEXT_LINES,
 };
 use beetos::{phys_to_virt, virt_to_phys};
 
@@ -458,15 +459,28 @@ pub fn populate_demo_desktop() {
         );
         let _ = wm.add(demo);
 
-        // Window 5 — calculator (right side).
+        // Window 5 — interactive calculator (right side, top half).
+        // Pre-seed the display with "1234" so it looks alive before
+        // the first keystroke arrives over virtio-keyboard.
         let calc = Window::new(
-            Rect::new(940, 60, 290, 510),
+            Rect::new(940, 60, 290, 350),
             "Calculator",
-            WindowKind::Widgets(calculator_grid("1234.56")),
+            WindowKind::Calc(CalcState::from_preview("1234")),
         );
         let calc_id = wm.add(calc).ok().unwrap_or(beetos::gui::WindowId(0));
-        // Focus the calc so it gets the accent colour treatment — most
-        // eye-catching widget on the screenshot.
+
+        // Window 6 — interactive notepad below the calculator.
+        let notes = Window::new(
+            Rect::new(940, 430, 290, 220),
+            "Notes",
+            WindowKind::Notes(NotesState::with_text(
+                "BeetOS notes:\n- Try Tab to switch\n  windows.\n- Calc keys: 0-9 + - * / =\n- This pad accepts text.",
+            )),
+        );
+        let _ = wm.add(notes);
+
+        // Focus the calc so it gets the accent colour treatment and
+        // receives the first keystrokes from the kernel input router.
         wm.focus(calc_id);
     });
 
