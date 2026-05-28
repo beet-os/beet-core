@@ -620,6 +620,118 @@ impl HostResponse {
     pub fn long(&self) -> [u32; 4] { self.r }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRANSFER_MODE register
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub mod xfer_mode {
+    pub const DMA_ENABLE:           u16 = 1 << 0; // 1 = DMA, 0 = PIO
+    pub const BLOCK_COUNT_ENABLE:   u16 = 1 << 1;
+    pub const AUTO_CMD12_ENABLE:    u16 = 1 << 2; // STOP_TRANSMISSION after multi
+    pub const READ_DIR:             u16 = 1 << 4; // 1 = read, 0 = write
+    pub const MULTI_BLOCK:          u16 = 1 << 5;
+}
+
+/// Standard SD block size — every SDHC/SDXC card uses 512 B blocks.
+pub const BLOCK_SIZE: usize = 512;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PIO data transfer (single block first; multi-block coming when DMA lands)
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl<'a, M: Mmio> Host<'a, M> {
+    /// Block-aligned address argument for CMD17/CMD18/CMD24/CMD25.
+    ///
+    /// SDHC/SDXC cards expect a *block index* (lba) — the controller
+    /// multiplies by 512 internally. Pre-v2 SDSC cards expect a byte
+    /// offset; we ignore that since every relevant target ships SDHC.
+    fn data_addr(&self, lba: u32) -> u32 { lba }
+
+    /// Stage BLOCK_SIZE + BLOCK_COUNT registers for a `n` × 512-byte
+    /// transfer.  Caller must follow with the appropriate
+    /// TRANSFER_MODE + COMMAND writes.
+    fn setup_block_xfer(&self, n_blocks: u16) {
+        self.mmio.write16(reg::BLOCK_SIZE, BLOCK_SIZE as u16);
+        self.mmio.write16(reg::BLOCK_COUNT, n_blocks);
+    }
+
+    /// Wait for INT_STATUS bit `flag` to assert. ACKs it before
+    /// returning (W1C). Times out per `poll_budget`.
+    fn wait_int(&self, flag: u32) -> Result<(), HostError> {
+        for _ in 0..self.poll_budget {
+            let s = self.mmio.read32(reg::INT_STATUS);
+            if s & flag != 0 {
+                self.mmio.write32(reg::INT_STATUS, flag);
+                return Ok(());
+            }
+            if s & int::ERR_ANY != 0 {
+                return Err(classify_int_status(s).unwrap_err());
+            }
+        }
+        Err(HostError::Timeout)
+    }
+
+    /// PIO read of one 512-byte block at `lba` into `buf` (must be
+    /// exactly `BLOCK_SIZE` bytes). Returns the card's R1 response
+    /// alongside the completed transfer.
+    pub fn read_block(&self, lba: u32, buf: &mut [u8]) -> Result<u32, HostError> {
+        assert_eq!(buf.len(), BLOCK_SIZE, "read_block expects a 512 B buffer");
+
+        self.wait_cmd_inhibit()?;
+        self.setup_block_xfer(1);
+
+        self.mmio.write32(reg::ARGUMENT, self.data_addr(lba));
+        self.mmio.write16(reg::TRANSFER_MODE,
+            xfer_mode::READ_DIR | xfer_mode::BLOCK_COUNT_ENABLE);
+        self.mmio.write16(reg::COMMAND,
+            cmd_reg::encode(cmd::READ_SINGLE_BLOCK, ResponseType::R1, /*data*/ true));
+
+        self.wait_int(int::CMD_COMPLETE)?;
+        let r1 = self.mmio.read32(reg::RESPONSE0);
+
+        // Wait for the controller to fill the buffer, then PIO it out.
+        self.wait_int(int::BUF_READ_READY)?;
+        for word_idx in 0..(BLOCK_SIZE / 4) {
+            let w = self.mmio.read32(reg::BUFFER_DATA_PORT);
+            let off = word_idx * 4;
+            buf[off]     =  w        as u8;
+            buf[off + 1] = (w >>  8) as u8;
+            buf[off + 2] = (w >> 16) as u8;
+            buf[off + 3] = (w >> 24) as u8;
+        }
+        self.wait_int(int::TRANSFER_COMPLETE)?;
+        Ok(r1)
+    }
+
+    /// PIO write of one 512-byte block from `buf` to `lba`.
+    pub fn write_block(&self, lba: u32, buf: &[u8]) -> Result<u32, HostError> {
+        assert_eq!(buf.len(), BLOCK_SIZE, "write_block expects a 512 B buffer");
+
+        self.wait_cmd_inhibit()?;
+        self.setup_block_xfer(1);
+
+        self.mmio.write32(reg::ARGUMENT, self.data_addr(lba));
+        self.mmio.write16(reg::TRANSFER_MODE, xfer_mode::BLOCK_COUNT_ENABLE);
+        self.mmio.write16(reg::COMMAND,
+            cmd_reg::encode(cmd::WRITE_BLOCK, ResponseType::R1, /*data*/ true));
+
+        self.wait_int(int::CMD_COMPLETE)?;
+        let r1 = self.mmio.read32(reg::RESPONSE0);
+
+        self.wait_int(int::BUF_WRITE_READY)?;
+        for word_idx in 0..(BLOCK_SIZE / 4) {
+            let off = word_idx * 4;
+            let w = (buf[off]     as u32)
+                  | ((buf[off + 1] as u32) <<  8)
+                  | ((buf[off + 2] as u32) << 16)
+                  | ((buf[off + 3] as u32) << 24);
+            self.mmio.write32(reg::BUFFER_DATA_PORT, w);
+        }
+        self.wait_int(int::TRANSFER_COMPLETE)?;
+        Ok(r1)
+    }
+}
+
 /// Drive the init state machine one step at a time. Returns the
 /// command to issue, OR the new state if a step is purely internal.
 pub fn next_command(step: InitStep) -> Option<SdCommand> {
@@ -1195,5 +1307,160 @@ mod tests {
             false,
         ).unwrap_err();
         assert_eq!(err, HostError::Timeout);
+    }
+
+    // ── Block I/O tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn read_block_pulls_512_bytes_from_buffer_port() {
+        let m = MockMmio::new();
+        let host = Host { mmio: &m, poll_budget: 100 };
+
+        // Synthetic "card data" — 128 u32s = 512 bytes. Pattern = idx*7+1
+        // so each byte is different and we can spot ordering bugs.
+        let data: alloc::vec::Vec<u32> = (0..128).map(|i: u32| i.wrapping_mul(7).wrapping_add(1)).collect();
+        let data_cell = alloc::rc::Rc::new(RefCell::new(data.clone()));
+
+        // The mock advances through three phases as the driver
+        // progresses: pre-CMD (INT_STATUS=0), post-CMD
+        // (CMD_COMPLETE), then BUF_READ_READY for 128 reads.
+        let phase = alloc::rc::Rc::new(RefCell::new(0u32));
+        let phase2 = phase.clone();
+        let data_clone = data_cell.clone();
+        m.install_read_hook(move |off| {
+            // Never inhibit, ever.
+            if off == reg::PRESENT_STATE { return Some(0); }
+            // BUFFER_DATA_PORT — feed the synthetic data, one word per call.
+            if off == reg::BUFFER_DATA_PORT {
+                let mut d = data_clone.borrow_mut();
+                if d.is_empty() { return Some(0); }
+                return Some(d.remove(0));
+            }
+            if off == reg::INT_STATUS {
+                // Phase 0: not yet CMD_COMPLETE. Caller is about to
+                //          flip phase after issuing the command.
+                // Phase 1: CMD_COMPLETE returned, advance to BUF_READ_READY.
+                // Phase 2: BUF_READ_READY returned, advance to TRANSFER_COMPLETE.
+                // Phase 3: TRANSFER_COMPLETE, stable.
+                let p = *phase2.borrow();
+                let s = match p {
+                    0 => int::CMD_COMPLETE,
+                    1 => int::BUF_READ_READY,
+                    _ => int::TRANSFER_COMPLETE,
+                };
+                *phase2.borrow_mut() = p + 1;
+                Some(s)
+            } else if off == reg::RESPONSE0 {
+                Some(0x0000_0900) // fake R1 with READY_FOR_DATA + Tran state
+            } else {
+                None
+            }
+        });
+
+        let mut buf = [0u8; 512];
+        let r1 = host.read_block(0, &mut buf).expect("read_block");
+        assert_eq!(r1, 0x0000_0900);
+
+        // Verify the byte pattern matches what the mock fed us.
+        for i in 0..128 {
+            let w = (i as u32).wrapping_mul(7).wrapping_add(1);
+            let off = i * 4;
+            assert_eq!(buf[off],     w        as u8);
+            assert_eq!(buf[off + 1], (w >>  8) as u8);
+            assert_eq!(buf[off + 2], (w >> 16) as u8);
+            assert_eq!(buf[off + 3], (w >> 24) as u8);
+        }
+
+        // Verify the driver staged BLOCK_SIZE + BLOCK_COUNT + ARGUMENT.
+        let writes = m.writes.borrow();
+        assert!(writes.iter().any(|(o, _)| *o == reg::BLOCK_SIZE),
+            "BLOCK_SIZE/COUNT write missing");
+        assert!(writes.iter().any(|(o, v)| *o == reg::ARGUMENT && *v == 0),
+            "ARGUMENT(LBA=0) write missing");
+    }
+
+    #[test]
+    fn write_block_pushes_512_bytes_to_buffer_port() {
+        let m = MockMmio::new();
+        let host = Host { mmio: &m, poll_budget: 100 };
+
+        let phase = alloc::rc::Rc::new(RefCell::new(0u32));
+        let phase2 = phase.clone();
+        m.install_read_hook(move |off| {
+            if off == reg::PRESENT_STATE { return Some(0); }
+            if off == reg::INT_STATUS {
+                let p = *phase2.borrow();
+                let s = match p {
+                    0 => int::CMD_COMPLETE,
+                    1 => int::BUF_WRITE_READY,
+                    _ => int::TRANSFER_COMPLETE,
+                };
+                *phase2.borrow_mut() = p + 1;
+                Some(s)
+            } else if off == reg::RESPONSE0 {
+                Some(0x0000_0900)
+            } else { None }
+        });
+
+        // Build a synthetic input block with a known pattern.
+        let mut buf = [0u8; 512];
+        for i in 0..512 { buf[i] = ((i as u32 * 13 + 7) & 0xFF) as u8; }
+
+        let r1 = host.write_block(42, &buf).expect("write_block");
+        assert_eq!(r1, 0x0000_0900);
+
+        // Verify the driver pushed 128 words to BUFFER_DATA_PORT.
+        let writes = m.writes.borrow();
+        let data_writes: alloc::vec::Vec<_> = writes.iter()
+            .filter(|(o, _)| *o == reg::BUFFER_DATA_PORT)
+            .map(|(_, v)| *v).collect();
+        assert_eq!(data_writes.len(), 128, "expected 128 word writes to BUFFER_DATA_PORT");
+
+        // Reconstruct the first byte of each word and compare to input.
+        for (i, w) in data_writes.iter().enumerate() {
+            let off = i * 4;
+            assert_eq!(*w as u8,         buf[off]);
+            assert_eq!((*w >>  8) as u8, buf[off + 1]);
+            assert_eq!((*w >> 16) as u8, buf[off + 2]);
+            assert_eq!((*w >> 24) as u8, buf[off + 3]);
+        }
+
+        // ARGUMENT must be the LBA.
+        assert!(writes.iter().any(|(o, v)| *o == reg::ARGUMENT && *v == 42),
+            "ARGUMENT(LBA=42) write missing");
+    }
+
+    #[test]
+    fn read_block_propagates_data_crc_error() {
+        let m = MockMmio::new();
+        let host = Host { mmio: &m, poll_budget: 100 };
+        let phase = alloc::rc::Rc::new(RefCell::new(0u32));
+        let phase2 = phase.clone();
+        m.install_read_hook(move |off| {
+            if off == reg::PRESENT_STATE { return Some(0); }
+            if off == reg::INT_STATUS {
+                let p = *phase2.borrow();
+                *phase2.borrow_mut() = p + 1;
+                // CMD_COMPLETE, then BUF_READ_READY, then ERROR + DATA_CRC.
+                Some(match p {
+                    0 => int::CMD_COMPLETE,
+                    1 => int::BUF_READ_READY,
+                    _ => int::ERROR | int::DATA_CRC_ERROR,
+                })
+            } else if off == reg::BUFFER_DATA_PORT {
+                Some(0xDEAD_BEEF)
+            } else { None }
+        });
+        let mut buf = [0u8; 512];
+        assert_eq!(host.read_block(0, &mut buf), Err(HostError::DataCrc));
+    }
+
+    #[test]
+    fn xfer_mode_bits_for_read_and_write_differ_on_dir() {
+        // Read sets READ_DIR; write doesn't.
+        let read_mode = xfer_mode::READ_DIR | xfer_mode::BLOCK_COUNT_ENABLE;
+        let write_mode = xfer_mode::BLOCK_COUNT_ENABLE;
+        assert_ne!(read_mode & xfer_mode::READ_DIR, 0);
+        assert_eq!(write_mode & xfer_mode::READ_DIR, 0);
     }
 }
