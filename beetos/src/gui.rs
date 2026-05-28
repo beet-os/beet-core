@@ -1096,8 +1096,31 @@ impl WindowManager {
     pub fn click_at_cursor(&mut self) -> Option<WindowId> {
         let (x, y) = self.cursor;
         let id = self.hit_test(x, y)?;
-        self.focus(id);
-        Some(id)
+        // If the click landed on the window's close X, remove it
+        // outright; otherwise just focus + raise the window.
+        let on_close = self.get(id).is_some_and(|w| w.close_button_contains(x, y));
+        if on_close {
+            self.remove(id);
+            None
+        } else {
+            self.focus(id);
+            Some(id)
+        }
+    }
+
+    /// Nudge the focused window by `(dx, dy)` pixels. No-op if nothing
+    /// is focused. Today bound to Ctrl+arrow keys in the input layer.
+    pub fn drag_focused(&mut self, dx: i32, dy: i32) -> bool {
+        let id = self.windows.iter().enumerate()
+            .find(|(_, w)| w.as_ref().is_some_and(|w| w.focused))
+            .map(|(i, _)| WindowId(i as u8));
+        let Some(id) = id else { return false; };
+        if let Some(w) = self.get_mut(id) {
+            w.rect.x += dx;
+            w.rect.y += dy;
+            return true;
+        }
+        false
     }
 
     pub fn set_desktop_bg(&mut self, color: Color) { self.desktop_bg = color; }
@@ -1238,6 +1261,11 @@ impl WindowManager {
             0xD4 => { self.move_cursor(-16,  0);  return true; }
             // Shift+Enter (0xD5) → click at cursor.
             0xD5 => { self.click_at_cursor(); return true; }
+            // Ctrl+arrow → drag the focused window by 16 px.
+            0xE1 => { self.drag_focused(0,   -16); return true; }
+            0xE2 => { self.drag_focused(0,    16); return true; }
+            0xE3 => { self.drag_focused(16,   0);  return true; }
+            0xE4 => { self.drag_focused(-16,  0);  return true; }
             _ => {}
         }
         let focused_id = self.windows.iter().enumerate()
@@ -2118,6 +2146,35 @@ mod tests {
         assert!(wm.handle_key(b'w'));
         // Animation step advances state.
         let _ = wm.animation_step();
+    }
+
+    #[test]
+    fn cursor_click_on_close_x_removes_window() {
+        let mut wm = WindowManager::new();
+        let id = wm.add(Window::new(Rect::new(40, 40, 200, 100),
+            "x", WindowKind::Empty)).unwrap();
+        wm.focus(id);
+        assert_eq!(wm.len(), 1);
+        // Close X sits at the top-right of the title bar.
+        // close_button is the rightmost TITLEBAR_H × TITLEBAR_H square.
+        let w = wm.get(id).unwrap();
+        let cx = w.rect.right() - CLOSE_BTN_W / 2;
+        let cy = w.rect.y + TITLEBAR_H / 2;
+        wm.set_cursor(cx, cy);
+        assert!(wm.handle_key(0xD5)); // simulated Shift+Enter click
+        assert_eq!(wm.len(), 0);
+    }
+
+    #[test]
+    fn ctrl_arrow_drags_focused_window() {
+        let mut wm = WindowManager::new();
+        let id = wm.add(Window::new(Rect::new(100, 100, 200, 100),
+            "x", WindowKind::Empty)).unwrap();
+        wm.focus(id);
+        assert!(wm.handle_key(0xE3)); // Ctrl+Right
+        assert_eq!(wm.get(id).unwrap().rect.x, 100 + 16);
+        assert!(wm.handle_key(0xE1)); // Ctrl+Up
+        assert_eq!(wm.get(id).unwrap().rect.y, 100 - 16);
     }
 
     #[test]

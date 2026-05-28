@@ -31,6 +31,8 @@ const VAL_DOWN: u32 = 1;
 /// Left/right shift keycodes (Linux evdev).
 const KEY_LEFTSHIFT:  u16 = 42;
 const KEY_RIGHTSHIFT: u16 = 54;
+const KEY_LEFTCTRL:   u16 = 29;
+const KEY_RIGHTCTRL:  u16 = 97;
 
 /// Number of event slots in the eventq.
 const QUEUE_SIZE: u16 = 64;
@@ -47,6 +49,7 @@ struct InputDev {
     irq:     u32,
     eventq:  Virtqueue,
     shift:   bool,
+    ctrl:    bool,
 }
 
 static mut INPUT_DEV: Option<InputDev> = None;
@@ -123,9 +126,12 @@ pub fn get_char() -> Option<u8> {
             let ev_code  = u16::from_le_bytes([buf[2], buf[3]]);
             let ev_value = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
-            // Track shift state (key-down and key-up both matter).
+            // Track shift / ctrl state (key-down and key-up both matter).
             if ev_code == KEY_LEFTSHIFT || ev_code == KEY_RIGHTSHIFT {
                 dev.shift = ev_value == VAL_DOWN;
+            }
+            if ev_code == KEY_LEFTCTRL || ev_code == KEY_RIGHTCTRL {
+                dev.ctrl = ev_value == VAL_DOWN;
             }
 
             // Re-post descriptor so QEMU can reuse it.
@@ -135,7 +141,7 @@ pub fn get_char() -> Option<u8> {
             // EV_KEY down → convert to ASCII and return.
             // EV_SYN / key-up / repeat → continue draining.
             if ev_type == EV_KEY && ev_value == VAL_DOWN {
-                if let Some(c) = keycode_to_ascii(ev_code, dev.shift) {
+                if let Some(c) = keycode_to_ascii(ev_code, dev.shift, dev.ctrl) {
                     return Some(c);
                 }
             }
@@ -159,7 +165,7 @@ unsafe fn init(base_va: usize, irq: u32) {
     let eventq = Virtqueue::init(buf_va, buf_pa, QUEUE_SIZE, beetos::PAGE_SIZE);
     virtio::setup_queue(base_va, 0, &eventq, beetos::PAGE_SIZE);
 
-    let mut dev = InputDev { base_va, irq, eventq, shift: false };
+    let mut dev = InputDev { base_va, irq, eventq, shift: false, ctrl: false };
 
     // Pre-populate all descriptors: each points to its own EVENT_BUFS slot.
     // Descriptor index i maps to EVENT_BUFS[i] (identity mapping).
@@ -191,7 +197,7 @@ unsafe fn init(base_va: usize, irq: u32) {
 // Keycode → ASCII (US QWERTY)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn keycode_to_ascii(code: u16, shift: bool) -> Option<u8> {
+fn keycode_to_ascii(code: u16, shift: bool, ctrl: bool) -> Option<u8> {
     let c: u8 = match code {
         1       => 0x1b,  // ESC
         14      => 0x7f,  // Backspace → DEL
@@ -260,11 +266,13 @@ fn keycode_to_ascii(code: u16, shift: bool) -> Option<u8> {
         // Shift switches the role: plain cursor keys steer the focused
         // interactive window (Snake), shifted cursor keys move the
         // mouse cursor across the desktop (range 0xD1-0xD4); Shift+Enter
-        // is a click at the current cursor position (0xD5).
-        103 => if shift { 0xD1 } else { 0xC1 }, // KEY_UP
-        108 => if shift { 0xD2 } else { 0xC2 }, // KEY_DOWN
-        106 => if shift { 0xD3 } else { 0xC3 }, // KEY_RIGHT
-        105 => if shift { 0xD4 } else { 0xC4 }, // KEY_LEFT
+        // is a click at the current cursor position (0xD5). Ctrl-arrow
+        // (range 0xE1-0xE4) drags the focused window by 16 px so any
+        // overlap is correctable from the keyboard alone.
+        103 => if ctrl { 0xE1 } else if shift { 0xD1 } else { 0xC1 }, // KEY_UP
+        108 => if ctrl { 0xE2 } else if shift { 0xD2 } else { 0xC2 }, // KEY_DOWN
+        106 => if ctrl { 0xE3 } else if shift { 0xD3 } else { 0xC3 }, // KEY_RIGHT
+        105 => if ctrl { 0xE4 } else if shift { 0xD4 } else { 0xC4 }, // KEY_LEFT
 
         // Numeric keypad — useful for driving the GUI calculator directly
         // without modifier juggling. Codes per Linux evdev (KEY_KP*).
