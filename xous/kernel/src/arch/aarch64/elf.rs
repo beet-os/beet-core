@@ -21,11 +21,9 @@ const ET_EXEC: u16 = 2; // Static executable
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
-const PT_GNU_RELRO: u32 = 0x6474_E552;
 
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
-const PF_R: u32 = 4;
 
 const R_AARCH64_RELATIVE: u32 = 1027;
 
@@ -84,8 +82,6 @@ struct Elf64Rela {
 pub struct ElfLoadResult {
     /// Entry point address (with ASLR slide applied).
     pub entry_point: usize,
-    /// ASLR slide applied to the binary.
-    pub aslr_slide: usize,
 }
 
 /// Load an ELF64 binary into a process's address space.
@@ -217,7 +213,6 @@ pub unsafe fn load_elf(
 
     Ok(ElfLoadResult {
         entry_point: header.e_entry as usize + aslr_slide,
-        aslr_slide,
     })
 }
 

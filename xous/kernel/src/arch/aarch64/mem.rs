@@ -144,12 +144,11 @@
 //! # TLB Invalidation
 //!
 //! After modifying a PTE, the corresponding TLB entry must be invalidated.
-//! See [`super::asm`] for the three invalidation primitives:
+//! See [`super::asm`] for the invalidation primitives:
 //! - [`flush_tlb_entry`](super::asm::flush_tlb_entry) — single VA (TLBI VAALE1IS)
 //! - [`flush_tlb_asid`](super::asm::flush_tlb_asid) — all entries for an ASID (TLBI ASIDE1IS)
-//! - [`flush_tlb_all`](super::asm::flush_tlb_all) — entire TLB (TLBI VMALLE1IS)
 //!
-//! All use Inner-Shareable (IS) variants for SMP correctness.
+//! Both use Inner-Shareable (IS) variants for SMP correctness.
 
 use core::arch::asm;
 

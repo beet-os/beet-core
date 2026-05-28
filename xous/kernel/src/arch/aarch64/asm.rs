@@ -75,24 +75,6 @@ pub fn flush_tlb_asid(asid: u16) {
     }
 }
 
-/// Invalidate the **entire** TLB (all ASIDs, all VAs).
-///
-/// Uses `TLBI VMALLE1IS` (VM All, EL1, Inner Shareable).
-/// Used during boot and for bulk page table changes. Expensive on SMP —
-/// prefer [`flush_tlb_entry`] or [`flush_tlb_asid`] when possible.
-#[inline]
-pub fn flush_tlb_all() {
-    unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vmalle1is",
-            "dsb ish",
-            "isb",
-            options(nomem, nostack),
-        );
-    }
-}
-
 /// Data Synchronization Barrier (full system).
 ///
 /// Ensures all preceding memory accesses (loads, stores, cache maintenance)
@@ -101,16 +83,6 @@ pub fn flush_tlb_all() {
 #[inline]
 pub fn dsb() {
     unsafe { core::arch::asm!("dsb sy", options(nomem, nostack)) };
-}
-
-/// Instruction Synchronization Barrier.
-///
-/// Flushes the CPU pipeline and refetches all subsequent instructions.
-/// Required after changes to system registers (TTBR, SCTLR, VBAR, etc.)
-/// to ensure the new settings take effect.
-#[inline]
-pub fn isb() {
-    unsafe { core::arch::asm!("isb", options(nomem, nostack)) };
 }
 
 /// Clean and invalidate data cache by VA to Point of Coherency.

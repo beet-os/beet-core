@@ -152,8 +152,9 @@ unsafe fn init(base_va: usize, irq: u32) {
         return;
     }
 
-    // Set up eventq (queue 0).
-    let buf_va = EVENTQ_BUF.0.as_mut_ptr() as usize;
+    // Set up eventq (queue 0). Use addr_of_mut! to avoid forming an
+    // intermediate &mut to the mutable static (lint: static_mut_refs).
+    let buf_va = core::ptr::addr_of_mut!(EVENTQ_BUF.0) as *mut u8 as usize;
     let buf_pa = beetos::virt_to_phys(buf_va);
     let eventq = Virtqueue::init(buf_va, buf_pa, QUEUE_SIZE, beetos::PAGE_SIZE);
     virtio::setup_queue(base_va, 0, &eventq, beetos::PAGE_SIZE);
