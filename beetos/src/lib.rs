@@ -39,6 +39,8 @@ pub mod fb_console;
 pub mod gfx;
 #[cfg(feature = "fb")]
 pub mod gui;
+#[cfg(feature = "fb")]
+pub mod wgpu_compat;
 
 /// AArch64 translation granule — set by the `page-4k` / `page-16k` / `page-64k` feature.
 /// Exactly one feature must be enabled. Default: `page-16k` (Apple Silicon).
