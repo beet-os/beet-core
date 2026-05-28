@@ -57,6 +57,10 @@ pub fn init(fdt_phys: *const u8) {
         uart::puts("UART: address from default (FDT not found)\n");
     }
 
+    // Boot screen markers are painted after FB::init succeeds further
+    // down — here we stash the events on UART. `mark_phase_complete` is
+    // called for each phase once the FB exists, so the boxes can fill
+    // retroactively.
     gic::init(beetos::phys_to_virt(gicd_phys), beetos::phys_to_virt(gicr_phys));
 
     if mmio.gicd_phys.is_some() {
@@ -72,8 +76,14 @@ pub fn init(fdt_phys: *const u8) {
     // Failure is non-fatal — UART remains the primary output.
     if unsafe { fb::init() } {
         uart::puts("FB: ramfb initialized (1280x800)\n");
-        fb::write_str("BeetOS v0.1.0\n");
-        fb::write_str("Platform: QEMU virt (AArch64)\n");
+        // Paint the BeetOS boot screen and retroactively mark every phase
+        // that already completed before the FB existed. Subsequent phases
+        // are marked as they finish.
+        fb::draw_boot_screen();
+        fb::mark_phase_complete(0, "UART");
+        fb::mark_phase_complete(1, "GIC");
+        fb::mark_phase_complete(2, "Timer");
+        fb::mark_phase_complete(3, "FB");
     } else {
         uart::puts("FB: ramfb not found (run with -device ramfb)\n");
     }

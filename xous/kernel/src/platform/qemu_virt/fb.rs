@@ -18,6 +18,7 @@
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
+use beetos::gfx::{color, Color, Rect, Surface};
 use beetos::{phys_to_virt, virt_to_phys};
 
 use crate::fb_console::FbConsole;
@@ -248,4 +249,127 @@ pub fn write_str(s: &str) {
             }
         }
     }
+}
+
+/// Borrow the live framebuffer as a [`Surface`].
+///
+/// # Safety
+///
+/// Caller must guarantee no other code writes to the FB concurrently —
+/// today the kernel is effectively single-CPU for early init / panic
+/// paths so that holds, but this needs revisiting before SMP.
+pub unsafe fn surface() -> Surface {
+    let base = phys_to_virt(FB_PHYS) as *mut u32;
+    Surface::from_raw_parts(base, FB_WIDTH as i32, FB_HEIGHT as i32, FB_WIDTH as i32)
+}
+
+/// Paint the BeetOS boot screen — solid background, banner, version,
+/// and a row of phase indicator boxes that subsequent init steps can
+/// turn from "pending" (frame-only) into "done" (filled) via
+/// [`mark_phase_complete`].
+///
+/// Designed to be called once, right after [`init`] returns true.
+pub fn draw_boot_screen() {
+    // SAFETY: called only from the single-threaded boot path, after `init`
+    // mapped the FB. No other writer can race here.
+    let mut s = unsafe { surface() };
+
+    // Background — slightly lighter than pure black so the boxes pop.
+    s.fill(color::DESKTOP_BG);
+
+    // Top accent bar.
+    let top = Rect::new(0, 0, FB_WIDTH as i32, 4);
+    s.fill_rect(&top, color::BEET_PURPLE);
+
+    // BeetOS title in big-ish block letters (the 8x16 font drawn at 2x via
+    // pixel doubling would be ideal but draw_text uses 1x; for the title we
+    // draw the same string twice with a 1px offset to fake bold).
+    let title_x = 80;
+    let title_y = 80;
+    s.draw_text(title_x,     title_y, "BeetOS",    color::WHITE,        color::DESKTOP_BG);
+    s.draw_text(title_x + 1, title_y, "BeetOS",    color::WHITE,        color::DESKTOP_BG);
+    s.draw_text(title_x,     title_y + 24, "v0.1.0 — booting on QEMU virt (AArch64)", color::LIGHT_GRAY, color::DESKTOP_BG);
+
+    // Decorative beet shape: filled magenta circle with a green leaf line.
+    let beet_cx = FB_WIDTH as i32 - 140;
+    let beet_cy = 130;
+    s.circle_filled(beet_cx, beet_cy, 48, color::BEET_PINK);
+    s.circle_filled(beet_cx, beet_cy, 36, color::BEET_PURPLE);
+    s.line(beet_cx, beet_cy - 48, beet_cx + 18, beet_cy - 80, color::BRIGHT_GREEN);
+    s.line(beet_cx, beet_cy - 48, beet_cx + 38, beet_cy - 72, color::GREEN);
+
+    // Subtitle / hint.
+    s.draw_text(title_x, title_y + 72,
+        "  Kernel: Xous (cherry-picked from KeyOS) + AArch64 port",
+        color::LIGHT_GRAY, color::DESKTOP_BG);
+    s.draw_text(title_x, title_y + 96,
+        "  Graphics: beetos::gfx software rasterizer (wgpu-shaped API)",
+        color::DARK_GRAY, color::DESKTOP_BG);
+
+    // Phase indicators — laid out along the bottom of the screen.
+    let labels = ["UART", "GIC", "Timer", "FB", "MMU", "ELF", "Shell"];
+    let box_w = 80;
+    let box_h = 24;
+    let gap = 12;
+    let total_w = labels.len() as i32 * box_w + (labels.len() as i32 - 1) * gap;
+    let start_x = (FB_WIDTH as i32 - total_w) / 2;
+    let row_y = FB_HEIGHT as i32 - 80;
+    for (i, label) in labels.iter().enumerate() {
+        let x = start_x + i as i32 * (box_w + gap);
+        let r = Rect::new(x, row_y, box_w, box_h);
+        s.rect_outline(&r, color::WINDOW_FRAME);
+        // Centre-ish the label text (8 px per glyph, 16 px tall).
+        let tx = x + (box_w - (label.len() as i32 * 8)) / 2;
+        let ty = row_y + (box_h - 16) / 2;
+        s.draw_text(tx, ty, label, color::LIGHT_GRAY, color::DESKTOP_BG);
+    }
+
+    // Bottom accent bar.
+    let bot = Rect::new(0, FB_HEIGHT as i32 - 4, FB_WIDTH as i32, 4);
+    s.fill_rect(&bot, color::BEET_PURPLE);
+
+    // Reset the FbConsole cursor so any subsequent text appears below the
+    // banner, not on top of it. We keep the existing FbConsole intact
+    // (it's still the path serial->fb mirroring uses) — just nudge its
+    // cursor past the boot graphics.
+    unsafe {
+        if let Some(ref mut con) = FB_CONSOLE {
+            // Below the title block, above the phase row.
+            con.set_cursor(13, 0);
+        }
+    }
+}
+
+/// Highlight one of the boot-phase indicator boxes drawn by
+/// [`draw_boot_screen`]. Boxes are 0-indexed in the order they were laid out
+/// (UART=0, GIC=1, Timer=2, FB=3, MMU=4, ELF=5, Shell=6).
+pub fn mark_phase_complete(phase_idx: usize, label: &str) {
+    let labels_count: i32 = 7;
+    let box_w = 80;
+    let box_h = 24;
+    let gap = 12;
+    let total_w = labels_count * box_w + (labels_count - 1) * gap;
+    let start_x = (FB_WIDTH as i32 - total_w) / 2;
+    let row_y = FB_HEIGHT as i32 - 80;
+    let x = start_x + phase_idx as i32 * (box_w + gap);
+    let r = Rect::new(x, row_y, box_w, box_h);
+    let mut s = unsafe { surface() };
+    s.fill_rect(&r, color::BEET_PURPLE);
+    let tx = x + (box_w - (label.len() as i32 * 8)) / 2;
+    let ty = row_y + (box_h - 16) / 2;
+    s.draw_text(tx, ty, label, color::WHITE, color::BEET_PURPLE);
+}
+
+/// Convenience: write a colored status line below the boot banner.
+/// Intended for future per-driver status updates from outside the
+/// platform module; kept ungated so we don't have to thread through
+/// extra plumbing the first time it's needed.
+#[allow(dead_code)]
+pub fn boot_status_line(line: i32, msg: &str, fg: Color) {
+    let mut s = unsafe { surface() };
+    let y = 220 + line * 18;
+    // Clear the line area first so re-writes don't overlap.
+    let clear = Rect::new(80, y, FB_WIDTH as i32 - 160, 16);
+    s.fill_rect(&clear, color::BLACK);
+    s.draw_text(80, y, msg, fg, color::BLACK);
 }
