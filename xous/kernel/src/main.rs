@@ -29,6 +29,14 @@ mod pcie;
 /// future virtio-blk equivalent, …).
 mod sdhci;
 
+/// Generic NVMe 1.4 protocol — SQE / CQE encoding, opcode tables,
+/// identify-controller / identify-namespace parsing, status decode,
+/// queue ring index arithmetic. Pure. Used by the Apple M1 ANS
+/// storage driver (the M1 has a custom NVMe-speaking flash
+/// controller) and the future PCIe NVMe path for real RPi5 NVMe
+/// slot work.
+mod nvme;
+
 #[cfg(beetos)]
 mod fb_console;
 
