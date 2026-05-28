@@ -10,6 +10,7 @@ fn main() -> anyhow::Result<()> {
         Some("build") => build(&args[1..])?,
         Some("qemu") => qemu(&args[1..])?,
         Some("qemu-smoke") => qemu_smoke()?,
+        Some("qemu-smoke-nodisk") => qemu_smoke_nodisk()?,
         Some("qemu-screenshot") => qemu_screenshot(&args[1..])?,
         Some("qemu-animation") => qemu_animation(&args[1..])?,
         Some("rpi5") => rpi5()?,
@@ -25,6 +26,7 @@ fn main() -> anyhow::Result<()> {
             println!("  build [--platform]  Cross-compile for aarch64-unknown-none");
             println!("  qemu [--terminal]  Build and run on QEMU virt (--terminal = headless, no FB)");
             println!("  qemu-smoke         Boot QEMU and verify expected progress markers (CI)");
+            println!("  qemu-smoke-nodisk  Boot QEMU *without* a disk image — verifies graceful degradation");
             println!("  qemu-screenshot [--wait SECS] [--out PATH]");
             println!("                     Boot QEMU and capture the framebuffer (default: 6s, target/beetos-fb.png)");
             println!("  qemu-animation [--frames N] [--interval SECS] [--out PATH]");
@@ -846,43 +848,14 @@ fn qemu_animation(args: &[String]) -> anyhow::Result<()> {
 ///
 /// Exits with code 0 if every marker is seen within the timeout, 1 otherwise.
 fn qemu_smoke() -> anyhow::Result<()> {
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
-
-    let root = workspace_root();
-
-    // hello-std.stripped is embedded via include_bytes! at kernel build time.
-    // Without the stage1 rustc we can't build it, but the kernel only spawns
-    // it on demand from the shell — a dummy placeholder lets the kernel link
-    // and boot. (build_apps() prints the same "[skip] hello-std" notice.)
-    let nostd_target = root.join("target/aarch64-unknown-none/debug");
-    std::fs::create_dir_all(&nostd_target)?;
-    let hello_std = nostd_target.join("hello-std.stripped");
-    if !hello_std.exists() {
-        // Minimal ELF magic — enough to satisfy include_bytes!.
-        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
-    }
-
-    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
-
-    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
-    anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
-    let kernel = elf_to_image(&kernel_elf)?;
-
-    // Build a test disk image so we exercise the virtio-blk + disk-mapping
-    // path. Both the fs and block services depend on these pages.
-    let disk_img = create_test_disk(&root)?;
-
-    let serial_log = root.join("target/qemu-smoke-serial.log");
-    let _ = std::fs::remove_file(&serial_log);
-
-    // Markers we expect to see in order during a healthy boot. If any is
-    // missing the smoke test fails — that's enough signal to catch regressions
-    // in early init, MMU bring-up, ELF loading, scheduling, or shell launch.
+    // Markers we expect to see during a healthy boot. If any is missing
+    // the smoke test fails — that's enough signal to catch regressions
+    // in early init, MMU bring-up, ELF loading, scheduling, or shell
+    // launch.
     //
-    // Each substring is chosen to appear exactly once during a normal boot
-    // (e.g. "Platform: QEMU virt" rather than the bare "BeetOS v0.1.0"
-    // banner, which is re-emitted by the shell once it starts).
+    // Each substring is chosen to appear exactly once during a normal
+    // boot (e.g. "Platform: QEMU virt" rather than the bare "BeetOS
+    // v0.1.0" banner, which is re-emitted by the shell once it starts).
     let markers: &[&str] = &[
         "Platform: QEMU virt",
         "UART: address from FDT",
@@ -898,9 +871,67 @@ fn qemu_smoke() -> anyhow::Result<()> {
         "[shell] block self-test: OK",
         "bsh>",
     ];
+    run_smoke("qemu-smoke", /*with_disk*/ true, markers)
+}
+
+/// Same harness as [`qemu_smoke`] but boots QEMU without a `-drive`,
+/// confirming that fs / block / shell degrade cleanly when there is
+/// no backing device:
+///   * block reports 0 blocks (still starts, still answers IPC)
+///   * fs caches 0 bytes via IPC (still starts, still serves ramfs)
+///   * shell's self-test detects capacity 0 and skips the read
+fn qemu_smoke_nodisk() -> anyhow::Result<()> {
+    let markers: &[&str] = &[
+        "Platform: QEMU virt",
+        "UART: address from FDT",
+        "GIC: initialized (address from FDT)",
+        "Timer: initialized",
+        "MMU: enabled",
+        "EL0: loading shell ELF",
+        // No "Disk: mapped into block service" — there's no disk to map.
+        "EL0: launching shell",
+        "PREEMPT: timer switched",
+        "[fs] started, disk=0 bytes via IPC",
+        "[block] started, disk=0 bytes (0 blocks)",
+        "[shell] block self-test: no disk attached (skipped)",
+        "bsh>",
+    ];
+    run_smoke("qemu-smoke-nodisk", /*with_disk*/ false, markers)
+}
+
+/// Shared QEMU smoke harness: build kernel, launch QEMU (optionally
+/// attaching a virtio-blk disk image), and verify every marker appears
+/// in the serial log before the deadline.
+fn run_smoke(name: &str, with_disk: bool, markers: &[&str]) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let root = workspace_root();
+
+    // hello-std.stripped is embedded via include_bytes! at kernel build time.
+    // Without the stage1 rustc we can't build it, but the kernel only spawns
+    // it on demand from the shell — a dummy placeholder lets the kernel link
+    // and boot. (build_apps() prints the same "[skip] hello-std" notice.)
+    let nostd_target = root.join("target/aarch64-unknown-none/debug");
+    std::fs::create_dir_all(&nostd_target)?;
+    let hello_std = nostd_target.join("hello-std.stripped");
+    if !hello_std.exists() {
+        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
+    }
+
+    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
+
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
+    let kernel = elf_to_image(&kernel_elf)?;
+
+    let disk_img = if with_disk { Some(create_test_disk(&root)?) } else { None };
+
+    let serial_log = root.join(format!("target/{name}-serial.log"));
+    let _ = std::fs::remove_file(&serial_log);
 
     println!();
-    println!("Launching QEMU smoke test (timeout: 15s)...");
+    println!("Launching QEMU smoke test [{name}] (timeout: 15s)...");
     println!("  serial log: {}", serial_log.display());
     println!();
 
@@ -916,10 +947,10 @@ fn qemu_smoke() -> anyhow::Result<()> {
         "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
     ];
 
-    if disk_img.exists() {
+    if let Some(ref img) = disk_img {
         qemu_args.extend_from_slice(&[
             "-drive".to_string(),
-            format!("file={},format=raw,if=none,id=disk0", disk_img.display()),
+            format!("file={},format=raw,if=none,id=disk0", img.display()),
             "-device".to_string(),
             "virtio-blk-device,drive=disk0".to_string(),
         ]);
@@ -969,11 +1000,11 @@ fn qemu_smoke() -> anyhow::Result<()> {
 
     println!();
     if pending.is_empty() {
-        println!("Result: SMOKE TEST PASSED ({} markers seen)", markers.len());
+        println!("Result: SMOKE TEST PASSED [{name}] ({} markers seen)", markers.len());
         Ok(())
     } else {
         anyhow::bail!(
-            "Result: SMOKE TEST FAILED — {} of {} markers missing: {:?}",
+            "Result: SMOKE TEST FAILED [{name}] — {} of {} markers missing: {:?}",
             pending.len(),
             markers.len(),
             pending,

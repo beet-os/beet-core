@@ -867,6 +867,14 @@ fn block_selftest() {
         Err(_) => { puts("[shell] block self-test: info FAILED\n"); return; }
     };
 
+    // No backing device — the block service is up but has nothing to
+    // serve (QEMU launched without `-drive`, or platform without disk).
+    // That's not an error; just don't pretend we can read LBA 0.
+    if info.capacity_blocks == 0 {
+        puts("[shell] block self-test: no disk attached (skipped)\n");
+        return;
+    }
+
     // A page is plenty for the one-block read (header + 512 bytes).
     let page_size = match xous::MemorySize::new(beetos::PAGE_SIZE) {
         Some(s) => s,
