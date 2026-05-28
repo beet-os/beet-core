@@ -31,6 +31,8 @@
 
 #![no_std]
 
+pub mod pl011;
+
 #[cfg(feature = "fb")]
 pub mod font;
 #[cfg(feature = "fb")]

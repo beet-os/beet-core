@@ -27,40 +27,8 @@ mod tarfs;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
+use beetos::pl011::{putc, puts, Writer as UartWriter};
 use beetos_api_fs::{BUF_STATUS_OFFSET, BUF_TEXT_OFFSET, FsError, FsOp, FS_SID};
-
-// ============================================================================
-// UART output
-// ============================================================================
-
-const UART_DR: usize = 0x00;
-const UART_FR: usize = 0x18;
-const UART_FR_TXFF: u32 = 1 << 5;
-
-static mut UART_BASE: usize = 0;
-
-fn putc(c: u8) {
-    unsafe {
-        if UART_BASE == 0 { return; }
-        let base = UART_BASE;
-        while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
-        if c == b'\n' {
-            core::ptr::write_volatile((base + UART_DR) as *mut u32, b'\r' as u32);
-            while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
-        }
-        core::ptr::write_volatile((base + UART_DR) as *mut u32, c as u32);
-    }
-}
-
-fn puts(s: &str) { for b in s.bytes() { putc(b); } }
-
-struct UartWriter;
-impl Write for UartWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        puts(s);
-        Ok(())
-    }
-}
 
 // ============================================================================
 // Disk cache — populated once at startup from the block service via IPC.
@@ -197,8 +165,8 @@ pub extern "C" fn _start() -> ! {
             out(reg) uart_base,
             options(nomem, nostack),
         );
-        UART_BASE = uart_base;
     }
+    beetos::pl011::init(uart_base);
 
     ramfs::init();
     let _ = ramfs::mkdir("/tmp");

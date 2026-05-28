@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 xous = { path = "../../xous/xous-rs" }
+beetos = { path = "../../beetos" }
 beetos-api-block = { path = "../../api/block" }
 
 [lints.rust]

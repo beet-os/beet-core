@@ -28,43 +28,11 @@
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
+use beetos::pl011::Writer as UartWriter;
 use beetos_api_block::{
     self as block, BlockOp, BlockResult, BLOCK_SID,
     BUF_DATA_OFFSET,
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UART (mirror of the FS service's tiny PL011 driver — kept inline so the
-// service is one self-contained binary without a shared "platform-uart"
-// dependency).
-// ─────────────────────────────────────────────────────────────────────────────
-
-const UART_DR:      usize = 0x00;
-const UART_FR:      usize = 0x18;
-const UART_FR_TXFF: u32   = 1 << 5;
-
-static mut UART_BASE: usize = 0;
-
-fn putc(c: u8) {
-    unsafe {
-        if UART_BASE == 0 { return; }
-        let base = UART_BASE;
-        while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
-        if c == b'\n' {
-            core::ptr::write_volatile((base + UART_DR) as *mut u32, b'\r' as u32);
-            while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
-        }
-        core::ptr::write_volatile((base + UART_DR) as *mut u32, c as u32);
-    }
-}
-
-struct UartWriter;
-impl Write for UartWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for b in s.bytes() { putc(b); }
-        Ok(())
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Backend — the disk pages the kernel mapped into our address space.
@@ -185,10 +153,10 @@ pub extern "C" fn _start() -> ! {
             out(reg) uart_base, out(reg) disk_base, out(reg) disk_size,
             options(nomem, nostack),
         );
-        UART_BASE = uart_base;
         DISK_BASE = disk_base;
         DISK_SIZE = disk_size;
     }
+    beetos::pl011::init(uart_base);
 
     let _ = write!(
         UartWriter,

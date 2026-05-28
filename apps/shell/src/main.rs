@@ -19,27 +19,12 @@ use core::panic::PanicInfo;
 use beetos_api_fs::{BUF_STATUS_OFFSET, BUF_TEXT_OFFSET, FsError, FsOp, FS_SID};
 
 // ============================================================================
-// UART output via mapped MMIO
+// UART output via mapped MMIO (delegated to the shared PL011 driver in
+// `beetos::pl011`). The shell wraps UART output below in `DualWriter`
+// so every byte also lands on the framebuffer console.
 // ============================================================================
 
-const UART_DR: usize = 0x00;
-const UART_FR: usize = 0x18;
-const UART_FR_TXFF: u32 = 1 << 5;
-
-static mut UART_BASE: usize = 0;
-
-fn uart_putc(c: u8) {
-    unsafe {
-        if UART_BASE == 0 { return; }
-        let base = UART_BASE;
-        while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
-        if c == b'\n' {
-            core::ptr::write_volatile((base + UART_DR) as *mut u32, b'\r' as u32);
-            while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
-        }
-        core::ptr::write_volatile((base + UART_DR) as *mut u32, c as u32);
-    }
-}
+use beetos::pl011::putc as uart_putc;
 
 // ============================================================================
 // Framebuffer console
@@ -924,8 +909,8 @@ fn block_selftest() {
 
 #[no_mangle]
 pub extern "C" fn _start(uart_base: usize) -> ! {
+    beetos::pl011::init(uart_base);
     unsafe {
-        UART_BASE = uart_base;
         CWD_BUF[0] = b'/';
         CWD_LEN = 1;
         // FB is mapped at a fixed VA by AcquireDisplay — use it directly.
