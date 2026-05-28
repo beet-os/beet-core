@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
             println!("Commands:");
             println!("  check              Check all workspace crates (hosted mode)");
             println!("  build [--platform]  Cross-compile for aarch64-unknown-none");
-            println!("  qemu               Build and run on QEMU virt");
+            println!("  qemu [--terminal]  Build and run on QEMU virt (--terminal = headless, no FB)");
             println!("  qemu-smoke         Boot QEMU and verify expected progress markers (CI)");
             println!("  qemu-screenshot [--wait SECS] [--out PATH]");
             println!("                     Boot QEMU and capture the framebuffer (default: 6s, target/beetos-fb.png)");
@@ -399,10 +399,20 @@ fn create_test_disk(root: &std::path::Path) -> anyhow::Result<PathBuf> {
 }
 
 fn qemu(args: &[String]) -> anyhow::Result<()> {
-    // Build for qemu-virt first
+    // --terminal flips off the FB stack: no ramfb, no input devices, no
+    // QEMU display window. UART → stdio just like the early BeetOS
+    // milestones; the kernel sees fb::init() fail and skips the entire
+    // GUI compose loop so this is also the lightest-CPU way to boot.
+    let terminal_only = args.iter().any(|a| a == "--terminal" || a == "--no-gui");
+
+    // Build for qemu-virt first (strip our own flags before forwarding).
+    let forward: Vec<String> = args.iter()
+        .filter(|a| a.as_str() != "--terminal" && a.as_str() != "--no-gui")
+        .cloned()
+        .collect();
     build(&{
         let mut a = vec!["--platform".to_string(), "qemu-virt".to_string()];
-        a.extend_from_slice(args);
+        a.extend_from_slice(&forward);
         a
     })?;
 
@@ -423,7 +433,11 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
     let disk_img = create_test_disk(&root)?;
 
     println!();
-    println!("Launching QEMU...");
+    if terminal_only {
+        println!("Launching QEMU (terminal mode — no FB/GUI)...");
+    } else {
+        println!("Launching QEMU...");
+    }
     println!("  Press Ctrl-A X to exit QEMU");
     println!();
 
@@ -433,11 +447,22 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
         "-m".to_string(), "2G".to_string(),
         "-serial".to_string(), "stdio".to_string(),
         "-monitor".to_string(), "none".to_string(),
-        "-device".to_string(), "ramfb".to_string(),
-        "-device".to_string(), "virtio-keyboard-device".to_string(),
-        "-device".to_string(), "virtio-tablet-device".to_string(),
-        "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
     ];
+    if !terminal_only {
+        qemu_args.extend_from_slice(&[
+            "-device".to_string(), "ramfb".to_string(),
+            "-device".to_string(), "virtio-keyboard-device".to_string(),
+            "-device".to_string(), "virtio-tablet-device".to_string(),
+        ]);
+    } else {
+        // Headless: no display, no FB, no pointer.
+        qemu_args.extend_from_slice(&[
+            "-display".to_string(), "none".to_string(),
+        ]);
+    }
+    qemu_args.extend_from_slice(&[
+        "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
+    ]);
 
     // Add virtio-blk disk if image exists
     if disk_img.exists() {

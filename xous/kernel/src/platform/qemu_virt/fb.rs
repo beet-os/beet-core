@@ -103,6 +103,15 @@ static mut RAMFB_CFG:  RamFbCfg       = RamFbCfg { addr: 0, fourcc: 0, flags: 0,
 /// Global console instance (initialised once in `init()`).
 static mut FB_CONSOLE: Option<FbConsole> = None;
 
+/// Set to `true` once `init()` finds a working ramfb device. The GUI
+/// compose / timer-driven recompose paths read this so terminal-only
+/// boots (no `-device ramfb`) don't waste CPU painting into an
+/// unmapped framebuffer region.
+static mut FB_READY: bool = false;
+
+#[inline]
+pub fn is_fb_ready() -> bool { unsafe { FB_READY } }
+
 /// Global window manager.
 ///
 /// `WindowManager::new()` is `const`, so we can hold one as a static and
@@ -206,14 +215,18 @@ unsafe fn find_ramfb_key() -> Option<u16> {
 
 /// Write the ramfb configuration to FW_CFG via the DMA interface.
 unsafe fn write_ramfb_cfg(key: u16) {
-    // Fill RamFbCfg (all big-endian).
+    // RamFbCfg is `#[repr(C, packed)]` — its fields are NOT guaranteed
+    // to be naturally aligned, so we must use `write_unaligned` rather
+    // than `write_volatile` (which UB-checks alignment). The values
+    // still cross to QEMU through a regular Normal-memory write
+    // followed by the DSB ISH in fwcfg_dma_submit.
     let cfg = addr_of_mut!(RAMFB_CFG);
-    write_volatile(addr_of_mut!((*cfg).addr),   (FB_PHYS as u64).to_be());
-    write_volatile(addr_of_mut!((*cfg).fourcc), DRM_FORMAT_XRGB8888.to_be());
-    write_volatile(addr_of_mut!((*cfg).flags),  0u32.to_be());
-    write_volatile(addr_of_mut!((*cfg).width),  (FB_WIDTH as u32).to_be());
-    write_volatile(addr_of_mut!((*cfg).height), (FB_HEIGHT as u32).to_be());
-    write_volatile(addr_of_mut!((*cfg).stride), (FB_STRIDE_BYTES as u32).to_be());
+    core::ptr::write_unaligned(addr_of_mut!((*cfg).addr),   (FB_PHYS as u64).to_be());
+    core::ptr::write_unaligned(addr_of_mut!((*cfg).fourcc), DRM_FORMAT_XRGB8888.to_be());
+    core::ptr::write_unaligned(addr_of_mut!((*cfg).flags),  0u32.to_be());
+    core::ptr::write_unaligned(addr_of_mut!((*cfg).width),  (FB_WIDTH as u32).to_be());
+    core::ptr::write_unaligned(addr_of_mut!((*cfg).height), (FB_HEIGHT as u32).to_be());
+    core::ptr::write_unaligned(addr_of_mut!((*cfg).stride), (FB_STRIDE_BYTES as u32).to_be());
 
     let cfg_phys = virt_to_phys(cfg as usize) as u64;
     let dma_len  = core::mem::size_of::<RamFbCfg>() as u32;
@@ -257,6 +270,7 @@ pub unsafe fn init() -> bool {
 
     // stride in pixels (not bytes)
     FB_CONSOLE = Some(FbConsole::new(fb_va, FB_WIDTH, FB_HEIGHT, FB_WIDTH));
+    FB_READY = true;
 
     true
 }
@@ -533,6 +547,7 @@ pub fn populate_demo_desktop() {
 /// Reads the current timer tick count to drive both the taskbar clock
 /// and the desktop's animated elements (spinner, bouncing accent).
 pub fn compose_desktop() {
+    if !is_fb_ready() { return; }
     let tick = super::timer::tick_count();
     // 100 timer ticks per second — see TICK_RATE_HZ in timer.rs.
     let uptime_seconds = tick / 100;
@@ -546,6 +561,10 @@ pub fn compose_desktop() {
 /// taskbar clock, spinner, and background animation without needing
 /// explicit input.  Called by `handle_irq` ~10 times a second.
 pub fn tick_recompose_if_due(tick: u64) {
+    // Terminal-only boots (no `-device ramfb`) skip the entire GUI
+    // pipeline so the timer IRQ stays cheap and the shell isn't
+    // competing with a wasted rasterizer.
+    if !is_fb_ready() { return; }
     // 10 Hz: smooth enough for the spinner and bouncing accent, well
     // below the 100 Hz timer so we don't melt the (software!) rasterizer.
     if tick % 10 == 0 {

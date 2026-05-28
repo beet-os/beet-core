@@ -250,8 +250,13 @@ fn dispatch_input_char(c: u8) {
     // WindowManager consumes the keystroke and triggers a recompose.
     // We only fall through to the IPC path when no window wanted the
     // key. This lets the shell keep working when the desktop has no
-    // focused interactive window.
-    let consumed = crate::platform::qemu_virt::fb::with_wm(|wm| wm.handle_key(c));
+    // focused interactive window. Terminal-only boots (no ramfb) skip
+    // the entire WM consult so keys go straight to the shell.
+    let consumed = if crate::platform::qemu_virt::fb::is_fb_ready() {
+        crate::platform::qemu_virt::fb::with_wm(|wm| wm.handle_key(c))
+    } else {
+        false
+    };
     if consumed {
         crate::platform::qemu_virt::fb::compose_desktop();
         return;
