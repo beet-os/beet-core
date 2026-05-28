@@ -14,10 +14,12 @@ pub mod rand;
 
 /// Write a string to the platform framebuffer console (if available).
 /// No-op on platforms without a framebuffer or before FB is initialized.
-#[cfg(feature = "platform-qemu-virt")]
+/// Only callers live in `cfg(beetos)` paths (debug/serial), so the stub is
+/// gated the same way to avoid a hosted-mode dead-code warning.
+#[cfg(all(beetos, feature = "platform-qemu-virt"))]
 pub fn fb_write(s: &str) { self::qemu_virt::fb::write_str(s); }
 
-#[cfg(not(feature = "platform-qemu-virt"))]
+#[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
 pub fn fb_write(_s: &str) {}
 
 /// Platform specific initialization.

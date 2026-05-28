@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//
+
+// The polling path that uses these futures (scheduler::activate_current,
+// services::print_current_process, several syscall arms) is gated on
+// `cfg(beetos)`.  In hosted-mode builds only the constructor sites compile,
+// so most variants, helpers, and the PollResult enum look unused — silence
+// those warnings without losing the design.
+#![cfg_attr(not(beetos), allow(dead_code))]
+
 //! Kernel futures — compiler-sized async state for in-flight syscalls.
 //!
 //! Each variant represents a blocking syscall that has been suspended.

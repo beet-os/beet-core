@@ -25,9 +25,11 @@ use crate::server::Server;
 const MAX_SERVER_COUNT: usize = 128;
 
 /// Maximum number of processes waiting for the display at once.
+#[cfg(beetos)]
 const DISPLAY_WAITER_MAX: usize = 16;
 
 /// Capacity of the keyboard input ring buffer (bytes).
+#[cfg(beetos)]
 pub(crate) const INPUT_BUF_CAP: usize = 64;
 
 /// Kernel state for exclusive display ownership.
