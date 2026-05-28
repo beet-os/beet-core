@@ -33,7 +33,7 @@ pub fn init(_fdt_phys: *const u8) {
 ///
 /// On real hardware this would power off or reboot via PMGR.
 #[allow(dead_code)]
-pub fn shutdown() {
+pub fn shutdown() -> ! {
     // TODO(M2): implement platform shutdown via Apple PMGR
     loop {
         // Halt the CPU; on real hardware we would issue a power-off command
