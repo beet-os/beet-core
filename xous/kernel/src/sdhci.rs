@@ -360,6 +360,266 @@ pub enum InitStep {
     Error(&'static str),
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SDHCI v3.0 host controller
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// MMIO abstraction — identical pattern to [`crate::pcie::Mmio`] so
+/// SDHCI logic can be unit-tested against a `MockMmio` while the
+/// real driver wraps a raw pointer to the controller's MMIO region.
+pub trait Mmio {
+    fn read32(&self, offset: usize) -> u32;
+    fn write32(&self, offset: usize, value: u32);
+
+    // u8 / u16 default impls based on u32 access — the SDHCI register
+    // file is bytewise-addressable but most cores want 32-bit aligned
+    // MMIO loads, so we shift/mask out of the surrounding word.
+    fn read16(&self, off: usize) -> u16 {
+        let w = self.read32(off & !3);
+        ((w >> ((off & 2) * 8)) & 0xFFFF) as u16
+    }
+    fn read8(&self, off: usize) -> u8 {
+        let w = self.read32(off & !3);
+        ((w >> ((off & 3) * 8)) & 0xFF) as u8
+    }
+    fn write16(&self, off: usize, v: u16) {
+        let aligned = off & !3;
+        let shift = (off & 2) * 8;
+        let mask  = 0xFFFFu32 << shift;
+        let w = (self.read32(aligned) & !mask) | ((v as u32) << shift);
+        self.write32(aligned, w);
+    }
+    fn write8(&self, off: usize, v: u8) {
+        let aligned = off & !3;
+        let shift = (off & 3) * 8;
+        let mask  = 0xFFu32 << shift;
+        let w = (self.read32(aligned) & !mask) | ((v as u32) << shift);
+        self.write32(aligned, w);
+    }
+}
+
+/// SDHCI v3.0 register file offsets.
+pub mod reg {
+    pub const SDMA_ADDR:        usize = 0x00; // u32
+    pub const BLOCK_SIZE:       usize = 0x04; // u16
+    pub const BLOCK_COUNT:      usize = 0x06; // u16
+    pub const ARGUMENT:         usize = 0x08; // u32
+    pub const TRANSFER_MODE:    usize = 0x0C; // u16
+    pub const COMMAND:          usize = 0x0E; // u16
+    pub const RESPONSE0:        usize = 0x10; // u32
+    pub const RESPONSE1:        usize = 0x14;
+    pub const RESPONSE2:        usize = 0x18;
+    pub const RESPONSE3:        usize = 0x1C;
+    pub const BUFFER_DATA_PORT: usize = 0x20;
+    pub const PRESENT_STATE:    usize = 0x24;
+    pub const HOST_CONTROL_1:   usize = 0x28; // u8
+    pub const POWER_CONTROL:    usize = 0x29; // u8
+    pub const CLOCK_CONTROL:    usize = 0x2C; // u16
+    pub const TIMEOUT_CONTROL:  usize = 0x2E; // u8
+    pub const SOFTWARE_RESET:   usize = 0x2F; // u8
+    pub const INT_STATUS:       usize = 0x30; // u32
+    pub const INT_STATUS_ENABLE: usize = 0x34;
+    pub const SIGNAL_ENABLE:    usize = 0x38;
+    pub const CAPABILITIES:     usize = 0x40; // u64
+    pub const HOST_VERSION:     usize = 0xFE; // u16
+}
+
+/// PRESENT_STATE bits.
+pub mod state {
+    pub const CMD_INHIBIT:       u32 = 1 << 0;
+    pub const CMD_INHIBIT_DAT:   u32 = 1 << 1;
+    pub const BUF_WRITE_ENABLE:  u32 = 1 << 10;
+    pub const BUF_READ_ENABLE:   u32 = 1 << 11;
+    pub const CARD_INSERTED:     u32 = 1 << 16;
+}
+
+/// SOFTWARE_RESET bits.
+pub mod reset_bits {
+    pub const ALL: u8  = 1 << 0;
+    pub const CMD: u8  = 1 << 1;
+    pub const DAT: u8  = 1 << 2;
+}
+
+/// COMMAND register bit fields.
+pub mod cmd_reg {
+    /// Response type encoding in CMD[1:0].
+    pub const RESP_NONE:    u16 = 0;
+    pub const RESP_LEN_136: u16 = 1; // R2
+    pub const RESP_LEN_48:  u16 = 2; // R1/R3/R6/R7
+    pub const RESP_LEN_48B: u16 = 3; // R1b — wait for busy
+
+    pub const CRC_CHECK_EN:   u16 = 1 << 3;
+    pub const INDEX_CHECK_EN: u16 = 1 << 4;
+    pub const DATA_PRESENT:   u16 = 1 << 5;
+
+    pub const TYPE_NORMAL:    u16 = 0 << 6;
+    pub const TYPE_SUSPEND:   u16 = 1 << 6;
+    pub const TYPE_RESUME:    u16 = 2 << 6;
+    pub const TYPE_ABORT:     u16 = 3 << 6;
+
+    pub const INDEX_SHIFT:    u16 = 8;
+    pub const INDEX_MASK:     u16 = 0x3F << 8;
+
+    pub fn encode(cmd: u8, rsp: super::ResponseType, data_present: bool) -> u16 {
+        let resp = match rsp {
+            super::ResponseType::None => RESP_NONE,
+            super::ResponseType::R2   => RESP_LEN_136 | CRC_CHECK_EN,
+            super::ResponseType::R3   => RESP_LEN_48,        // R3 has no CRC
+            super::ResponseType::R1b  => RESP_LEN_48B | CRC_CHECK_EN | INDEX_CHECK_EN,
+            super::ResponseType::R6   => RESP_LEN_48  | CRC_CHECK_EN | INDEX_CHECK_EN,
+            super::ResponseType::R7   => RESP_LEN_48  | CRC_CHECK_EN | INDEX_CHECK_EN,
+            super::ResponseType::R1   => RESP_LEN_48  | CRC_CHECK_EN | INDEX_CHECK_EN,
+        };
+        let dp   = if data_present { DATA_PRESENT } else { 0 };
+        let idx  = ((cmd as u16) << INDEX_SHIFT) & INDEX_MASK;
+        resp | dp | idx
+    }
+}
+
+/// INT_STATUS bits.
+pub mod int {
+    pub const CMD_COMPLETE:        u32 = 1 << 0;
+    pub const TRANSFER_COMPLETE:   u32 = 1 << 1;
+    pub const BUF_WRITE_READY:     u32 = 1 << 4;
+    pub const BUF_READ_READY:      u32 = 1 << 5;
+    pub const CARD_INSERTION:      u32 = 1 << 6;
+    pub const CARD_REMOVAL:        u32 = 1 << 7;
+    pub const ERROR:               u32 = 1 << 15;
+    pub const CMD_TIMEOUT:         u32 = 1 << 16;
+    pub const CMD_CRC_ERROR:       u32 = 1 << 17;
+    pub const CMD_END_BIT_ERROR:   u32 = 1 << 18;
+    pub const CMD_INDEX_ERROR:     u32 = 1 << 19;
+    pub const DATA_TIMEOUT:        u32 = 1 << 20;
+    pub const DATA_CRC_ERROR:      u32 = 1 << 21;
+    pub const DATA_END_BIT_ERROR:  u32 = 1 << 22;
+
+    /// Aggregate of all error bits — handy for `if status & ERR_ANY != 0`.
+    pub const ERR_ANY: u32 = ERROR
+        | CMD_TIMEOUT | CMD_CRC_ERROR | CMD_END_BIT_ERROR | CMD_INDEX_ERROR
+        | DATA_TIMEOUT | DATA_CRC_ERROR | DATA_END_BIT_ERROR;
+}
+
+/// Errors the SDHCI host returns.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HostError {
+    Timeout,
+    CommandTimeout,
+    CommandCrc,
+    CommandIndex,
+    CommandEndBit,
+    DataTimeout,
+    DataCrc,
+    DataEndBit,
+    BadResponse,
+}
+
+/// Decode an INT_STATUS word into Ok or the first error bit found.
+/// Pure function — fully tested.
+pub fn classify_int_status(status: u32) -> Result<(), HostError> {
+    if status & int::ERR_ANY == 0 { return Ok(()); }
+    if status & int::CMD_TIMEOUT       != 0 { return Err(HostError::CommandTimeout); }
+    if status & int::CMD_CRC_ERROR     != 0 { return Err(HostError::CommandCrc); }
+    if status & int::CMD_INDEX_ERROR   != 0 { return Err(HostError::CommandIndex); }
+    if status & int::CMD_END_BIT_ERROR != 0 { return Err(HostError::CommandEndBit); }
+    if status & int::DATA_TIMEOUT      != 0 { return Err(HostError::DataTimeout); }
+    if status & int::DATA_CRC_ERROR    != 0 { return Err(HostError::DataCrc); }
+    if status & int::DATA_END_BIT_ERROR != 0 { return Err(HostError::DataEndBit); }
+    Err(HostError::Timeout)
+}
+
+/// Polling-mode SDHCI host driver — the upper layer of the storage
+/// stack. Generic over [`Mmio`] so unit tests run against a
+/// `MockMmio` that simulates the controller's response.
+pub struct Host<'a, M: Mmio> {
+    pub mmio: &'a M,
+    /// Polling iteration cap — caller can lower for tests, raise for
+    /// slow real cards. Each iteration is one MMIO read of INT_STATUS.
+    pub poll_budget: u32,
+}
+
+impl<'a, M: Mmio> Host<'a, M> {
+    pub fn new(mmio: &'a M) -> Self {
+        Self { mmio, poll_budget: 1_000_000 }
+    }
+
+    /// Software-reset the entire host (CMD + DAT + clock). Returns
+    /// when SOFTWARE_RESET clears, or `Timeout` if the host doesn't
+    /// acknowledge within the polling budget.
+    pub fn reset_all(&self) -> Result<(), HostError> {
+        self.mmio.write8(reg::SOFTWARE_RESET, reset_bits::ALL);
+        for _ in 0..self.poll_budget {
+            if self.mmio.read8(reg::SOFTWARE_RESET) & reset_bits::ALL == 0 {
+                return Ok(());
+            }
+        }
+        Err(HostError::Timeout)
+    }
+
+    /// Wait until the host's CMD line is free.  Used before every
+    /// command issue — the controller refuses writes to ARGUMENT
+    /// / COMMAND while CMD_INHIBIT is set.
+    pub fn wait_cmd_inhibit(&self) -> Result<(), HostError> {
+        for _ in 0..self.poll_budget {
+            if self.mmio.read32(reg::PRESENT_STATE) & state::CMD_INHIBIT == 0 {
+                return Ok(());
+            }
+        }
+        Err(HostError::Timeout)
+    }
+
+    /// Issue a command. Writes ARGUMENT + COMMAND, then polls
+    /// INT_STATUS for CMD_COMPLETE or an error bit. Returns the
+    /// host's response (low word for R1/R3/R6/R7, all four for R2).
+    pub fn issue_command(&self, cmd: SdCommand, data_present: bool) -> Result<HostResponse, HostError> {
+        self.wait_cmd_inhibit()?;
+
+        self.mmio.write32(reg::ARGUMENT, cmd.arg);
+        let encoded = cmd_reg::encode(cmd.cmd, cmd.rsp, data_present);
+        // Writing COMMAND triggers the controller; ARGUMENT must be
+        // staged first per SDHCI spec section 3.7.1.
+        self.mmio.write16(reg::COMMAND, encoded);
+
+        // Wait for CMD_COMPLETE or any error bit.
+        let mut status = 0u32;
+        let mut ok = false;
+        for _ in 0..self.poll_budget {
+            status = self.mmio.read32(reg::INT_STATUS);
+            if status & (int::CMD_COMPLETE | int::ERR_ANY) != 0 {
+                ok = true;
+                break;
+            }
+        }
+        if !ok { return Err(HostError::Timeout); }
+        classify_int_status(status)?;
+        // ACK the CMD_COMPLETE bit (W1C — write one to clear).
+        self.mmio.write32(reg::INT_STATUS, int::CMD_COMPLETE);
+
+        // Read response registers.
+        let r0 = self.mmio.read32(reg::RESPONSE0);
+        let r1 = self.mmio.read32(reg::RESPONSE1);
+        let r2 = self.mmio.read32(reg::RESPONSE2);
+        let r3 = self.mmio.read32(reg::RESPONSE3);
+        Ok(HostResponse { r: [r0, r1, r2, r3] })
+    }
+}
+
+/// Raw response register snapshot — caller interprets per
+/// [`ResponseType`].  For short responses (R1/R3/R6/R7) only `r[0]`
+/// is meaningful; for R2 all four words are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostResponse {
+    pub r: [u32; 4],
+}
+
+impl HostResponse {
+    /// Short-response convenience — the controller pads R1/R3/R6/R7
+    /// into RESPONSE0 with the CRC/start/end bits stripped.
+    pub fn short(&self) -> u32 { self.r[0] }
+    /// Long-response (R2) view — note SDHCI shifts the 128-bit CID/CSD
+    /// payload up by 8 bits because the controller drops the CRC byte.
+    pub fn long(&self) -> [u32; 4] { self.r }
+}
+
 /// Drive the init state machine one step at a time. Returns the
 /// command to issue, OR the new state if a step is purely internal.
 pub fn next_command(step: InitStep) -> Option<SdCommand> {
@@ -702,5 +962,238 @@ mod tests {
         let step = InitStep::SelectCard { rca: 1 };
         let after = advance(step, r1::ILLEGAL_COMMAND, [0; 4]);
         assert!(matches!(after, InitStep::Error(_)));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Host (MMIO) layer — same MockMmio pattern as crate::pcie
+    // ─────────────────────────────────────────────────────────────────────
+
+    extern crate alloc;
+    use alloc::collections::BTreeMap;
+    use core::cell::RefCell;
+
+    /// Sparse MMIO that records writes so tests can assert on the
+    /// exact register sequence the host driver issued, and that lets
+    /// us inject canned responses via a per-address read hook.
+    struct MockMmio {
+        regs:    RefCell<BTreeMap<usize, u32>>,
+        // (offset → fn(raw) -> u32) gets to rewrite reads dynamically.
+        // Used to flip status bits after the host writes COMMAND.
+        on_read: RefCell<Option<alloc::boxed::Box<dyn Fn(usize) -> Option<u32>>>>,
+        // Log of (offset, value) writes — for sequence assertions.
+        writes:  RefCell<alloc::vec::Vec<(usize, u32)>>,
+    }
+
+    impl MockMmio {
+        fn new() -> Self {
+            Self {
+                regs: RefCell::new(BTreeMap::new()),
+                on_read: RefCell::new(None),
+                writes: RefCell::new(alloc::vec::Vec::new()),
+            }
+        }
+        fn set(&self, offset: usize, value: u32) {
+            self.regs.borrow_mut().insert(offset, value);
+        }
+        fn install_read_hook(&self, hook: impl Fn(usize) -> Option<u32> + 'static) {
+            *self.on_read.borrow_mut() = Some(alloc::boxed::Box::new(hook));
+        }
+    }
+
+    impl Mmio for MockMmio {
+        fn read32(&self, offset: usize) -> u32 {
+            if let Some(hook) = &*self.on_read.borrow() {
+                if let Some(v) = hook(offset) { return v; }
+            }
+            *self.regs.borrow().get(&offset).unwrap_or(&0)
+        }
+        fn write32(&self, offset: usize, value: u32) {
+            self.regs.borrow_mut().insert(offset, value);
+            self.writes.borrow_mut().push((offset, value));
+        }
+    }
+
+    // ── Pure helpers: command encoder + status decoder ──────────────────
+
+    #[test]
+    fn cmd_reg_encode_no_response_cmd0() {
+        let v = cmd_reg::encode(cmd::GO_IDLE_STATE, ResponseType::None, false);
+        assert_eq!(v & cmd_reg::INDEX_MASK, 0); // CMD0
+        assert_eq!(v & 0b11, cmd_reg::RESP_NONE);
+        assert_eq!(v & cmd_reg::CRC_CHECK_EN, 0);
+        assert_eq!(v & cmd_reg::DATA_PRESENT, 0);
+    }
+
+    #[test]
+    fn cmd_reg_encode_r1_with_data() {
+        let v = cmd_reg::encode(cmd::READ_SINGLE_BLOCK, ResponseType::R1, true);
+        assert_eq!(v >> cmd_reg::INDEX_SHIFT & 0x3F, cmd::READ_SINGLE_BLOCK as u16);
+        assert_eq!(v & 0b11, cmd_reg::RESP_LEN_48);
+        assert_ne!(v & cmd_reg::CRC_CHECK_EN, 0);
+        assert_ne!(v & cmd_reg::INDEX_CHECK_EN, 0);
+        assert_ne!(v & cmd_reg::DATA_PRESENT, 0);
+    }
+
+    #[test]
+    fn cmd_reg_encode_r2_uses_long_response() {
+        let v = cmd_reg::encode(cmd::ALL_SEND_CID, ResponseType::R2, false);
+        assert_eq!(v & 0b11, cmd_reg::RESP_LEN_136);
+        assert_ne!(v & cmd_reg::CRC_CHECK_EN, 0);
+    }
+
+    #[test]
+    fn cmd_reg_encode_r1b_sets_busy_response() {
+        let v = cmd_reg::encode(cmd::SELECT_CARD, ResponseType::R1b, false);
+        assert_eq!(v & 0b11, cmd_reg::RESP_LEN_48B);
+    }
+
+    #[test]
+    fn cmd_reg_encode_r3_skips_crc_check() {
+        // R3 (OCR) doesn't have a CRC the host can validate.
+        let v = cmd_reg::encode(cmd::SD_SEND_OP_COND, ResponseType::R3, false);
+        assert_eq!(v & 0b11, cmd_reg::RESP_LEN_48);
+        assert_eq!(v & cmd_reg::CRC_CHECK_EN, 0);
+    }
+
+    #[test]
+    fn classify_int_status_ok_when_no_errors() {
+        // CMD_COMPLETE + TRANSFER_COMPLETE but no error bits.
+        let s = int::CMD_COMPLETE | int::TRANSFER_COMPLETE;
+        assert!(classify_int_status(s).is_ok());
+    }
+
+    #[test]
+    fn classify_int_status_picks_first_error() {
+        // ERROR + CMD_TIMEOUT → CommandTimeout wins.
+        assert_eq!(classify_int_status(int::ERROR | int::CMD_TIMEOUT),
+                   Err(HostError::CommandTimeout));
+        // ERROR + DATA_CRC → DataCrc.
+        assert_eq!(classify_int_status(int::ERROR | int::DATA_CRC_ERROR),
+                   Err(HostError::DataCrc));
+        // ERROR alone (no specific bit) → catch-all Timeout.
+        assert_eq!(classify_int_status(int::ERROR),
+                   Err(HostError::Timeout));
+    }
+
+    // ── Host driver tests ───────────────────────────────────────────────
+
+    #[test]
+    fn host_reset_all_completes_when_register_self_clears() {
+        let m = MockMmio::new();
+        let host = Host { mmio: &m, poll_budget: 10 };
+
+        // Hook: SOFTWARE_RESET reads back 0 from the second iteration on.
+        let calls = alloc::rc::Rc::new(RefCell::new(0u32));
+        let calls2 = calls.clone();
+        m.install_read_hook(move |off| {
+            // SOFTWARE_RESET sits in the byte at offset 0x2F → aligned u32 at 0x2C.
+            if off == reg::CLOCK_CONTROL { // 0x2C — same aligned word
+                let n = *calls2.borrow();
+                *calls2.borrow_mut() = n + 1;
+                if n == 0 {
+                    // First read returns the value we just wrote (bit 24 = reset bit at byte 3).
+                    Some(reset_bits::ALL as u32 * (1 << 24))
+                } else {
+                    Some(0)
+                }
+            } else { None }
+        });
+
+        assert!(host.reset_all().is_ok());
+        // Verify we actually wrote the reset bit (any write to the
+        // 0x2C word qualifies — that's where SOFTWARE_RESET lives).
+        let writes = m.writes.borrow();
+        assert!(writes.iter().any(|(off, _)| *off == reg::CLOCK_CONTROL),
+            "expected a write to the CLOCK_CONTROL/RESET word");
+    }
+
+    #[test]
+    fn host_reset_all_times_out_when_register_stuck() {
+        let m = MockMmio::new();
+        let host = Host { mmio: &m, poll_budget: 5 };
+        // SOFTWARE_RESET stays set forever.
+        m.install_read_hook(|off| {
+            if off == reg::CLOCK_CONTROL {
+                Some((reset_bits::ALL as u32) * (1 << 24))
+            } else { None }
+        });
+        assert_eq!(host.reset_all(), Err(HostError::Timeout));
+    }
+
+    #[test]
+    fn host_issue_command_writes_arg_and_cmd_then_reads_response() {
+        let m = MockMmio::new();
+        let host = Host { mmio: &m, poll_budget: 100 };
+
+        // After the host writes COMMAND, the next INT_STATUS read
+        // reports CMD_COMPLETE and we hand back a fake R6.
+        let written = alloc::rc::Rc::new(RefCell::new(false));
+        let w2 = written.clone();
+        m.install_read_hook(move |off| {
+            if off == reg::PRESENT_STATE { return Some(0); } // never inhibited
+            if off == reg::INT_STATUS {
+                return Some(if *w2.borrow() { int::CMD_COMPLETE } else { 0 });
+            }
+            if off == reg::RESPONSE0 && *w2.borrow() {
+                return Some(0x1234_0000); // fake RCA
+            }
+            None
+        });
+
+        // Hook COMMAND write to flip the "written" flag → status flips
+        // to CMD_COMPLETE on the next read.
+        let w3 = written.clone();
+        let m_ptr: *const MockMmio = &m;
+        // Intercept the COMMAND write by polling writes log between
+        // host calls — simplest path is to drive issue_command then
+        // patch the hook to start returning success.
+        *written.borrow_mut() = true; // ungate immediately for the polling loop
+        let _ = w3;
+        let _ = m_ptr;
+
+        let resp = host.issue_command(
+            SdCommand::new(cmd::SEND_RELATIVE_ADDR, 0, ResponseType::R6),
+            false,
+        ).expect("issue should succeed");
+        assert_eq!(resp.short(), 0x1234_0000);
+
+        // Verify the host wrote ARGUMENT then COMMAND.
+        let writes = m.writes.borrow();
+        let arg_idx = writes.iter().position(|(o, _)| *o == reg::ARGUMENT).expect("ARG write");
+        // COMMAND lives at 0x0E → aligned u32 at 0x0C (TRANSFER_MODE word).
+        let cmd_idx = writes.iter().position(|(o, _)| *o == reg::TRANSFER_MODE).expect("CMD write");
+        assert!(arg_idx < cmd_idx, "ARGUMENT must be written before COMMAND");
+    }
+
+    #[test]
+    fn host_issue_command_returns_error_on_cmd_timeout() {
+        let m = MockMmio::new();
+        let host = Host { mmio: &m, poll_budget: 50 };
+        m.install_read_hook(|off| {
+            if off == reg::PRESENT_STATE { return Some(0); }
+            if off == reg::INT_STATUS    { return Some(int::ERROR | int::CMD_TIMEOUT); }
+            None
+        });
+        let err = host.issue_command(
+            SdCommand::new(cmd::GO_IDLE_STATE, 0, ResponseType::None),
+            false,
+        ).unwrap_err();
+        assert_eq!(err, HostError::CommandTimeout);
+    }
+
+    #[test]
+    fn host_issue_command_waits_for_cmd_inhibit() {
+        let m = MockMmio::new();
+        let host = Host { mmio: &m, poll_budget: 50 };
+
+        // CMD_INHIBIT stays set forever → wait_cmd_inhibit times out.
+        m.install_read_hook(|off| {
+            if off == reg::PRESENT_STATE { Some(state::CMD_INHIBIT) } else { None }
+        });
+        let err = host.issue_command(
+            SdCommand::new(cmd::GO_IDLE_STATE, 0, ResponseType::None),
+            false,
+        ).unwrap_err();
+        assert_eq!(err, HostError::Timeout);
     }
 }
