@@ -373,6 +373,32 @@ impl CompletionQueue {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Transport trait — the seam between the generic NVMe protocol and
+// the per-platform driver (Apple ANS, future PCIe NVMe, hosted-mode
+// in-process simulator).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One round-trip through a controller: submit an SQE, eventually
+/// get a CQE back. Real implementations (ANS, PCIe NVMe) write the
+/// SQE into DMA memory and ring a doorbell; the hosted-mode simulator
+/// (see `tests::HostedNvmeController` below) runs the command
+/// synchronously against an in-memory namespace. Either way the
+/// upper layer sees the same `Result<Cqe, …>`.
+pub trait Transport {
+    /// Execute the command. On success returns the controller's
+    /// completion entry. `data` is the buffer the command reads
+    /// from / writes to (length determined by the command, e.g.
+    /// 4096 for IDENTIFY, n_blocks * block_size for READ/WRITE).
+    /// `Ok` does NOT mean the command succeeded — callers must
+    /// inspect the returned [`StatusField`] via `cqe.status()`.
+    fn submit(&mut self, sqe: &Sqe, data: &mut [u8]) -> Cqe;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -557,5 +583,215 @@ mod tests {
         // Wrapped — phase must have flipped.
         assert!(!cq.phase);
         assert_eq!(cq.head, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // HostedNvmeController — in-process simulator implementing Transport.
+    //
+    // Why this lives here:
+    //  - Validates the protocol layer END-TO-END (encode SQE → simulate
+    //    controller → decode CQE), not just per-helper unit tests.
+    //  - Sets the contract every real Transport (Apple ANS, PCIe NVMe,
+    //    virtio-NVMe) has to satisfy. If a real driver doesn't pass the
+    //    same Identify/Read/Write integration tests below, it's broken.
+    //  - In the future we'll lift this out to a public `nvme::hosted`
+    //    module so apps can use a fake NVMe device under `cargo run`
+    //    hosted mode without M1 hardware.
+    // ─────────────────────────────────────────────────────────────────────
+
+    extern crate alloc;
+    use alloc::vec::Vec;
+    use alloc::vec;
+
+    pub struct HostedNvmeController {
+        /// Synthetic namespace 1 backing store.
+        ns_blocks: Vec<u8>,
+        block_size: u32,
+        /// Last SQE submitted, for diagnostics.
+        last_sqe: Option<Sqe>,
+        /// Monotonic CID echo + SQ head counters.
+        sq_head: u16,
+    }
+
+    impl HostedNvmeController {
+        pub fn new(block_size: u32, n_blocks: u64) -> Self {
+            let size = (block_size as u64 * n_blocks) as usize;
+            Self {
+                ns_blocks: vec![0u8; size],
+                block_size,
+                last_sqe: None,
+                sq_head: 0,
+            }
+        }
+
+        fn cqe(&mut self, sqe: &Sqe, sc: u8, dw0: u32) -> Cqe {
+            self.sq_head = self.sq_head.wrapping_add(1);
+            // Status field encoding: bits 1..15 = SC | SCT, top bit
+            // = DNR/More flags (we leave 0 here).
+            let status_raw = (sc as u32) & 0xFF; // SCT=0 (generic) implied.
+            Cqe {
+                dw0,
+                dw1: 0,
+                sq_head_sqid: self.sq_head as u32,
+                cid_phase_status: (cid_of(sqe.cdw0) as u32)
+                    | (1 << 16) // phase
+                    | (status_raw << 17),
+            }
+        }
+
+        fn handle_identify(&mut self, sqe: &Sqe, data: &mut [u8]) -> Cqe {
+            // Return canned data for CNS = 1 (controller) and CNS = 0
+            // (namespace 1). Other CNS values return INVALID_FIELD.
+            if data.len() < 4096 {
+                return self.cqe(sqe, sc_generic::INVALID_FIELD, 0);
+            }
+            for b in data.iter_mut() { *b = 0; }
+            let cns_val = (sqe.cdw10 & 0xFF) as u8;
+            match cns_val {
+                cns_v if cns_v == cns::IDENTIFY_CONTROLLER => {
+                    // Synthesize a plausible Apple-ish identify-controller payload.
+                    data[0..2].copy_from_slice(&0x106Bu16.to_le_bytes()); // VID = Apple
+                    data[2..4].copy_from_slice(&0x0000u16.to_le_bytes());
+                    data[4..24].copy_from_slice(b"HOSTED-NVME-1234567 ");
+                    data[24..64].copy_from_slice(
+                        b"BeetOS Hosted NVMe Simulator Namespace 1"
+                    );
+                    data[64..72].copy_from_slice(b"sim-1.00");
+                    data[77] = 5; // MDTS
+                    self.cqe(sqe, sc_generic::SUCCESS, 0)
+                }
+                cns_v if cns_v == cns::IDENTIFY_NAMESPACE => {
+                    let nblocks = (self.ns_blocks.len() / self.block_size as usize) as u64;
+                    data[0..8].copy_from_slice(&nblocks.to_le_bytes());
+                    data[8..16].copy_from_slice(&nblocks.to_le_bytes());
+                    data[25] = 0;     // NLBAF = single format
+                    data[26] = 0;     // FLBAS = 0
+                    // LBAF0 at offset 128: LBA Data Size exponent.
+                    let exp = (self.block_size).trailing_zeros() as u8;
+                    data[128 + 2] = exp;
+                    self.cqe(sqe, sc_generic::SUCCESS, 0)
+                }
+                _ => self.cqe(sqe, sc_generic::INVALID_FIELD, 0),
+            }
+        }
+
+        fn handle_read(&mut self, sqe: &Sqe, data: &mut [u8]) -> Cqe {
+            let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+            let nblocks = (sqe.cdw12 & 0xFFFF) as u64 + 1;
+            let off = (slba * self.block_size as u64) as usize;
+            let len = (nblocks * self.block_size as u64) as usize;
+            if off + len > self.ns_blocks.len() {
+                return self.cqe(sqe, sc_generic::LBA_OUT_OF_RANGE, 0);
+            }
+            if data.len() < len {
+                return self.cqe(sqe, sc_generic::INVALID_FIELD, 0);
+            }
+            data[..len].copy_from_slice(&self.ns_blocks[off..off + len]);
+            self.cqe(sqe, sc_generic::SUCCESS, 0)
+        }
+
+        fn handle_write(&mut self, sqe: &Sqe, data: &mut [u8]) -> Cqe {
+            let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+            let nblocks = (sqe.cdw12 & 0xFFFF) as u64 + 1;
+            let off = (slba * self.block_size as u64) as usize;
+            let len = (nblocks * self.block_size as u64) as usize;
+            if off + len > self.ns_blocks.len() {
+                return self.cqe(sqe, sc_generic::LBA_OUT_OF_RANGE, 0);
+            }
+            if data.len() < len {
+                return self.cqe(sqe, sc_generic::INVALID_FIELD, 0);
+            }
+            self.ns_blocks[off..off + len].copy_from_slice(&data[..len]);
+            self.cqe(sqe, sc_generic::SUCCESS, 0)
+        }
+    }
+
+    impl Transport for HostedNvmeController {
+        fn submit(&mut self, sqe: &Sqe, data: &mut [u8]) -> Cqe {
+            self.last_sqe = Some(*sqe);
+            match opcode_of(sqe.cdw0) {
+                op if op == admin_opc::IDENTIFY => self.handle_identify(sqe, data),
+                op if op == nvm_opc::READ       => self.handle_read(sqe, data),
+                op if op == nvm_opc::WRITE      => self.handle_write(sqe, data),
+                op if op == nvm_opc::FLUSH      => self.cqe(sqe, sc_generic::SUCCESS, 0),
+                _ => self.cqe(sqe, sc_generic::INVALID_COMMAND_OPCODE, 0),
+            }
+        }
+    }
+
+    // ── End-to-end integration tests against the simulator ─────────────
+
+    #[test]
+    fn end_to_end_identify_controller_round_trip() {
+        let mut ctrl = HostedNvmeController::new(4096, 1024);
+        let mut buf = [0u8; 4096];
+        let cqe = ctrl.submit(&Sqe::identify(7, cns::IDENTIFY_CONTROLLER, 0, 0), &mut buf);
+        assert!(cqe.status().is_success());
+        assert_eq!(cqe.cid(), 7);
+        let info = ControllerInfo::parse(&buf);
+        assert_eq!(info.vid, 0x106B); // Apple
+        assert!(core::str::from_utf8(&info.model).unwrap().contains("BeetOS"));
+    }
+
+    #[test]
+    fn end_to_end_identify_namespace_reports_capacity() {
+        let mut ctrl = HostedNvmeController::new(4096, 1024); // 4 MB ns
+        let mut buf = [0u8; 4096];
+        let cqe = ctrl.submit(&Sqe::identify(8, cns::IDENTIFY_NAMESPACE, 1, 0), &mut buf);
+        assert!(cqe.status().is_success());
+        let ns = NamespaceInfo::parse(&buf);
+        assert_eq!(ns.size_lba, 1024);
+        assert_eq!(ns.block_size, 4096);
+        assert_eq!(ns.capacity_bytes(), 1024 * 4096);
+    }
+
+    #[test]
+    fn end_to_end_write_then_read_round_trips_payload() {
+        let mut ctrl = HostedNvmeController::new(512, 16); // 8 KB ns
+        // Write LBA 3 with a known pattern.
+        let mut payload = [0u8; 512];
+        for i in 0..512 { payload[i] = ((i * 31 + 5) & 0xFF) as u8; }
+        let cqe = ctrl.submit(&Sqe::write(1, 1, 3, 1, 0), &mut payload);
+        assert!(cqe.status().is_success(), "write failed: {:?}", cqe.status());
+
+        // Read it back; buffer should match.
+        let mut readback = [0xFFu8; 512];
+        let cqe = ctrl.submit(&Sqe::read(2, 1, 3, 1, 0), &mut readback);
+        assert!(cqe.status().is_success());
+        assert_eq!(readback, payload);
+    }
+
+    #[test]
+    fn end_to_end_lba_out_of_range_propagates() {
+        let mut ctrl = HostedNvmeController::new(512, 4); // 4 blocks only
+        let mut buf = [0u8; 512];
+        let cqe = ctrl.submit(&Sqe::read(1, 1, 99, 1, 0), &mut buf);
+        let s = cqe.status();
+        assert!(!s.is_success());
+        assert_eq!(s.sc, sc_generic::LBA_OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn end_to_end_unknown_opcode_returns_invalid() {
+        let mut ctrl = HostedNvmeController::new(512, 4);
+        let mut buf = [0u8; 0];
+        let mut sqe = Sqe::default();
+        sqe.cdw0 = pack_cdw0(0xFE, 0, 99); // unknown vendor opcode
+        let cqe = ctrl.submit(&sqe, &mut buf);
+        assert_eq!(cqe.status().sc, sc_generic::INVALID_COMMAND_OPCODE);
+    }
+
+    #[test]
+    fn end_to_end_multi_block_write_then_read() {
+        let mut ctrl = HostedNvmeController::new(512, 32);
+        let mut payload = [0u8; 2048]; // 4 blocks
+        for i in 0..2048 { payload[i] = ((i ^ 0x55) & 0xFF) as u8; }
+        let cqe = ctrl.submit(&Sqe::write(10, 1, 8, 4, 0), &mut payload);
+        assert!(cqe.status().is_success());
+
+        let mut readback = [0u8; 2048];
+        let cqe = ctrl.submit(&Sqe::read(11, 1, 8, 4, 0), &mut readback);
+        assert!(cqe.status().is_success());
+        assert_eq!(readback, payload);
     }
 }
