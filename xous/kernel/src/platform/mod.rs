@@ -46,12 +46,19 @@ pub struct Console;
 #[cfg(beetos)]
 impl core::fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // Send to the platform's character sink first (UART/serial), then
+        // mirror onto the framebuffer when one is set up. On Apple M1
+        // there is no exposed UART, so the FB is the *only* surface boot
+        // diagnostics ever reach — wiring it here means every panic /
+        // abort / boot log line lands on screen automatically, without
+        // each call site knowing about FB at all.
         #[cfg(feature = "platform-qemu-virt")]
         self::qemu_virt::uart::puts(s);
         #[cfg(feature = "platform-bcm2712")]
         self::bcm2712::uart::puts(s);
         #[cfg(feature = "platform-apple-t8103")]
         self::apple_t8103::console::puts(s);
+        fb_write(s);
         let _ = s;
         Ok(())
     }

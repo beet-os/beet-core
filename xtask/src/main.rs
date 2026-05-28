@@ -10,6 +10,7 @@ fn main() -> anyhow::Result<()> {
         Some("build") => build(&args[1..])?,
         Some("qemu") => qemu(&args[1..])?,
         Some("qemu-smoke") => qemu_smoke()?,
+        Some("qemu-screenshot") => qemu_screenshot(&args[1..])?,
         Some("rpi5") => rpi5()?,
         Some("test") => test()?,
         Some(cmd) => anyhow::bail!("unknown command: {cmd}"),
@@ -23,6 +24,8 @@ fn main() -> anyhow::Result<()> {
             println!("  build [--platform]  Cross-compile for aarch64-unknown-none");
             println!("  qemu               Build and run on QEMU virt");
             println!("  qemu-smoke         Boot QEMU and verify expected progress markers (CI)");
+            println!("  qemu-screenshot [--wait SECS] [--out PATH]");
+            println!("                     Boot QEMU and capture the framebuffer (default: 6s, target/beetos-fb.png)");
             println!("  test               Build and run self-test suite on QEMU (CI)");
             println!();
             println!("Platforms:");
@@ -534,6 +537,132 @@ fn build_test_kernel(root: &std::path::Path) -> anyhow::Result<()> {
         .env("RUSTFLAGS", format!("{linker_arg} -Ccodegen-units=1"))
         .status()?;
     anyhow::ensure!(status.success(), "test kernel build failed");
+    Ok(())
+}
+
+/// Boot the qemu-virt kernel, wait for the FB to stabilize, then capture
+/// it via QEMU's QMP `screendump` and convert PPM → PNG. Saves the result
+/// to the path given by `--out` (default `target/beetos-fb.png`). The
+/// `--wait` flag controls how many seconds to let the kernel run before
+/// snapping (default 6).
+///
+/// Requires: `qemu-system-aarch64`, `socat`, and ImageMagick `convert`
+/// (or `magick`).
+fn qemu_screenshot(args: &[String]) -> anyhow::Result<()> {
+    let root = workspace_root();
+
+    let mut wait_secs: u64 = 6;
+    let mut out_path = root.join("target/beetos-fb.png");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--wait" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--wait needs a value"))?;
+                wait_secs = v.parse()?;
+                i += 2;
+            }
+            "--out" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--out needs a value"))?;
+                out_path = PathBuf::from(v);
+                i += 2;
+            }
+            other => anyhow::bail!("unknown flag: {other}"),
+        }
+    }
+
+    // Same dummy-stub trick as qemu_smoke so we don't need stage1 rustc.
+    let nostd_target = root.join("target/aarch64-unknown-none/debug");
+    std::fs::create_dir_all(&nostd_target)?;
+    let hello_std = nostd_target.join("hello-std.stripped");
+    if !hello_std.exists() {
+        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
+    }
+
+    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    let kernel = elf_to_image(&kernel_elf)?;
+
+    let qmp_sock = root.join("target/qemu-screenshot.qmp");
+    let serial_log = root.join("target/qemu-screenshot-serial.log");
+    let ppm_path = root.join("target/beetos-fb.ppm");
+    let _ = std::fs::remove_file(&qmp_sock);
+    let _ = std::fs::remove_file(&serial_log);
+    let _ = std::fs::remove_file(&ppm_path);
+
+    println!();
+    println!("Launching QEMU for screenshot (wait: {}s)...", wait_secs);
+
+    let mut child = Command::new("qemu-system-aarch64")
+        .args([
+            "-machine", "virt,gic-version=3",
+            "-cpu", "neoverse-n1",
+            "-m", "2G",
+            "-display", "none",
+            "-device", "ramfb",
+            "-chardev", &format!("file,id=c0,path={}", serial_log.display()),
+            "-serial", "chardev:c0",
+            "-qmp", &format!("unix:{},server,nowait", qmp_sock.display()),
+            "-kernel", kernel.to_str().expect("non-UTF8 path"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    // Give QEMU a moment to open the QMP socket before we connect.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Let the kernel run long enough for the boot output to render.
+    std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+
+    let qmp_script = format!(
+        "{}\n{}\n{}\n",
+        r#"{"execute":"qmp_capabilities"}"#,
+        format!(r#"{{"execute":"screendump","arguments":{{"filename":"{}"}}}}"#, ppm_path.display()),
+        r#"{"execute":"quit"}"#,
+    );
+    // socat itself often exits non-zero because `quit` makes QMP close the
+    // socket on us — that's fine, the real success signal is whether the
+    // PPM file shows up below.
+    let _ = Command::new("socat")
+        .arg("-")
+        .arg(format!("UNIX-CONNECT:{}", qmp_sock.display()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            if let Some(mut stdin) = c.stdin.take() {
+                let _ = stdin.write_all(qmp_script.as_bytes());
+                let _ = stdin.flush();
+                drop(stdin);
+            }
+            c.wait()
+        });
+
+    let _ = child.wait();
+
+    anyhow::ensure!(
+        ppm_path.exists(),
+        "QMP screendump did not produce {}",
+        ppm_path.display()
+    );
+
+    // PPM → PNG. Try `magick` (IM7) first, then `convert` (IM6).
+    let conv_status = Command::new("magick")
+        .arg(&ppm_path)
+        .arg(&out_path)
+        .status()
+        .or_else(|_| {
+            Command::new("convert")
+                .arg(&ppm_path)
+                .arg(&out_path)
+                .status()
+        })?;
+    anyhow::ensure!(conv_status.success(), "PPM → PNG conversion failed");
+
+    let size = std::fs::metadata(&out_path)?.len();
+    println!();
+    println!("Screenshot saved: {} ({} bytes)", out_path.display(), size);
     Ok(())
 }
 
