@@ -62,6 +62,35 @@ xtask/          ← build system (runs on host)
 
 The `api/` vs `os/` split follows KeyOS/Xous pattern: `api/keyboard` defines the types and client stubs, `os/keyboard` is the actual driver. Any process can depend on an api crate without pulling in the driver.
 
+## GUI stack
+
+BeetOS has an allocation-free GUI layer living in the `beetos` crate
+(`fb` feature):
+
+- `beetos::gfx` — `Surface`, `Rect`, `Color`, software 2D primitives
+  (lines/rects/circles/blit/text). API shape is intentionally close
+  to wgpu's `Surface`/`Texture` so a future GPU backend (M11) can
+  swap in without touching widget code.
+- `beetos::gui` — `WindowManager` (fixed slab, no_alloc),
+  `Window` + decorations, `WidgetGrid` with `Label`/`Button`/`Spacer`,
+  stateful `CalcState`/`NotesState`, keyboard routing via
+  `handle_key`, `compose_animated` for timer-driven animation.
+- Kernel-side seam: `qemu_virt::fb::with_wm`, `compose_desktop`,
+  `tick_recompose_if_due` (called from the 100 Hz timer IRQ at ~10 Hz).
+  Keyboard events from virtio-input go through the WindowManager
+  first in `arch/aarch64/irq.rs::dispatch_input_char`; unconsumed
+  keys still flow to the existing IPC path so the shell keeps working.
+
+See `docs/gui.md` for architecture details and `docs/wgpu-roadmap.md`
+for the path from today's software rasterizer to a real wgpu stack
+built straight on top of Rust GPU drivers (VC7/AGX/virtio-gpu),
+explicitly bypassing the Vulkan/Metal layer.
+
+Reproducible visuals:
+- `cargo xtask qemu-smoke` — boot check, 9 progress markers, exits 0/1
+- `cargo xtask qemu-screenshot [--wait SECS] [--out PATH]` — capture
+  the FB via QMP `screendump`, PPM → PNG via ImageMagick
+
 ## How to Develop (hosted mode)
 
 **Primary development workflow — no hardware needed:**
