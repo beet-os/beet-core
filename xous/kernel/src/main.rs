@@ -22,6 +22,13 @@ mod arch;
 /// in the per-platform module.
 mod pcie;
 
+/// SD card / SDHCI protocol layer — CRC7/CRC16, command encoding, R1
+/// status, OCR/CID/CSD parsing, init state machine. All pure / mockable
+/// so the unit tests cover everything that doesn't touch real MMIO; the
+/// actual SDHCI register driver lives per-platform (BCM2712 SDHOST,
+/// future virtio-blk equivalent, …).
+mod sdhci;
+
 #[cfg(beetos)]
 mod fb_console;
 
