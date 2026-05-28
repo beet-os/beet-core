@@ -51,7 +51,11 @@ xous/           ← Xous microkernel (cherry-picked from KeyOS)
   ipc/          ← shared IPC types
   api/          ← core service APIs (log, names, ticktimer)
   log/, names/, ticktimer/, trng/  ← core service implementations
-beetos/         ← constants crate (PAGE_SIZE, memory map, addresses)
+beetos/         ← shared no_std crate
+                  ├ constants (PAGE_SIZE, memory map, addresses)
+                  ├ gfx — software 2D rasterizer (Surface, primitives)
+                  └ gui — fixed-size window manager + widget framework
+                    (see docs/gui.md)
 api/            ← BeetOS service APIs (console, keyboard, storage, net)
 os/             ← BeetOS service implementations / drivers
 apps/           ← user applications (shell)
