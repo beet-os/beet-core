@@ -657,10 +657,20 @@ impl WindowManager {
         }
     }
 
+    /// Re-paint the desktop and every visible window onto `screen`,
+    /// with an optional uptime in seconds shown on the taskbar.
+    pub fn compose_with_uptime(&self, screen: &mut Surface, uptime_seconds: u64) {
+        self.compose_inner(screen, Some(uptime_seconds));
+    }
+
     /// Re-paint the desktop and every visible window onto `screen`.
     /// O(windows × pixels) — fine for the static demo screens, will
     /// move to dirty-rect tracking when input lands.
     pub fn compose(&self, screen: &mut Surface) {
+        self.compose_inner(screen, None);
+    }
+
+    fn compose_inner(&self, screen: &mut Surface, uptime: Option<u64>) {
         screen.fill(self.desktop_bg);
 
         // Top accent bar + taskbar across the bottom so the desktop
@@ -676,6 +686,31 @@ impl WindowManager {
         // Brand label on the taskbar.
         screen.draw_text(8, h - taskbar_h + (taskbar_h - font::CHAR_H as i32) / 2,
             "BeetOS", color::TITLE_FG, color::TITLE_BAR);
+
+        // Uptime clock on the right of the taskbar.
+        if let Some(uptime) = uptime {
+            let hh = uptime / 3600;
+            let mm = (uptime % 3600) / 60;
+            let ss = uptime % 60;
+            let mut buf = [b'0'; 32];
+            // Manual zero-padded HH:MM:SS — keeps us out of core::fmt allocations.
+            buf[0] = b'0' + ((hh / 10) % 10) as u8;
+            buf[1] = b'0' + (hh % 10) as u8;
+            buf[2] = b':';
+            buf[3] = b'0' + ((mm / 10) % 10) as u8;
+            buf[4] = b'0' + (mm % 10) as u8;
+            buf[5] = b':';
+            buf[6] = b'0' + ((ss / 10) % 10) as u8;
+            buf[7] = b'0' + (ss % 10) as u8;
+            let s = core::str::from_utf8(&buf[..8]).unwrap_or("");
+            let clock_w = 8 * font::CHAR_W as i32;
+            let cx = w - clock_w - 16;
+            let cy = h - taskbar_h + (taskbar_h - font::CHAR_H as i32) / 2;
+            // Small pill background so the clock pops out of the taskbar.
+            let pill = Rect::new(cx - 8, cy - 4, clock_w + 16, font::CHAR_H as i32 + 8);
+            screen.fill_rect(&pill, color::BEET_PURPLE);
+            screen.draw_text(cx, cy, s, color::WHITE, color::BEET_PURPLE);
+        }
 
         // Taskbar entries — one per window.
         let mut tx: i32 = 80;

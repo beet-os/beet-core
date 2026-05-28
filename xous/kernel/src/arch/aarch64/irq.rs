@@ -161,6 +161,9 @@ fn handle_irq() -> bool {
             timer::TIMER_IRQ => {
                 let count = timer::handle_tick();
                 net_stack::tick(count);
+                // Refresh the desktop once per second so the taskbar
+                // clock advances without the user having to type anything.
+                crate::platform::qemu_virt::fb::tick_recompose_if_due(count);
             }
             uart::UART_IRQ => {
                 // Read all pending characters and route to input focus owner.

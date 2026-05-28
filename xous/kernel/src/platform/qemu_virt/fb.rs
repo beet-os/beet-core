@@ -488,9 +488,27 @@ pub fn populate_demo_desktop() {
 }
 
 /// Re-render the live [`WindowManager`] onto the framebuffer.
+///
+/// Reads the current timer tick count to drive the taskbar clock so
+/// every recompose reflects the latest uptime without each caller
+/// having to plumb that through.
 pub fn compose_desktop() {
+    let tick = super::timer::tick_count();
+    // 100 timer ticks per second — see TICK_RATE_HZ in timer.rs.
+    let uptime_seconds = tick / 100;
     let mut s = unsafe { surface() };
-    with_wm(|wm| wm.compose(&mut s));
+    with_wm(|wm| wm.compose_with_uptime(&mut s, uptime_seconds));
+}
+
+/// Trigger a periodic recompose from the timer IRQ — used to animate
+/// the taskbar clock and surface any state that drifts without explicit
+/// input (e.g. spinners).  Called by `handle_irq` once per second.
+pub fn tick_recompose_if_due(tick: u64) {
+    // Once a second is plenty for an HH:MM:SS clock; cheap enough that
+    // we don't bother with dirty tracking for the demo.
+    if tick % 100 == 0 {
+        compose_desktop();
+    }
 }
 
 /// Convenience: write a colored status line below the boot banner.
