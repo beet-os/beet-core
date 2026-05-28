@@ -87,6 +87,11 @@ impl Color {
         Color(gfx::rgb(r, g, b))
     }
 
+    /// Lift any `gfx::Color` into a wgpu-shaped [`Color`]. Useful when
+    /// pulling values out of the existing palette (`gfx::color::*`)
+    /// without having to repeat the RGB triplet here.
+    pub const fn from_raw(raw: gfx::Color) -> Color { Color(raw) }
+
     pub const fn as_raw(self) -> gfx::Color { self.0 }
 }
 

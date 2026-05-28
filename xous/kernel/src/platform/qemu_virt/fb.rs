@@ -293,63 +293,91 @@ pub unsafe fn surface() -> Surface {
 ///
 /// Designed to be called once, right after [`init`] returns true.
 pub fn draw_boot_screen() {
+    // Run the boot screen through the wgpu_compat shim end-to-end.
+    // Same pixel result as a direct gfx::Surface walk — the point is
+    // that this is exactly the program structure a real wgpu renderer
+    // would have, so when we get a real GPU backend (M11), nothing
+    // here needs to change beyond a single `use` line.
+    use beetos::wgpu_compat::{Color, Instance};
+
     // SAFETY: called only from the single-threaded boot path, after `init`
     // mapped the FB. No other writer can race here.
-    let mut s = unsafe { surface() };
+    let instance = Instance::new();
+    let mut surface = unsafe {
+        instance.create_surface_raw(
+            beetos::phys_to_virt(FB_PHYS) as *mut u32,
+            FB_WIDTH as i32, FB_HEIGHT as i32, FB_WIDTH as i32,
+        )
+    };
+    let device = instance.request_device();
+    let queue = device.queue();
 
-    // Background — slightly lighter than pure black so the boxes pop.
-    s.fill(color::DESKTOP_BG);
+    let mut frame = surface.get_current_texture();
+    let view = frame.texture_view();
+    let mut encoder = device.create_command_encoder(view);
+    {
+        let mut rpass = encoder.begin_render_pass(Some(Color::from_raw(color::DESKTOP_BG)));
 
-    // Top accent bar.
-    let top = Rect::new(0, 0, FB_WIDTH as i32, 4);
-    s.fill_rect(&top, color::BEET_PURPLE);
+        // Top accent bar.
+        rpass.fill_rect(
+            &Rect::new(0, 0, FB_WIDTH as i32, 4),
+            Color::from_raw(color::BEET_PURPLE),
+        );
 
-    // BeetOS title in big-ish block letters (the 8x16 font drawn at 2x via
-    // pixel doubling would be ideal but draw_text uses 1x; for the title we
-    // draw the same string twice with a 1px offset to fake bold).
-    let title_x = 80;
-    let title_y = 80;
-    s.draw_text(title_x,     title_y, "BeetOS",    color::WHITE,        color::DESKTOP_BG);
-    s.draw_text(title_x + 1, title_y, "BeetOS",    color::WHITE,        color::DESKTOP_BG);
-    s.draw_text(title_x,     title_y + 24, "v0.1.0 — booting on QEMU virt (AArch64)", color::LIGHT_GRAY, color::DESKTOP_BG);
+        // BeetOS title — drawn twice for fake-bold.
+        let title_x = 80;
+        let title_y = 80;
+        let white  = Color::from_raw(color::WHITE);
+        let lgray  = Color::from_raw(color::LIGHT_GRAY);
+        let dgray  = Color::from_raw(color::DARK_GRAY);
+        let bg     = Color::from_raw(color::DESKTOP_BG);
+        rpass.draw_text(title_x,     title_y, "BeetOS", white, bg);
+        rpass.draw_text(title_x + 1, title_y, "BeetOS", white, bg);
+        rpass.draw_text(title_x, title_y + 24,
+            "v0.1.0 - booting on QEMU virt (AArch64)", lgray, bg);
 
-    // Decorative beet shape: filled magenta circle with a green leaf line.
-    let beet_cx = FB_WIDTH as i32 - 140;
-    let beet_cy = 130;
-    s.circle_filled(beet_cx, beet_cy, 48, color::BEET_PINK);
-    s.circle_filled(beet_cx, beet_cy, 36, color::BEET_PURPLE);
-    s.line(beet_cx, beet_cy - 48, beet_cx + 18, beet_cy - 80, color::BRIGHT_GREEN);
-    s.line(beet_cx, beet_cy - 48, beet_cx + 38, beet_cy - 72, color::GREEN);
+        // Decorative beet shape.
+        let beet_cx = FB_WIDTH as i32 - 140;
+        let beet_cy = 130;
+        rpass.fill_circle(beet_cx, beet_cy, 48, Color::from_raw(color::BEET_PINK));
+        rpass.fill_circle(beet_cx, beet_cy, 36, Color::from_raw(color::BEET_PURPLE));
+        rpass.line(beet_cx, beet_cy - 48, beet_cx + 18, beet_cy - 80,
+            Color::from_raw(color::BRIGHT_GREEN));
+        rpass.line(beet_cx, beet_cy - 48, beet_cx + 38, beet_cy - 72,
+            Color::from_raw(color::GREEN));
 
-    // Subtitle / hint.
-    s.draw_text(title_x, title_y + 72,
-        "  Kernel: Xous (cherry-picked from KeyOS) + AArch64 port",
-        color::LIGHT_GRAY, color::DESKTOP_BG);
-    s.draw_text(title_x, title_y + 96,
-        "  Graphics: beetos::gfx software rasterizer (wgpu-shaped API)",
-        color::DARK_GRAY, color::DESKTOP_BG);
+        // Subtitle / hint.
+        rpass.draw_text(title_x, title_y + 72,
+            "  Kernel: Xous (cherry-picked from KeyOS) + AArch64 port", lgray, bg);
+        rpass.draw_text(title_x, title_y + 96,
+            "  Graphics: beetos::gfx + wgpu_compat shim", dgray, bg);
 
-    // Phase indicators — laid out along the bottom of the screen.
-    let labels = ["UART", "GIC", "Timer", "FB", "MMU", "ELF", "Shell"];
-    let box_w = 80;
-    let box_h = 24;
-    let gap = 12;
-    let total_w = labels.len() as i32 * box_w + (labels.len() as i32 - 1) * gap;
-    let start_x = (FB_WIDTH as i32 - total_w) / 2;
-    let row_y = FB_HEIGHT as i32 - 80;
-    for (i, label) in labels.iter().enumerate() {
-        let x = start_x + i as i32 * (box_w + gap);
-        let r = Rect::new(x, row_y, box_w, box_h);
-        s.rect_outline(&r, color::WINDOW_FRAME);
-        // Centre-ish the label text (8 px per glyph, 16 px tall).
-        let tx = x + (box_w - (label.len() as i32 * 8)) / 2;
-        let ty = row_y + (box_h - 16) / 2;
-        s.draw_text(tx, ty, label, color::LIGHT_GRAY, color::DESKTOP_BG);
+        // Phase indicators along the bottom.
+        let labels = ["UART", "GIC", "Timer", "FB", "MMU", "ELF", "Shell"];
+        let box_w = 80;
+        let box_h = 24;
+        let gap = 12;
+        let total_w = labels.len() as i32 * box_w + (labels.len() as i32 - 1) * gap;
+        let start_x = (FB_WIDTH as i32 - total_w) / 2;
+        let row_y = FB_HEIGHT as i32 - 80;
+        let frame_c = Color::from_raw(color::WINDOW_FRAME);
+        for (i, label) in labels.iter().enumerate() {
+            let x = start_x + i as i32 * (box_w + gap);
+            let r = Rect::new(x, row_y, box_w, box_h);
+            rpass.stroke_rect(&r, frame_c);
+            let tx = x + (box_w - (label.len() as i32 * 8)) / 2;
+            let ty = row_y + (box_h - 16) / 2;
+            rpass.draw_text(tx, ty, label, lgray, bg);
+        }
+
+        // Bottom accent bar.
+        rpass.fill_rect(
+            &Rect::new(0, FB_HEIGHT as i32 - 4, FB_WIDTH as i32, 4),
+            Color::from_raw(color::BEET_PURPLE),
+        );
     }
-
-    // Bottom accent bar.
-    let bot = Rect::new(0, FB_HEIGHT as i32 - 4, FB_WIDTH as i32, 4);
-    s.fill_rect(&bot, color::BEET_PURPLE);
+    queue.submit([encoder.finish()]);
+    frame.present();
 
     // Reset the FbConsole cursor so any subsequent text appears below the
     // banner, not on top of it. We keep the existing FbConsole intact
