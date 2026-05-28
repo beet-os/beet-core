@@ -21,6 +21,15 @@ SECTIONS
     .text.boot : ALIGN(16)
     {
         KEEP(*(.text.boot))
+        . = ALIGN(8);
+    } > RAM
+
+    /* Pre-allocated boot page tables + boot stack, declared in start.S.
+     * Must live within ±1 MB of .text.boot so the ADR/ADRP instructions
+     * in the page-table setup code stay in relocation range. */
+    .boot.bss (NOLOAD) : ALIGN(16384)
+    {
+        *(.boot.bss)
     } > RAM
 
     /* Exception vectors must be 2KB-aligned (0x800) for VBAR_EL1 */

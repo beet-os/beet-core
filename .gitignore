@@ -1,2 +1,3 @@
 target/
 Cargo.lock
+kernel8.img
