@@ -9,6 +9,7 @@ fn main() -> anyhow::Result<()> {
         Some("check") => check()?,
         Some("build") => build(&args[1..])?,
         Some("qemu") => qemu(&args[1..])?,
+        Some("qemu-smoke") => qemu_smoke()?,
         Some("rpi5") => rpi5()?,
         Some("test") => test()?,
         Some(cmd) => anyhow::bail!("unknown command: {cmd}"),
@@ -21,6 +22,7 @@ fn main() -> anyhow::Result<()> {
             println!("  check              Check all workspace crates (hosted mode)");
             println!("  build [--platform]  Cross-compile for aarch64-unknown-none");
             println!("  qemu               Build and run on QEMU virt");
+            println!("  qemu-smoke         Boot QEMU and verify expected progress markers (CI)");
             println!("  test               Build and run self-test suite on QEMU (CI)");
             println!();
             println!("Platforms:");
@@ -503,6 +505,121 @@ fn build_test_kernel(root: &std::path::Path) -> anyhow::Result<()> {
         .status()?;
     anyhow::ensure!(status.success(), "test kernel build failed");
     Ok(())
+}
+
+/// Boot the qemu-virt kernel and verify expected progress markers appear in
+/// the serial log. Lightweight CI smoke test — does not need the stage1 rustc
+/// or any beetos-test sentinel; just confirms the kernel makes it through
+/// platform init, MMU bring-up, ELF loading, the first preemption switch,
+/// and ends up at the shell prompt.
+///
+/// Exits with code 0 if every marker is seen within the timeout, 1 otherwise.
+fn qemu_smoke() -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let root = workspace_root();
+
+    // hello-std.stripped is embedded via include_bytes! at kernel build time.
+    // Without the stage1 rustc we can't build it, but the kernel only spawns
+    // it on demand from the shell — a dummy placeholder lets the kernel link
+    // and boot. (build_apps() prints the same "[skip] hello-std" notice.)
+    let nostd_target = root.join("target/aarch64-unknown-none/debug");
+    std::fs::create_dir_all(&nostd_target)?;
+    let hello_std = nostd_target.join("hello-std.stripped");
+    if !hello_std.exists() {
+        // Minimal ELF magic — enough to satisfy include_bytes!.
+        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
+    }
+
+    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
+
+    let kernel = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel.exists(), "kernel binary not found at {}", kernel.display());
+
+    let serial_log = root.join("target/qemu-smoke-serial.log");
+    let _ = std::fs::remove_file(&serial_log);
+
+    // Markers we expect to see in order during a healthy boot. If any is
+    // missing the smoke test fails — that's enough signal to catch regressions
+    // in early init, MMU bring-up, ELF loading, scheduling, or shell launch.
+    //
+    // Each substring is chosen to appear exactly once during a normal boot
+    // (e.g. "Platform: QEMU virt" rather than the bare "BeetOS v0.1.0"
+    // banner, which is re-emitted by the shell once it starts).
+    let markers: &[&str] = &[
+        "Platform: QEMU virt",
+        "Timer: initialized",
+        "MMU: enabled",
+        "EL0: loading shell ELF",
+        "EL0: launching shell",
+        "PREEMPT: timer switched",
+        "bsh>",
+    ];
+
+    println!();
+    println!("Launching QEMU smoke test (timeout: 15s)...");
+    println!("  serial log: {}", serial_log.display());
+    println!();
+
+    let qemu_args = vec![
+        "-machine".to_string(), "virt,gic-version=3".to_string(),
+        "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-m".to_string(), "2G".to_string(),
+        "-display".to_string(), "none".to_string(),
+        "-device".to_string(), "ramfb".to_string(),
+        "-chardev".to_string(),
+        format!("file,id=c0,path={}", serial_log.display()),
+        "-serial".to_string(), "chardev:c0".to_string(),
+        "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
+    ];
+
+    let mut child = Command::new("qemu-system-aarch64")
+        .args(&qemu_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut next_marker = 0usize;
+    let mut log_pos: u64 = 0;
+
+    while std::time::Instant::now() < deadline && next_marker < markers.len() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let Ok(file) = std::fs::File::open(&serial_log) else { continue };
+        let metadata = file.metadata()?;
+        if metadata.len() <= log_pos {
+            continue;
+        }
+        let mut reader = BufReader::new(file);
+        use std::io::Seek;
+        reader.seek(std::io::SeekFrom::Start(log_pos))?;
+        for line in reader.lines().flatten() {
+            println!("  {line}");
+            while next_marker < markers.len() && line.contains(markers[next_marker]) {
+                println!("    [ok] marker matched: {}", markers[next_marker]);
+                next_marker += 1;
+            }
+        }
+        log_pos = metadata.len();
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    println!();
+    if next_marker == markers.len() {
+        println!("Result: SMOKE TEST PASSED ({} markers seen)", markers.len());
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Result: SMOKE TEST FAILED — missing marker {}/{}: {:?}",
+            next_marker + 1,
+            markers.len(),
+            markers[next_marker],
+        );
+    }
 }
 
 /// Build the test binary + kernel, launch QEMU with piped stdout, parse results.
