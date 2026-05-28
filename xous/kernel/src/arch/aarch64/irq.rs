@@ -184,6 +184,20 @@ fn handle_irq() -> bool {
                     dispatch_input_char(c);
                 }
             }
+            irq_id if input::tablet_irq_number() == Some(irq_id) => {
+                input::ack_irq_for(irq_id);
+                let changed = input::drain_tablet_events(
+                    |x, y| {
+                        crate::platform::qemu_virt::fb::with_wm(|wm| wm.set_cursor(x, y));
+                    },
+                    || {
+                        crate::platform::qemu_virt::fb::with_wm(|wm| { wm.click_at_cursor(); });
+                    },
+                );
+                if changed {
+                    crate::platform::qemu_virt::fb::compose_desktop();
+                }
+            }
             irq_id => {
                 use core::fmt::Write;
                 let _ = write!(uart::UartWriter, "IRQ {}\n", irq_id);

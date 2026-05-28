@@ -25,6 +25,8 @@ const VIRTIO_INPUT_DEVICE_ID: u32 = 18;
 
 /// EV_KEY event type (key up/down).
 const EV_KEY: u16 = 1;
+/// EV_ABS event type (absolute axis — tablet x/y).
+const EV_ABS: u16 = 3;
 /// Key-down event value.
 const VAL_DOWN: u32 = 1;
 
@@ -34,25 +36,53 @@ const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_LEFTCTRL:   u16 = 29;
 const KEY_RIGHTCTRL:  u16 = 97;
 
-/// Number of event slots in the eventq.
+/// BTN_LEFT — primary mouse / tablet button (Linux evdev).
+const BTN_LEFT: u16 = 0x110;
+
+/// ABS_X / ABS_Y axes for the tablet's absolute coordinates.
+const ABS_X: u16 = 0;
+const ABS_Y: u16 = 1;
+
+/// Number of event slots per eventq.
 const QUEUE_SIZE: u16 = 64;
 
 /// Size of one virtio_input_event in bytes (type + code + value).
 const EVENT_SIZE: usize = 8;
 
+/// We support up to two virtio-input devices on the same platform: a
+/// keyboard for character input and a tablet for absolute pointer
+/// motion + clicks. The slots are statically sized so the whole
+/// driver remains no_alloc.
+const MAX_INPUT_DEVS: usize = 2;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Device state
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// What kind of input device occupies a slot. Used to dispatch events
+/// to the right consumer (keyboard → keycode_to_ascii; tablet → cursor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DevKind {
+    Keyboard,
+    Tablet,
+}
 
 struct InputDev {
     base_va: usize,
     irq:     u32,
     eventq:  Virtqueue,
+    kind:    DevKind,
     shift:   bool,
     ctrl:    bool,
+    /// Tablet only: last absolute X / Y reported by the device. The
+    /// virtio-tablet sends EV_ABS events between EV_SYN frames; we
+    /// commit motion on each frame end.
+    abs_x:   u32,
+    abs_y:   u32,
+    abs_max: u32,
 }
 
-static mut INPUT_DEV: Option<InputDev> = None;
+static mut INPUT_DEVS: [Option<InputDev>; MAX_INPUT_DEVS] = [None, None];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Static DMA buffers (kernel BSS — physically contiguous)
@@ -61,13 +91,16 @@ static mut INPUT_DEV: Option<InputDev> = None;
 #[repr(C, align(16384))]
 struct VqBuf([u8; Virtqueue::size_bytes(QUEUE_SIZE as usize, beetos::PAGE_SIZE)]);
 
-static mut EVENTQ_BUF: VqBuf =
-    VqBuf([0u8; Virtqueue::size_bytes(QUEUE_SIZE as usize, beetos::PAGE_SIZE)]);
+/// Per-device virtqueue scratch buffer.
+static mut EVENTQ_BUFS: [VqBuf; MAX_INPUT_DEVS] = [
+    VqBuf([0u8; Virtqueue::size_bytes(QUEUE_SIZE as usize, beetos::PAGE_SIZE)]),
+    VqBuf([0u8; Virtqueue::size_bytes(QUEUE_SIZE as usize, beetos::PAGE_SIZE)]),
+];
 
-/// One 8-byte event buffer per queue slot.
-/// Descriptor index i maps directly to EVENT_BUFS[i].
-static mut EVENT_BUFS: [[u8; EVENT_SIZE]; QUEUE_SIZE as usize] =
-    [[0u8; EVENT_SIZE]; QUEUE_SIZE as usize];
+/// Per-device event-buffer pool — one 8-byte event slot per queue
+/// descriptor, two devices.
+static mut EVENT_BUFS_DEV: [[[u8; EVENT_SIZE]; QUEUE_SIZE as usize]; MAX_INPUT_DEVS] =
+    [[[0u8; EVENT_SIZE]; QUEUE_SIZE as usize]; MAX_INPUT_DEVS];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -77,28 +110,68 @@ static mut EVENT_BUFS: [[u8; EVENT_SIZE]; QUEUE_SIZE as usize] =
 /// Called during platform init.
 pub fn probe_and_init(virtio_base_va: usize) {
     unsafe {
+        let mut slot = 0usize;
         for i in 0..NUM_TRANSPORTS {
+            if slot >= MAX_INPUT_DEVS { break; }
             let base_va = virtio_base_va + i * TRANSPORT_SIZE;
             if virtio::probe_transport(base_va) == Some(VIRTIO_INPUT_DEVICE_ID) {
                 let irq = VIRTIO_IRQ_BASE + i as u32;
-                init(base_va, irq);
-                return;
+                // QEMU lists devices in the order they appear on the
+                // command line. We launch virtio-keyboard-device first
+                // and virtio-tablet-device second; slot 0 = keyboard,
+                // slot 1 = tablet. Tablet's absolute axis maximum is
+                // typically 32767 (Q15.0) — QEMU clamps to that.
+                let kind = if slot == 0 { DevKind::Keyboard } else { DevKind::Tablet };
+                init(slot, base_va, irq, kind);
+                slot += 1;
             }
         }
     }
 }
 
-/// Return the GIC IRQ number of the input device, or None if not initialized.
+/// Return the GIC IRQ number of any registered input device.
+///
+/// Today's `handle_irq` dispatches by checking `irq_number()` for every
+/// match, so we return the FIRST registered IRQ here — the keyboard.
+/// `tablet_irq_number()` returns the tablet's.
 pub fn irq_number() -> Option<u32> {
-    unsafe { (*(&raw const INPUT_DEV)).as_ref().map(|d| d.irq) }
+    unsafe {
+        (*(&raw const INPUT_DEVS)).iter()
+            .filter_map(|d| d.as_ref())
+            .find(|d| d.kind == DevKind::Keyboard)
+            .map(|d| d.irq)
+    }
 }
 
-/// Acknowledge the virtio-input interrupt (call once per IRQ).
-pub fn ack_irq() {
+/// GIC IRQ for the tablet device, or `None` when no tablet attached.
+pub fn tablet_irq_number() -> Option<u32> {
     unsafe {
-        if let Some(dev) = (*(&raw const INPUT_DEV)).as_ref() {
-            virtio::ack_interrupt(dev.base_va);
-        }
+        (*(&raw const INPUT_DEVS)).iter()
+            .filter_map(|d| d.as_ref())
+            .find(|d| d.kind == DevKind::Tablet)
+            .map(|d| d.irq)
+    }
+}
+
+fn dev_by_irq(irq: u32) -> Option<&'static mut InputDev> {
+    unsafe {
+        (*(&raw mut INPUT_DEVS)).iter_mut()
+            .filter_map(|d| d.as_mut())
+            .find(|d| d.irq == irq)
+    }
+}
+
+/// Acknowledge the virtio-input interrupt for a specific IRQ.
+pub fn ack_irq_for(irq: u32) {
+    if let Some(dev) = dev_by_irq(irq) {
+        virtio::ack_interrupt(dev.base_va);
+    }
+}
+
+/// Back-compat shim — keyboard ack used by the existing irq.rs dispatch.
+pub fn ack_irq() {
+    if let Some(kbd_irq) = irq_number() {
+        ack_irq_for(kbd_irq);
     }
 }
 
@@ -114,19 +187,18 @@ pub fn ack_irq() {
 /// loop until `None` to drain all pending characters per IRQ.
 pub fn get_char() -> Option<u8> {
     unsafe {
-        let dev = (*(&raw mut INPUT_DEV)).as_mut()?;
+        // The keyboard always lives in slot 0 (see probe_and_init).
+        let slot = 0;
+        let dev = (*(&raw mut INPUT_DEVS))[slot].as_mut()?;
+        if dev.kind != DevKind::Keyboard { return None; }
 
         loop {
-            // Return None (queue empty) when no more events.
             let (desc_idx, _len) = dev.eventq.pop_used()?;
-
-            // Read event. Descriptor index == buffer index (identity mapping).
-            let buf = &EVENT_BUFS[desc_idx as usize];
+            let buf = &EVENT_BUFS_DEV[slot][desc_idx as usize];
             let ev_type  = u16::from_le_bytes([buf[0], buf[1]]);
             let ev_code  = u16::from_le_bytes([buf[2], buf[3]]);
             let ev_value = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
-            // Track shift / ctrl state (key-down and key-up both matter).
             if ev_code == KEY_LEFTSHIFT || ev_code == KEY_RIGHTSHIFT {
                 dev.shift = ev_value == VAL_DOWN;
             }
@@ -134,12 +206,9 @@ pub fn get_char() -> Option<u8> {
                 dev.ctrl = ev_value == VAL_DOWN;
             }
 
-            // Re-post descriptor so QEMU can reuse it.
             dev.eventq.push_avail(desc_idx);
             virtio::notify(dev.base_va, 0);
 
-            // EV_KEY down → convert to ASCII and return.
-            // EV_SYN / key-up / repeat → continue draining.
             if ev_type == EV_KEY && ev_value == VAL_DOWN {
                 if let Some(c) = keycode_to_ascii(ev_code, dev.shift, dev.ctrl) {
                     return Some(c);
@@ -149,29 +218,94 @@ pub fn get_char() -> Option<u8> {
     }
 }
 
+/// Drain pending tablet events.  Each call processes everything queued
+/// up since the last call, applies absolute-axis updates to the cursor
+/// via `set_cursor`, and invokes `on_click` for every BTN_LEFT down
+/// event seen. Returns `true` if anything changed (motion or click) so
+/// the caller can trigger a recompose.
+///
+/// QEMU's virtio-tablet reports ABS_X/Y in 0..32767 — we scale into the
+/// FB's pixel range using the slot's `abs_max`.
+pub fn drain_tablet_events(
+    set_cursor: impl Fn(i32, i32),
+    on_click:   impl Fn(),
+) -> bool {
+    unsafe {
+        let slot = 1; // tablet sits in slot 1 (see probe_and_init).
+        let dev = match (*(&raw mut INPUT_DEVS))[slot].as_mut() {
+            Some(d) if d.kind == DevKind::Tablet => d,
+            _ => return false,
+        };
+        let mut changed = false;
+        let abs_max = dev.abs_max.max(1) as f32;
+        while let Some((desc_idx, _len)) = dev.eventq.pop_used() {
+            let buf = &EVENT_BUFS_DEV[slot][desc_idx as usize];
+            let ev_type  = u16::from_le_bytes([buf[0], buf[1]]);
+            let ev_code  = u16::from_le_bytes([buf[2], buf[3]]);
+            let ev_value = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+            match (ev_type, ev_code) {
+                (EV_ABS, ABS_X) => {
+                    dev.abs_x = ev_value;
+                    let x = (ev_value as f32 / abs_max
+                        * crate::platform::qemu_virt::fb::FB_WIDTH as f32) as i32;
+                    let y = (dev.abs_y as f32 / abs_max
+                        * crate::platform::qemu_virt::fb::FB_HEIGHT as f32) as i32;
+                    set_cursor(x, y);
+                    changed = true;
+                }
+                (EV_ABS, ABS_Y) => {
+                    dev.abs_y = ev_value;
+                    let x = (dev.abs_x as f32 / abs_max
+                        * crate::platform::qemu_virt::fb::FB_WIDTH as f32) as i32;
+                    let y = (ev_value as f32 / abs_max
+                        * crate::platform::qemu_virt::fb::FB_HEIGHT as f32) as i32;
+                    set_cursor(x, y);
+                    changed = true;
+                }
+                (EV_KEY, BTN_LEFT) if ev_value == VAL_DOWN => {
+                    on_click();
+                    changed = true;
+                }
+                _ => {}
+            }
+
+            dev.eventq.push_avail(desc_idx);
+            virtio::notify(dev.base_va, 0);
+        }
+        changed
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Initialization
 // ─────────────────────────────────────────────────────────────────────────────
 
-unsafe fn init(base_va: usize, irq: u32) {
+unsafe fn init(slot: usize, base_va: usize, irq: u32, kind: DevKind) {
+    if slot >= MAX_INPUT_DEVS { return; }
     if virtio::init_device(base_va, 0).is_none() {
         return;
     }
 
     // Set up eventq (queue 0). Use addr_of_mut! to avoid forming an
     // intermediate &mut to the mutable static (lint: static_mut_refs).
-    let buf_va = core::ptr::addr_of_mut!(EVENTQ_BUF.0) as *mut u8 as usize;
+    let buf_va = core::ptr::addr_of_mut!(EVENTQ_BUFS[slot].0) as *mut u8 as usize;
     let buf_pa = beetos::virt_to_phys(buf_va);
     let eventq = Virtqueue::init(buf_va, buf_pa, QUEUE_SIZE, beetos::PAGE_SIZE);
     virtio::setup_queue(base_va, 0, &eventq, beetos::PAGE_SIZE);
 
-    let mut dev = InputDev { base_va, irq, eventq, shift: false, ctrl: false };
+    let mut dev = InputDev {
+        base_va, irq, eventq, kind,
+        shift: false, ctrl: false,
+        abs_x: 0, abs_y: 0,
+        abs_max: 32767, // QEMU tablet default Q15
+    };
 
-    // Pre-populate all descriptors: each points to its own EVENT_BUFS slot.
-    // Descriptor index i maps to EVENT_BUFS[i] (identity mapping).
+    // Pre-populate descriptors: each points to its own slot in the
+    // per-device event buffer pool.
     for i in 0..(QUEUE_SIZE as usize) {
         let desc_idx = dev.eventq.alloc_desc().expect("eventq descriptor");
-        let buf_pa   = beetos::virt_to_phys(EVENT_BUFS[i].as_ptr() as usize) as u64;
+        let buf_pa   = beetos::virt_to_phys(EVENT_BUFS_DEV[slot][i].as_ptr() as usize) as u64;
 
         let d = &mut *dev.eventq.desc.add(desc_idx as usize);
         d.addr  = buf_pa;
@@ -188,7 +322,7 @@ unsafe fn init(base_va: usize, irq: u32) {
     // Enable IRQ in GIC.
     super::gic::enable_irq(irq);
 
-    INPUT_DEV = Some(dev);
+    INPUT_DEVS[slot] = Some(dev);
 
     super::uart::puts("virtio-input: keyboard ready\n");
 }

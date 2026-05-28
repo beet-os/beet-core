@@ -435,6 +435,7 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
         "-monitor".to_string(), "none".to_string(),
         "-device".to_string(), "ramfb".to_string(),
         "-device".to_string(), "virtio-keyboard-device".to_string(),
+        "-device".to_string(), "virtio-tablet-device".to_string(),
         "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
     ];
 
@@ -602,6 +603,8 @@ fn qemu_screenshot(args: &[String]) -> anyhow::Result<()> {
             "-m", "2G",
             "-display", "none",
             "-device", "ramfb",
+            "-device", "virtio-keyboard-device",
+            "-device", "virtio-tablet-device",
             "-chardev", &format!("file,id=c0,path={}", serial_log.display()),
             "-serial", "chardev:c0",
             "-qmp", &format!("unix:{},server,nowait", qmp_sock.display()),
@@ -731,6 +734,7 @@ fn qemu_animation(args: &[String]) -> anyhow::Result<()> {
             "-display", "none",
             "-device", "ramfb",
             "-device", "virtio-keyboard-device",
+            "-device", "virtio-tablet-device",
             "-chardev", &format!("file,id=c0,path={}", serial_log.display()),
             "-serial", "chardev:c0",
             "-qmp", &format!("unix:{},server,nowait", qmp_sock.display()),
