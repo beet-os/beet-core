@@ -77,8 +77,32 @@ fn populate_disk_cache_via_ipc() -> usize {
         }
     };
 
+    // Trust-but-verify the geometry the block service reports. Today
+    // block is a sibling service we implicitly trust, but a bad value
+    // here turns into one of three subtle failure modes downstream:
+    //   * block_size == 0          → divide-by-zero computing blocks_per_round
+    //   * block_size > IPC payload → blocks_per_round = 0 → infinite loop
+    //   * cap × bs overflows usize → loop invariants break, OOB write
+    // All three are catastrophic; the explicit checks below turn each
+    // into a clean "return 0 with a diagnostic" instead.
     let block_size = info.block_size as usize;
-    let total_bytes = (info.capacity_blocks as usize) * block_size;
+    const MAX_BLOCK_SIZE: usize =
+        beetos::PAGE_SIZE - beetos_api_block::BUF_DATA_OFFSET;
+    if block_size == 0 || block_size > MAX_BLOCK_SIZE {
+        let _ = write!(UartWriter,
+            "[fs] bad block_size {} from block service (expected 1..={})\n",
+            block_size, MAX_BLOCK_SIZE);
+        return 0;
+    }
+    let total_bytes = match (info.capacity_blocks as usize).checked_mul(block_size) {
+        Some(b) => b,
+        None => {
+            let _ = write!(UartWriter,
+                "[fs] geometry overflow: {} blocks × {} B\n",
+                info.capacity_blocks, block_size);
+            return 0;
+        }
+    };
     if total_bytes == 0 { return 0; }
     if total_bytes > MAX_DISK_SIZE {
         let _ = write!(UartWriter, "[fs] disk {} B exceeds cache {} B\n",

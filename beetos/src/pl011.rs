@@ -24,12 +24,18 @@
 //! are on.
 
 use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const UART_DR:      usize = 0x00;
 const UART_FR:      usize = 0x18;
 const UART_FR_TXFF: u32   = 1 << 5;
 
-static mut BASE: usize = 0;
+// `AtomicUsize` (not `static mut`) so a future multi-threaded service
+// can't observe a torn read of BASE. On aarch64 this lowers to a plain
+// load/store — no synchronisation cost — but it forecloses the
+// read-where / write-where foot-gun a torn VA would create when
+// CreateThread eventually lands on EL0.
+static BASE: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the MMIO virtual address of the PL011 for this process.
 /// Subsequent [`putc`] / [`puts`] / [`Writer`] calls use it.
@@ -38,23 +44,19 @@ static mut BASE: usize = 0;
 /// is exactly one call at the top of `_start` with the value the
 /// kernel placed in x0.
 pub fn init(base: usize) {
-    // SAFETY: BASE is a single `usize`; userspace services are
-    // single-threaded (the kernel doesn't wire CreateThread yet), so
-    // there's no race. Even if it were multi-threaded the worst
-    // outcome of a torn write would be writing to a half-updated VA,
-    // which produces garbage output, not memory corruption.
-    unsafe { BASE = base; }
+    BASE.store(base, Ordering::Relaxed);
 }
 
 /// Write a single byte to the UART, translating `\n` to `\r\n` so the
 /// host terminal renders newlines correctly. No-op if [`init`] was
 /// never called.
 pub fn putc(c: u8) {
-    // SAFETY: BASE is either 0 (we early-out) or a kernel-mapped
-    // PL011 MMIO page valid for the lifetime of the process.
+    let base = BASE.load(Ordering::Relaxed);
+    if base == 0 { return; }
+    // SAFETY: `base` is either 0 (handled above) or the value last
+    // passed to [`init`], which by contract is a kernel-mapped PL011
+    // MMIO page valid for the lifetime of the process.
     unsafe {
-        if BASE == 0 { return; }
-        let base = BASE;
         while (core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_TXFF) != 0 {}
         if c == b'\n' {
             core::ptr::write_volatile((base + UART_DR) as *mut u32, b'\r' as u32);
