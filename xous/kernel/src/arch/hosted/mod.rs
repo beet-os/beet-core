@@ -14,7 +14,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::thread_local;
 
-use crossbeam_channel::{unbounded, Receiver, RecvError, RecvTimeoutError, Sender};
+use crossbeam_channel::{unbounded, Receiver, RecvError, Sender};
 use xous::{AppId, ProcessInit, Result, SysCall, PID, TID};
 
 use crate::arch::process::Process;
@@ -188,9 +188,10 @@ fn listen_thread(
     let listener = TcpListener::bind(listen_addr).unwrap_or_else(|e| {
         panic!("Unable to create server: {}", e);
     });
+    let local_addr = listener.local_addr().unwrap();
     // Notify the host what our kernel address is, if a listener exists.
     if let Some(las) = local_addr_sender.take() {
-        las.send(listener.local_addr().unwrap()).unwrap();
+        las.send(local_addr).unwrap();
     }
 
     let mut clients = vec![];
@@ -241,7 +242,6 @@ fn listen_thread(
         }
     }
 
-    // Use `listener` in a nonblocking setup so that we can exit when doing tests
     enum ClientMessage {
         NewConnection(TcpStream),
         Exit,
@@ -250,27 +250,20 @@ fn listen_thread(
     let tcp_sender = sender.clone();
     let exit_sender = sender;
 
-    let (shutdown_listener, shutdown_listener_receiver) = unbounded();
-
-    // `listener.accept()` has no way to break, so we must put it in nonblocking mode
-    listener.set_nonblocking(true).unwrap();
-
+    // Blocking accept is woken up at shutdown by connecting a dummy stream to
+    // our own listen address; the accept thread then sees `should_exit` set
+    // and returns. This avoids the 500ms polling loop that was here before.
+    let accept_should_exit = should_exit.clone();
     std::thread::Builder::new()
         .name("kernel accept thread".to_owned())
         .spawn(move || {
             loop {
                 match listener.accept() {
                     Ok((conn, _addr)) => {
-                        conn.set_nonblocking(false).unwrap();
-                        tcp_sender.send(ClientMessage::NewConnection(conn)).unwrap();
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        match shutdown_listener_receiver.recv_timeout(std::time::Duration::from_millis(500)) {
-                            Err(RecvTimeoutError::Timeout) => continue,
-                            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                                return;
-                            }
+                        if accept_should_exit.load(Ordering::Relaxed) {
+                            return;
                         }
+                        tcp_sender.send(ClientMessage::NewConnection(conn)).unwrap();
                     }
                     Err(e) => {
                         // Windows generates this error -- WSACancelBlockingCall -- when a
@@ -310,7 +303,9 @@ fn listen_thread(
             ClientMessage::Exit => break,
         }
     }
-    shutdown_listener.send(()).unwrap();
+    // Wake the blocking accept() so the accept thread observes should_exit and returns.
+    should_exit.store(true, Ordering::Relaxed);
+    let _ = TcpStream::connect(local_addr);
     exit_server(should_exit, clients);
 }
 
