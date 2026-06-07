@@ -204,6 +204,7 @@ fn handle_ipv4(frame: &[u8], ip: &[u8]) {
 
     match proto {
         1 => handle_icmp(frame, src_ip, dst_ip, payload),
+        6 => super::tcp::handle_segment(frame, src_ip, dst_ip, payload),
         17 => handle_udp(src_ip, dst_ip, payload),
         _ => {}
     }
@@ -485,7 +486,7 @@ fn finalize_ipv4_checksum(pkt: &mut [u8]) {
 // Internet checksum (RFC 1071)
 // ============================================================================
 
-fn internet_checksum(data: &[u8]) -> u16 {
+pub(super) fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
 

@@ -11,6 +11,7 @@ fn main() -> anyhow::Result<()> {
         Some("qemu") => qemu(&args[1..])?,
         Some("qemu-smoke") => qemu_smoke()?,
         Some("qemu-smoke-nodisk") => qemu_smoke_nodisk()?,
+        Some("qemu-smoke-net") => qemu_smoke_net()?,
         Some("qemu-screenshot") => qemu_screenshot(&args[1..])?,
         Some("qemu-animation") => qemu_animation(&args[1..])?,
         Some("rpi5") => rpi5()?,
@@ -27,6 +28,7 @@ fn main() -> anyhow::Result<()> {
             println!("  qemu [--terminal]  Build and run on QEMU virt (--terminal = headless, no FB)");
             println!("  qemu-smoke         Boot QEMU and verify expected progress markers (CI)");
             println!("  qemu-smoke-nodisk  Boot QEMU *without* a disk image — verifies graceful degradation");
+            println!("  qemu-smoke-net     Boot QEMU with networking, drive the TCP remote console over a host socket");
             println!("  qemu-screenshot [--wait SECS] [--out PATH]");
             println!("                     Boot QEMU and capture the framebuffer (default: 6s, target/beetos-fb.png)");
             println!("  qemu-animation [--frames N] [--interval SECS] [--out PATH]");
@@ -923,6 +925,185 @@ fn qemu_smoke_nodisk() -> anyhow::Result<()> {
         "bsh>",
     ];
     run_smoke("qemu-smoke-nodisk", /*with_disk*/ false, markers)
+}
+
+/// Boot QEMU with user-mode networking + a hostfwd to the guest's TCP
+/// remote console (guest port 2323 → host 127.0.0.1:5555), wait for
+/// DHCP to bind, then drive the console over a real TCP socket from the
+/// host. This is the M7 end-to-end proof: virtio-net RX/TX, the in-
+/// kernel ARP/DHCP/IP stack, and the new TCP server all on the live
+/// path — no mocking.
+fn qemu_smoke_net() -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root();
+
+    // Same hello-std placeholder dance as run_smoke so the kernel links.
+    let nostd_target = root.join("target/aarch64-unknown-none/debug");
+    std::fs::create_dir_all(&nostd_target)?;
+    let hello_std = nostd_target.join("hello-std.stripped");
+    if !hello_std.exists() {
+        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
+    }
+
+    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
+    let kernel = elf_to_image(&kernel_elf)?;
+
+    let serial_log = root.join("target/qemu-smoke-net-serial.log");
+    let _ = std::fs::remove_file(&serial_log);
+
+    const HOST_PORT: u16 = 5555;
+    const GUEST_PORT: u16 = 2323;
+
+    println!();
+    println!("Launching QEMU net smoke test (timeout: 20s)...");
+    println!("  serial log: {}", serial_log.display());
+    println!("  hostfwd: 127.0.0.1:{HOST_PORT} -> guest :{GUEST_PORT}");
+    println!();
+
+    let qemu_args = vec![
+        "-machine".to_string(), "virt,gic-version=3".to_string(),
+        "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-m".to_string(), "2G".to_string(),
+        "-display".to_string(), "none".to_string(),
+        "-device".to_string(), "ramfb".to_string(),
+        "-chardev".to_string(),
+        format!("file,id=c0,path={}", serial_log.display()),
+        "-serial".to_string(), "chardev:c0".to_string(),
+        "-netdev".to_string(),
+        format!("user,id=net0,hostfwd=tcp:127.0.0.1:{HOST_PORT}-:{GUEST_PORT}"),
+        "-device".to_string(), "virtio-net-device,netdev=net0".to_string(),
+        "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
+    ];
+
+    let mut child = Command::new("qemu-system-aarch64")
+        .args(&qemu_args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    // Phase 1: wait for the guest to bind an IP via DHCP. net_stack
+    // prints "virtio-net: IP=..." on the DHCP ACK.
+    let result = (|| -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let dhcp_marker = "virtio-net: IP=";
+        wait_for_marker(&serial_log, dhcp_marker, deadline)?;
+        println!("  [ok] DHCP bound (saw '{dhcp_marker}')");
+
+        // Phase 2: open the TCP console. QEMU accepts the host-side
+        // connection immediately but the guest only answers once it's
+        // listening with an IP — so retry the whole open/read cycle.
+        let mut last_err = String::new();
+        while Instant::now() < deadline {
+            match try_console_session(HOST_PORT) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+        anyhow::bail!("TCP console never responded correctly: {last_err}");
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    println!();
+    match result {
+        Ok(()) => {
+            println!("Result: NET SMOKE TEST PASSED");
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("Result: NET SMOKE TEST FAILED — {e}"),
+    }
+}
+
+/// One full remote-console exchange: connect, read the banner, then
+/// issue `ip` and `ping` and assert the replies. Returns Ok only if
+/// every expected token is seen.
+fn try_console_session(host_port: u16) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", host_port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+    // Read whatever the server sends within the timeout, accumulating
+    // into a String. Used after connect (banner) and after each command.
+    fn drain(stream: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1024];
+        let mut acc = String::new();
+        // A couple of short reads are enough; the console answers in one
+        // segment but TCP may split it.
+        for _ in 0..4 {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => acc.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => break, // timeout — stop draining
+            }
+        }
+        acc
+    }
+
+    let banner = drain(&mut stream);
+    anyhow::ensure!(
+        banner.contains("BeetOS remote console"),
+        "missing banner, got: {banner:?}"
+    );
+    println!("  [ok] banner: {:?}", banner.trim());
+
+    stream.write_all(b"ip\n")?;
+    let ip_reply = drain(&mut stream);
+    anyhow::ensure!(
+        ip_reply.contains("10.0.2.15"),
+        "ip command did not return the DHCP address, got: {ip_reply:?}"
+    );
+    println!("  [ok] 'ip' -> {:?}", ip_reply.trim());
+
+    stream.write_all(b"ping\n")?;
+    let ping_reply = drain(&mut stream);
+    anyhow::ensure!(
+        ping_reply.contains("pong"),
+        "ping command did not return pong, got: {ping_reply:?}"
+    );
+    println!("  [ok] 'ping' -> {:?}", ping_reply.trim());
+
+    Ok(())
+}
+
+/// Poll a growing serial-log file until `marker` appears or the deadline
+/// passes. Echoes new lines as they arrive for debugging.
+fn wait_for_marker(
+    serial_log: &std::path::Path,
+    marker: &str,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader, Seek};
+
+    let mut log_pos: u64 = 0;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let Ok(file) = std::fs::File::open(serial_log) else { continue };
+        let len = file.metadata()?.len();
+        if len <= log_pos {
+            continue;
+        }
+        let mut reader = BufReader::new(file);
+        reader.seek(std::io::SeekFrom::Start(log_pos))?;
+        for line in reader.lines().flatten() {
+            println!("  {line}");
+            if line.contains(marker) {
+                return Ok(());
+            }
+        }
+        log_pos = len;
+    }
+    anyhow::bail!("timed out waiting for serial marker {marker:?}")
 }
 
 /// Shared QEMU smoke harness: build kernel, launch QEMU (optionally

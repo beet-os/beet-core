@@ -811,15 +811,21 @@ virtio-blk uses SPI 16 (first virtio transport = GIC IRQ 48). For the initial im
 
 ## Milestone 7 — Network
 
-**Goal:** TCP/IP via USB-C Ethernet. Remote shell access.
+**Goal:** TCP/IP. Remote shell access.
 
 ### Tasks
 
-- [ ] `os/usb/` — xHCI USB-C driver (minimal, for Ethernet dongle)
-- [ ] `api/net/` — network API
-- [ ] smoltcp integration as Xous service
-- [ ] SSH or raw TCP shell
-- [ ] Shell commands: `ifconfig`, `ping`
+- [x] virtio-net driver (QEMU virt) — `platform/qemu_virt/net.rs`
+- [x] In-kernel L2/L3 stack: ARP replies, DHCP client, ICMP echo — `net_stack.rs`
+- [x] **TCP server (passive open) — `platform/qemu_virt/tcp.rs`** — three-way handshake, in-order data, clean teardown (RST/FIN), TCP checksum with pseudo-header. Single connection, no retransmit (loopback-quality QEMU link); documented limitations inline.
+- [x] **Remote console over TCP** (port 2323): `help` / `ip` / `ping` / `uptime` / `echo` / `quit`. First reachable-from-the-host BeetOS interface.
+- [x] **`cargo xtask qemu-smoke-net`** — boots QEMU with `hostfwd`, waits for DHCP bind, then drives the console over a real host TCP socket and asserts the `ip`/`ping` replies. Hardware-free CI coverage of the whole RX/TX → ARP/DHCP/IP → TCP datapath.
+- [ ] Bridge the TCP console to the **real userspace shell** (capture shell stdout over the socket via a `net`↔`shell` IPC seam) — the remaining piece for a true remote shell rather than a built-in command set.
+- [ ] `api/net/` — userspace network API (socket syscalls or a `net` IPC service) so apps, not just the kernel console, can use TCP.
+- [ ] Shell commands `ifconfig` / `ping` (needs the `api/net/` bridge above to reach the kernel net state from EL0).
+- [ ] Real-NIC path (USB-C Ethernet / RP1 on Pi 5) + retransmission timer for lossy links.
+
+**Status: IN PROGRESS** — TCP transport + remote console land the headline "reach BeetOS over the network" goal and are CI-tested end-to-end on QEMU. Remaining work is the userspace plumbing (`api/net/`, shell bridge) and a real NIC.
 
 ---
 

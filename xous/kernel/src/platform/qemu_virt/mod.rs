@@ -20,6 +20,7 @@ pub mod gic;
 pub mod input;
 pub mod net;
 pub mod net_stack;
+pub mod tcp;
 pub mod timer;
 pub mod uart;
 pub mod virtio;
