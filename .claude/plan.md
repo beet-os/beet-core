@@ -308,6 +308,13 @@ BeetOS boots on QEMU `virt`. Xous microkernel operational. Any developer can run
 
 BeetOS boots on real Raspberry Pi 5. `cargo xtask rpi5` produces a bootable image. Same arch layer as QEMU — only `platform/bcm2712/` is new.
 
+**Status: CODE COMPLETE (hardware validation pending)**
+
+- All `platform/bcm2712/` drivers in place (UART, GIC, timer, mailbox FB, SDHCI host).
+- `cargo xtask rpi5` produces `target/rpi5/{kernel8.img,config.txt}` ready to drop on the bootfs partition.
+- Two latent boot bugs fixed: (a) `bcm2712::init` was passing raw MMIO PAs to driver `init()` calls instead of `phys_to_virt(pa)` — broken under TTBR1 MMU; (b) bootstrap pagetable in `start.S` was hardcoded to the QEMU virt layout (low 1 GiB = device + PXN, high 1 GiB = normal), which would have faulted on instruction fetch immediately after MMU enable on the Pi 5 (kernel loads at PA 0x80000 inside the would-be PXN range, and BCM2712 peripherals at PA 0x10_xxxx_xxxx weren't mapped at all). Refactor: `start.S` now delegates pagetable fill to a platform-specific `_fill_boot_tables` symbol; QEMU virt keeps its split layout, BCM2712 gets a 4 GiB normal L2_low + a 4 GiB device L2_high wired at `L1[1]` for the PA 0x10_0000_0000+ peripheral region.
+- Remaining: physical RPi5 + USB-TTL serial cable to confirm "BeetOS v0.1.0" appears on UART. Once verified, mark **DONE** and tag `v0.4.0`.
+
 ---
 
 ## Milestone 3b — Apple M1 Platform & Hardware Boot

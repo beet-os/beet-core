@@ -29,8 +29,34 @@ use core::arch::asm;
 // Include assembly files via global_asm! (no cc crate needed).
 // Combined into a single global_asm! to avoid duplicate symbol issues
 // across codegen units.
+//
+// `start.S` calls into an extern `_fill_boot_tables` which is the only
+// piece of the bootstrap that knows the platform memory map. Pick the
+// matching implementation based on the active platform feature.
+#[cfg(feature = "platform-qemu-virt")]
 core::arch::global_asm!(
     include_str!("start.S"),
+    include_str!("pagetables_qemu_virt.S"),
+    include_str!("asm.S"),
+);
+
+#[cfg(feature = "platform-bcm2712")]
+core::arch::global_asm!(
+    include_str!("start.S"),
+    include_str!("pagetables_bcm2712.S"),
+    include_str!("asm.S"),
+);
+
+// Apple M1 (T8103) boot bring-up lives in M3b; until then we keep the
+// build green by falling back to the QEMU virt pagetable layout, which
+// at least compiles. Real M1 boot needs its own pagetables_apple.S.
+#[cfg(all(
+    feature = "platform-apple-t8103",
+    not(any(feature = "platform-qemu-virt", feature = "platform-bcm2712"))
+))]
+core::arch::global_asm!(
+    include_str!("start.S"),
+    include_str!("pagetables_qemu_virt.S"),
     include_str!("asm.S"),
 );
 

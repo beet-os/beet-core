@@ -127,93 +127,57 @@ _start:
 // Boot page table setup (runs at PA, called from _start)
 // ============================================================================
 //
-// Creates two L1 tables sharing one L2 table:
+// Creates two L1 tables that share an L2_low table for the kernel image
+// and low-PA mapping, plus an optional L2_high table for high-PA MMIO
+// (used by BCM2712-style chips where peripherals live above 1 TiB).
 //
-//   TTBR0 (identity):  VA 0x0000_0000..0x7FFF_FFFF → PA 0..2GB
-//   TTBR1 (kernel):    VA 0xFFFF_8000_0000_0000..+2GB → PA 0..2GB
+//   TTBR0 (identity):  VA 0..2 GiB → PA 0..2 GiB
+//   TTBR1 (kernel):    VA 0xFFFF_8000_0000_0000 + PA (linear map)
 //
 // Pre-allocated in .boot.bss (must be 16KB-aligned for hardware):
 //   _boot_l1_ttbr0 (16KB): L1 table for TTBR0 (identity map)
 //   _boot_l1_ttbr1 (16KB): L1 table for TTBR1 (kernel map)
-//   _boot_l2       (16KB): L2 table shared by both
+//   _boot_l2_low   (16KB): L2 table for the low PA range (RAM + maybe MMIO)
+//   _boot_l2_high  (16KB): L2 table for the high PA range (MMIO above 1 TiB)
 //
 // 16KB granule geometry:
 //   L1 entry covers 2048 × 32 MiB = 64 GiB (points to L2 table)
 //   L2 BLOCK entry covers 32 MiB directly (no L3 needed for boot)
-//   We use 64 L2 block entries = 2 GiB total:
-//     [0..31]  = Device (MMIO 0x0..0x3FFF_FFFF)
-//     [32..63] = Normal (RAM  0x4000_0000..0x7FFF_FFFF)
 //
-// Block descriptor bits for L2 (32 MiB blocks):
-//   Device: Valid | AttrIdx=0 | SH=ISH | AF | UXN | PXN = 0x0060_0000_0000_0701
-//   Normal: Valid | AttrIdx=1 | SH=ISH | AF | UXN       = 0x0040_0000_0000_0705
-//           (No PXN — kernel must execute from RAM at boot)
+// The exact L2 content is platform-specific: QEMU virt splits the low
+// range into device (0..1 GiB) + normal (1..2 GiB) and never uses the
+// high table; BCM2712 makes the entire low range normal RAM and wires
+// L1[16] → L2_high for the peripheral region at PA 0x100_0000_0000+.
+// The platform-specific symbol `_fill_boot_tables` implements that
+// policy. See `pagetables_qemu_virt.S` / `pagetables_bcm2712.S`.
 
 _create_boot_page_tables:
     stp     x29, x30, [sp, #-16]!
 
-    // Zero all three page tables (3 × 16KB = 48KB = 6144 u64s)
+    // Zero all four page tables (4 × 16KB = 64KB = 8192 u64s).
     adr     x0, _boot_l1_ttbr0
-    mov     x1, #(3 * 16384 / 8)
+    mov     x1, #(4 * 16384 / 8)
 .Lzero_tables:
     str     xzr, [x0], #8
     subs    x1, x1, #1
     b.ne    .Lzero_tables
 
-    // --- Fill L2 with block descriptors ---
-    adr     x10, _boot_l2
-
-    // Device memory block attributes (MMIO: PA 0..0x4000_0000)
-    // bits: VALID(0) | AttrIdx=0(device) | SH=ISH(9:8) | AF(10) | UXN(54) | PXN(53)
-    // = 0x0060_0000_0000_0701
-    movz    x2, #0x0701
-    movk    x2, #0x0060, lsl #48
-
-    // Map MMIO blocks: L2[0..31] = PA 0..0x3E00_0000 (32 × 32MB = 1GB)
-    mov     x3, #0                  // block index
-.Lmap_mmio:
-    cmp     x3, #32
-    b.ge    .Lmap_ram
-
-    lsl     x5, x3, #25            // PA = index × 32MB
-    orr     x5, x5, x2             // PA | device attrs
-    str     x5, [x10, x3, lsl #3]  // L2[index] = descriptor
-
-    add     x3, x3, #1
-    b       .Lmap_mmio
-
-.Lmap_ram:
-    // Normal memory block attributes (RAM: PA 0x4000_0000..0x8000_0000)
-    // bits: VALID(0) | AttrIdx=1(normal,2) | SH=ISH(9:8) | AF(10) | UXN(54)
-    // No PXN — kernel can execute from RAM.
-    // = 0x0040_0000_0000_0705
-    movz    x2, #0x0705
-    movk    x2, #0x0040, lsl #48
-
-    // Map RAM blocks: L2[32..63] = PA 0x4000_0000..0x7E00_0000 (32 × 32MB = 1GB)
-    mov     x3, #32
-.Lmap_ram_loop:
-    cmp     x3, #64
-    b.ge    .Lmap_done
-
-    lsl     x5, x3, #25            // PA = index × 32MB
-    orr     x5, x5, x2             // PA | normal attrs
-    str     x5, [x10, x3, lsl #3]  // L2[index] = descriptor
-
-    add     x3, x3, #1
-    b       .Lmap_ram_loop
-
-.Lmap_done:
-    // --- Wire L1[0] → L2 in both TTBR0 and TTBR1 ---
-    // L1 table descriptor: L2_PA | VALID(1) | TABLE(2) = L2_PA | 0x3
-    adr     x0, _boot_l2
-    orr     x0, x0, #0x3           // table descriptor
-
-    adr     x5, _boot_l1_ttbr0
-    str     x0, [x5]               // TTBR0 L1[0] → L2
-
-    adr     x5, _boot_l1_ttbr1
-    str     x0, [x5]               // TTBR1 L1[0] → L2
+    // Hand off to the platform's _fill_boot_tables. It receives the
+    // four page-table PAs and is expected to:
+    //   - fill _boot_l2_low (and optionally _boot_l2_high) with block
+    //     descriptors appropriate for this platform
+    //   - install L1[0] → L2_low in both TTBR0 and TTBR1
+    //   - if needed, install L1[N] → L2_high in TTBR1 for the high MMIO
+    // ABI:
+    //   x0 = _boot_l1_ttbr0
+    //   x1 = _boot_l1_ttbr1
+    //   x2 = _boot_l2_low
+    //   x3 = _boot_l2_high
+    adr     x0, _boot_l1_ttbr0
+    adr     x1, _boot_l1_ttbr1
+    adr     x2, _boot_l2_low
+    adr     x3, _boot_l2_high
+    bl      _fill_boot_tables
 
     ldp     x29, x30, [sp], #16
     ret
@@ -318,8 +282,12 @@ _boot_l1_ttbr0:
 _boot_l1_ttbr1:
     .space 16384
 
-.globl _boot_l2
-_boot_l2:
+.globl _boot_l2_low
+_boot_l2_low:
+    .space 16384
+
+.globl _boot_l2_high
+_boot_l2_high:
     .space 16384
 
 // Small boot stack (4KB) for the page table setup code.

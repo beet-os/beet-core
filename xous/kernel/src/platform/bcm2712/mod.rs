@@ -52,7 +52,12 @@ pub fn init(fdt_phys: *const u8) {
     let gicd_phys  = mmio.gicd_phys.unwrap_or(defaults::GICD_BASE);
     let gicr_phys  = mmio.gicr_phys.unwrap_or(defaults::GICR_BASE);
 
-    uart::init(uart0_phys);
+    // The MMU is on; MMIO accesses go through TTBR1's linear map.
+    // Convert each MMIO PA to its kernel VA before handing it to a
+    // driver — the bootstrap pagetable maps PA 0x10_xxxx_xxxx into
+    // VA 0xFFFF_8010_xxxx_xxxx via L1[1] → _boot_l2_high. Passing the
+    // raw PA here would deref straight into TTBR0 user space and fault.
+    uart::init(beetos::phys_to_virt(uart0_phys));
     uart::puts("BeetOS v0.1.0\n");
     uart::puts("Platform: Raspberry Pi 5 (BCM2712 / AArch64)\n");
 
@@ -62,7 +67,7 @@ pub fn init(fdt_phys: *const u8) {
         uart::puts("UART: address from default (FDT not found)\n");
     }
 
-    gic::init(gicd_phys, gicr_phys);
+    gic::init(beetos::phys_to_virt(gicd_phys), beetos::phys_to_virt(gicr_phys));
 
     if mmio.gicd_phys.is_some() {
         uart::puts("GIC: initialized (address from FDT)\n");
