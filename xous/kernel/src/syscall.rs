@@ -407,6 +407,8 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
 
         #[cfg(beetos)]
         SysCall::NetGetInfo => Ok(()),
+        #[cfg(beetos)]
+        SysCall::NetConsolePush(..) => Ok(()),
 
         // Notification syscalls
         #[cfg(beetos)]
@@ -688,6 +690,31 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         SysCall::NetGetInfo => {
             // No network stack on this platform yet.
             Ok(Result::Scalar5(0, 0, 0, 0, 0))
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetConsolePush(len, w0, w1, w2, w3) => {
+            // Bytes arrive packed inline in the syscall args, not as a
+            // userspace pointer — so we don't have to fight PAN (which
+            // AArch64v8.1 asserts on EL0→EL1 entry) or the
+            // copy-from-user dance to read them. Unpack into a small
+            // kernel buffer and hand to the TCP ring.
+            let len = len.min(32);
+            let mut stage = [0u8; 32];
+            let words = [w0 as u64, w1 as u64, w2 as u64, w3 as u64];
+            for (i, word) in words.iter().enumerate() {
+                for j in 0..8 {
+                    stage[i * 8 + j] = ((word >> (j * 8)) & 0xff) as u8;
+                }
+            }
+            crate::platform::qemu_virt::tcp::console_push(&stage[..len]);
+            Ok(Result::Ok)
+        }
+
+        #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
+        SysCall::NetConsolePush(_, _, _, _, _) => {
+            // No network stack on this platform yet.
+            Ok(Result::Ok)
         }
 
         #[cfg(beetos)]

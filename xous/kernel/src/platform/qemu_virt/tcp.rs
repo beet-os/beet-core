@@ -164,7 +164,10 @@ pub fn handle_segment(frame: &[u8], src_ip: [u8; 4], dst_ip: [u8; 4], segment: &
             if flags & ACK != 0 && ack == c.snd_nxt && src_port == c.peer_port {
                 c.state = State::Established;
                 // Greet the client the moment the channel is open.
-                console::on_connect(c, our_ip);
+                send_banner(c, our_ip);
+                // Then flush anything the userspace console service
+                // already pushed since boot (shell's prompt, motd, …).
+                flush_pending(c, our_ip);
             }
         }
 
@@ -173,13 +176,17 @@ pub fn handle_segment(frame: &[u8], src_ip: [u8; 4], dst_ip: [u8; 4], segment: &
                 return;
             }
             // Accept in-order data only; anything else just gets a
-            // duplicate ACK of where we are.
+            // duplicate ACK of where we are. Each byte fans out into
+            // the same input dispatcher that the UART IRQ uses, so the
+            // remote console is, from the shell's perspective,
+            // indistinguishable from a local keyboard.
             if !payload.is_empty() && seq == c.rcv_nxt {
                 c.rcv_nxt = c.rcv_nxt.wrapping_add(payload.len() as u32);
-                console::on_data(c, our_ip, payload);
-                // console::on_data already piggy-backed any reply +
-                // current ACK; if it produced no output it still must
-                // ACK the data, which it does via send_segment(ACK).
+                for &b in payload {
+                    crate::arch::irq::dispatch_input_char_public(b);
+                }
+                // Either piggy-back queued output, or send a bare ACK.
+                flush_pending(c, our_ip);
             } else if !payload.is_empty() {
                 // Out-of-order / retransmit — re-ACK our cumulative point.
                 send_segment(c, our_ip, ACK, &[]);
@@ -309,150 +316,119 @@ fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: &[u8]) -> u16 {
 }
 
 // ============================================================================
-// Remote console — the "application" sitting on top of the socket.
+// Bridge to userspace `os/console` — pipe between syscall pushes and TCP TX.
 // ============================================================================
+//
+// `console_push(bytes)` is called from the NetConsolePush syscall handler
+// in the kernel (IRQs masked). We deposit bytes into a small ring; when
+// an inbound TCP segment is being ACKed (or right after the handshake
+// completes), `flush_pending` drains the ring into the same segment.
+//
+// We deliberately do NOT call `send_packet` directly from `console_push`
+// — without an open connection that produces an unmatched TX on the
+// virtio device. The "drain on ACK opportunity" pattern matches how the
+// QEMU loopback link behaves: every input or boot tick lets the buffer
+// flush.
 
-mod console {
-    use super::{send_segment, Conn, ACK, PSH};
-    use super::net_stack;
+const RING_SIZE: usize = 4096;
 
-    /// Greeting sent the moment the connection is established.
-    pub fn on_connect(conn: &mut Conn, our_ip: [u8; 4]) {
-        let banner = b"BeetOS remote console (M7)\r\nType 'help'.\r\n> ";
-        send_segment(conn, our_ip, PSH | ACK, banner);
+struct ConsoleRing {
+    buf: [u8; RING_SIZE],
+    head: usize, // write cursor (advances on push)
+    tail: usize, // read cursor (advances on flush)
+}
+
+static mut RING: ConsoleRing = ConsoleRing {
+    buf: [0u8; RING_SIZE],
+    head: 0,
+    tail: 0,
+};
+
+/// Push bytes from a userspace caller (via [`SysCall::NetConsolePush`]).
+/// IRQs are masked by the synchronous exception entry, so we don't race
+/// the timer-IRQ-driven flush.
+pub fn console_push(bytes: &[u8]) {
+    // SAFETY: single-threaded kernel; this is the only writer.
+    unsafe {
+        let r = &mut *(&raw mut RING);
+        for &b in bytes {
+            let next = (r.head + 1) % RING_SIZE;
+            if next == r.tail {
+                // Ring full — drop the oldest byte. A console RX is a
+                // best-effort sink; we'd rather show the *latest* shell
+                // output to the remote client than freeze on an
+                // overflow.
+                r.tail = (r.tail + 1) % RING_SIZE;
+            }
+            r.buf[r.head] = b;
+            r.head = next;
+        }
     }
+}
 
-    /// Interpret one chunk of received bytes as console input. The QEMU
-    /// loopback delivers a whole line per segment in practice, so we
-    /// treat the payload as a command line (trimming CR/LF) rather than
-    /// maintaining a cross-segment line buffer.
-    pub fn on_data(conn: &mut Conn, our_ip: [u8; 4], payload: &[u8]) {
-        // A scratch reply buffer; commands keep their output well under
-        // a single segment.
-        let mut out = [0u8; 512];
+/// Consume up to [`MAX_SEG_PAYLOAD`] bytes from the ring into `out`.
+/// Returns the number copied (0 if the ring is empty).
+fn ring_drain(out: &mut [u8]) -> usize {
+    unsafe {
+        let r = &mut *(&raw mut RING);
         let mut n = 0;
-        let push = |s: &[u8], out: &mut [u8; 512], n: &mut usize| {
-            let take = s.len().min(out.len() - *n);
-            out[*n..*n + take].copy_from_slice(&s[..take]);
-            *n += take;
-        };
-
-        let line = trim(payload);
-        match cmd_word(line) {
-            b"" => {}
-            b"help" => push(
-                b"commands: help, ip, ping, uptime, echo <text>, quit\r\n",
-                &mut out, &mut n,
-            ),
-            b"ip" => {
-                let ip = net_stack::get_ip();
-                let mut tmp = [0u8; 24];
-                let len = fmt_ip(ip, &mut tmp);
-                push(&tmp[..len], &mut out, &mut n);
-                push(b"\r\n", &mut out, &mut n);
-            }
-            b"ping" => push(b"pong\r\n", &mut out, &mut n),
-            b"uptime" => {
-                let ticks = super::super::timer::tick_count();
-                let mut tmp = [0u8; 32];
-                let len = fmt_uptime(ticks, &mut tmp);
-                push(&tmp[..len], &mut out, &mut n);
-            }
-            b"echo" => {
-                let rest = after_word(line);
-                push(rest, &mut out, &mut n);
-                push(b"\r\n", &mut out, &mut n);
-            }
-            b"quit" => {
-                push(b"bye\r\n", &mut out, &mut n);
-                push(b"> ", &mut out, &mut n);
-                send_segment(conn, our_ip, PSH | ACK, &out[..n]);
-                // Initiate close from our side next: easiest is to wait
-                // for the client's FIN, but we nudge with our prompt and
-                // let the teardown happen on their disconnect.
-                return;
-            }
-            other => {
-                push(b"unknown command: ", &mut out, &mut n);
-                push(other, &mut out, &mut n);
-                push(b"\r\n", &mut out, &mut n);
-            }
-        }
-        push(b"> ", &mut out, &mut n);
-
-        // One segment: ACKs the received data and carries the reply.
-        send_segment(conn, our_ip, PSH | ACK, &out[..n]);
-    }
-
-    fn trim(b: &[u8]) -> &[u8] {
-        let mut end = b.len();
-        while end > 0 && (b[end - 1] == b'\r' || b[end - 1] == b'\n' || b[end - 1] == b' ') {
-            end -= 1;
-        }
-        let mut start = 0;
-        while start < end && b[start] == b' ' {
-            start += 1;
-        }
-        &b[start..end]
-    }
-
-    fn cmd_word(line: &[u8]) -> &[u8] {
-        let mut i = 0;
-        while i < line.len() && line[i] != b' ' {
-            i += 1;
-        }
-        &line[..i]
-    }
-
-    fn after_word(line: &[u8]) -> &[u8] {
-        let mut i = 0;
-        while i < line.len() && line[i] != b' ' {
-            i += 1;
-        }
-        while i < line.len() && line[i] == b' ' {
-            i += 1;
-        }
-        &line[i..]
-    }
-
-    fn fmt_ip(ip: [u8; 4], out: &mut [u8; 24]) -> usize {
-        let mut n = 0;
-        for (i, octet) in ip.iter().enumerate() {
-            if i > 0 {
-                out[n] = b'.';
-                n += 1;
-            }
-            n += fmt_u32(*octet as u32, &mut out[n..]);
+        while n < out.len() && r.head != r.tail {
+            out[n] = r.buf[r.tail];
+            r.tail = (r.tail + 1) % RING_SIZE;
+            n += 1;
         }
         n
     }
+}
 
-    fn fmt_uptime(ticks: u64, out: &mut [u8; 32]) -> usize {
-        // Timer runs at 100 Hz.
-        let secs = ticks / 100;
-        let mut n = 0;
-        n += fmt_u32((secs % 1_000_000) as u32, &mut out[n..]);
-        let tail = b" s up\r\n";
-        out[n..n + tail.len()].copy_from_slice(tail);
-        n + tail.len()
+/// Build and send one TCP segment carrying as many queued bytes as
+/// will fit, or a bare ACK if the ring is empty. Called after every
+/// inbound data segment to fold the application reply into the ACK.
+fn flush_pending(conn: &mut Conn, our_ip: [u8; 4]) {
+    let mut buf = [0u8; MAX_SEG_PAYLOAD];
+    let n = ring_drain(&mut buf);
+    if n > 0 {
+        send_segment(conn, our_ip, PSH | ACK, &buf[..n]);
+    } else {
+        send_segment(conn, our_ip, ACK, &[]);
     }
+}
 
-    /// Minimal decimal formatter for a u32 into `out`; returns bytes written.
-    fn fmt_u32(mut v: u32, out: &mut [u8]) -> usize {
-        if v == 0 {
-            out[0] = b'0';
-            return 1;
+/// One-shot banner pushed the moment the TCP handshake completes. Says
+/// hello so a freshly-connected client doesn't think the link is dead
+/// while it waits for the shell to print its next prompt.
+fn send_banner(conn: &mut Conn, our_ip: [u8; 4]) {
+    let banner = b"BeetOS remote console (M7)\r\n";
+    send_segment(conn, our_ip, PSH | ACK, banner);
+}
+
+/// Drain queued console bytes into a segment without waiting for an
+/// inbound segment to piggy-back the ACK. Called from the 100 Hz timer
+/// tick so shell output reaches the client even when the client is
+/// silent (`ifconfig` writes a few hundred bytes without any prompt
+/// from the user).
+///
+/// No-op unless the connection is Established **and** the ring has
+/// bytes — otherwise we'd spam the wire with empty ACKs.
+pub fn tick_flush_console() {
+    // SAFETY: single-threaded kernel, same invariants as `console_push`.
+    unsafe {
+        let c = &mut *(&raw mut CONN);
+        if c.state != State::Established {
+            return;
         }
-        let mut digits = [0u8; 10];
-        let mut d = 0;
-        while v > 0 {
-            digits[d] = b'0' + (v % 10) as u8;
-            v /= 10;
-            d += 1;
+        let r = &*(&raw const RING);
+        if r.head == r.tail {
+            return;
         }
-        for i in 0..d {
-            out[i] = digits[d - 1 - i];
+        let our_ip = net_stack::get_ip();
+        if our_ip == [0, 0, 0, 0] {
+            return;
         }
-        d
+        let mut buf = [0u8; MAX_SEG_PAYLOAD];
+        let n = ring_drain(&mut buf);
+        if n > 0 {
+            send_segment(c, our_ip, PSH | ACK, &buf[..n]);
+        }
     }
 }

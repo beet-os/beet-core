@@ -818,14 +818,17 @@ virtio-blk uses SPI 16 (first virtio transport = GIC IRQ 48). For the initial im
 - [x] virtio-net driver (QEMU virt) — `platform/qemu_virt/net.rs`
 - [x] In-kernel L2/L3 stack: ARP replies, DHCP client, ICMP echo — `net_stack.rs`
 - [x] **TCP server (passive open) — `platform/qemu_virt/tcp.rs`** — three-way handshake, in-order data, clean teardown (RST/FIN), TCP checksum with pseudo-header. Single connection, no retransmit (loopback-quality QEMU link); documented limitations inline.
-- [x] **Remote console over TCP** (port 2323): `help` / `ip` / `ping` / `uptime` / `echo` / `quit`. First reachable-from-the-host BeetOS interface.
-- [x] **`cargo xtask qemu-smoke-net`** — boots QEMU with `hostfwd`, waits for DHCP bind, then drives the console over a real host TCP socket and asserts the `ip`/`ping` replies. Hardware-free CI coverage of the whole RX/TX → ARP/DHCP/IP → TCP datapath.
-- [ ] Bridge the TCP console to the **real userspace shell** (capture shell stdout over the socket via a `net`↔`shell` IPC seam) — the remaining piece for a true remote shell rather than a built-in command set.
+- [x] **`cargo xtask qemu-smoke-net`** — boots QEMU with `hostfwd`, waits for DHCP bind, then drives the real shell over a host TCP socket and asserts the `ifconfig` reply contains `10.0.2.15`. Hardware-free CI coverage of the whole RX/TX → ARP/DHCP/IP → TCP → IPC → shell → tap → kernel ring → TCP datapath. Stable on 3 consecutive runs.
+- [x] **TCP ↔ real userspace shell bridge**:
+  - [x] **`os/console` output service** (`api/console::CONSOLE_OUT_SID`, PID 7) — receives `ConsoleOp::Putc` / `ConsoleOp::Write` Scalar IPC from any process, fans out to UART and to the kernel's TCP ring via the new `NetConsolePush` syscall. Phase 1 = additive tap; the shell still writes UART/FB directly for the local terminal, and *also* mirrors each `puts()` to the service. Phase 2 (follow-up) will retire the local UART write and let the service own it.
+  - [x] **`SysCall::NetConsolePush(len, w0..w3)`** — bytes ride **inline in the syscall args** (mirrors `ConsoleOp::Write`'s packing exactly). No user-pointer crosses the EL0/EL1 boundary, so the kernel handler is PAN-safe without a copy-from-user helper.
+  - [x] **`tcp.rs` becomes a transparent pipe** — inbound bytes go through `dispatch_input_char_public` (same routing as the UART IRQ, but skips the GUI WindowManager so the boot desktop's focused window doesn't eat remote letters); outbound bytes drain from a 4 KiB ring filled by `NetConsolePush`, flushed both on inbound ACK opportunity *and* every 10 ms by the timer IRQ (so silent clients still see shell output).
+- [ ] **Phase 2: retire the shell's direct UART/FB writes** in favour of the service. Keeps boot-time fallback for when the service isn't up yet, but removes the duplicate write path on steady state.
 - [ ] `api/net/` — userspace network API (socket syscalls or a `net` IPC service) so apps, not just the kernel console, can use TCP.
-- [ ] Shell commands `ifconfig` / `ping` (needs the `api/net/` bridge above to reach the kernel net state from EL0).
+- [ ] Shell command `ping` (already have `ifconfig` via `NetGetInfo` — proven over TCP in `qemu-smoke-net`).
 - [ ] Real-NIC path (USB-C Ethernet / RP1 on Pi 5) + retransmission timer for lossy links.
 
-**Status: IN PROGRESS** — TCP transport + remote console land the headline "reach BeetOS over the network" goal and are CI-tested end-to-end on QEMU. Remaining work is the userspace plumbing (`api/net/`, shell bridge) and a real NIC.
+**Status: HEADLINE DONE — `cargo xtask qemu-smoke-net` boots BeetOS, runs the real userspace shell, connects over real TCP from the host, and gets a real `ifconfig` reply with the DHCP-assigned IP.** Phase 1 of the `os/console` service is in place and CI-tested; Phase 2 retirement of the local UART write is the only architectural cleanup left before this milestone closes. `api/net/` for arbitrary userspace TCP and a real NIC path are M7 extensions.
 
 ---
 

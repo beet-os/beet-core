@@ -142,10 +142,10 @@ fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
     let target_dir = ws_target.join("aarch64-unknown-none/debug");
 
     // Build all app/service crates (excluded from workspace, so use --manifest-path)
-    for app in &["hello", "shell", "procman", "fs", "log", "block"] {
+    for app in &["hello", "shell", "procman", "fs", "log", "block", "console"] {
         println!("Building app: {app}");
-        // procman, fs, log, and block live in os/, everything else in apps/
-        let manifest = if matches!(*app, "procman" | "fs" | "log" | "block") {
+        // procman, fs, log, block, console live in os/, everything else in apps/
+        let manifest = if matches!(*app, "procman" | "fs" | "log" | "block" | "console") {
             root.join(format!("os/{app}/Cargo.toml"))
         } else {
             root.join(format!("apps/{app}/Cargo.toml"))
@@ -1030,48 +1030,67 @@ fn try_console_session(host_port: u16) -> anyhow::Result<()> {
     use std::time::Duration;
 
     let mut stream = TcpStream::connect(("127.0.0.1", host_port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    // Short per-read timeout so we can poll for quiescence. Bytes
+    // arrive in bursts as the shell does IPC → kernel push → next ACK
+    // segment, so we read until 500 ms goes by without new data or 5
+    // s of total wall time.
+    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
-    // Read whatever the server sends within the timeout, accumulating
-    // into a String. Used after connect (banner) and after each command.
     fn drain(stream: &mut TcpStream) -> String {
+        use std::time::Instant;
         let mut buf = [0u8; 1024];
         let mut acc = String::new();
-        // A couple of short reads are enough; the console answers in one
-        // segment but TCP may split it.
-        for _ in 0..4 {
+        let overall_deadline = Instant::now() + Duration::from_secs(5);
+        let mut quiet_since: Option<Instant> = None;
+        while Instant::now() < overall_deadline {
             match stream.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => acc.push_str(&String::from_utf8_lossy(&buf[..n])),
-                Err(_) => break, // timeout — stop draining
+                Ok(n) => {
+                    acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    quiet_since = None;
+                }
+                Err(_) => {
+                    // Read timeout — start (or extend) the quiet timer.
+                    let start = quiet_since.get_or_insert_with(Instant::now);
+                    if start.elapsed() >= Duration::from_millis(500) {
+                        break;
+                    }
+                }
             }
         }
         acc
     }
 
-    let banner = drain(&mut stream);
+    // First read: the kernel banner sent on handshake completion, then
+    // anything `os/console` has spooled from the shell since boot
+    // (motd, prompt, …). Either order is fine; we only require the
+    // banner is in there and the shell has reached a prompt-ish state.
+    let initial = drain(&mut stream);
     anyhow::ensure!(
-        banner.contains("BeetOS remote console"),
-        "missing banner, got: {banner:?}"
+        initial.contains("BeetOS remote console"),
+        "missing banner, got: {initial:?}"
     );
-    println!("  [ok] banner: {:?}", banner.trim());
+    println!("  [ok] banner: {:?}", initial.trim());
+    anyhow::ensure!(
+        initial.contains("bsh"),
+        "no shell prompt in initial drain — shell didn't tap output? got: {initial:?}"
+    );
+    println!("  [ok] shell prompt visible over TCP");
 
-    stream.write_all(b"ip\n")?;
-    let ip_reply = drain(&mut stream);
+    // Drive the real shell — `ifconfig` is the most distinctive
+    // command (no false-positive match in the prompt/echo) and its
+    // reply hits multiple integration points: the shell sends the
+    // NetGetInfo syscall, formats the result, taps it through the
+    // console output service, the kernel TCP module flushes it to the
+    // socket. If we see "10.0.2.15" here, the whole pipe is live.
+    stream.write_all(b"ifconfig\n")?;
+    let reply = drain(&mut stream);
     anyhow::ensure!(
-        ip_reply.contains("10.0.2.15"),
-        "ip command did not return the DHCP address, got: {ip_reply:?}"
+        reply.contains("10.0.2.15"),
+        "ifconfig did not return the DHCP address, got: {reply:?}"
     );
-    println!("  [ok] 'ip' -> {:?}", ip_reply.trim());
-
-    stream.write_all(b"ping\n")?;
-    let ping_reply = drain(&mut stream);
-    anyhow::ensure!(
-        ping_reply.contains("pong"),
-        "ping command did not return pong, got: {ping_reply:?}"
-    );
-    println!("  [ok] 'ping' -> {:?}", ping_reply.trim());
+    println!("  [ok] 'ifconfig' -> contains 10.0.2.15");
 
     Ok(())
 }

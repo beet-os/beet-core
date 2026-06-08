@@ -96,9 +96,93 @@ fn release_input_focus() {
 fn putc(c: u8) {
     uart_putc(c);
     fb_putc(c);
+    // Tap: mirror to the console output service (which fans out to TCP).
+    // Fire-and-forget Scalar; never blocks the shell.
+    tap_byte(c);
 }
 
-fn puts(s: &str) { for b in s.bytes() { putc(b); } }
+fn puts(s: &str) {
+    for b in s.bytes() {
+        uart_putc(b);
+        fb_putc(b);
+    }
+    // Tap once per call, in 32-byte chunks: amortises the IPC cost vs.
+    // one IPC per byte and matches how the shell actually batches output
+    // (a prompt, a path, a help line — all small contiguous strings).
+    tap_chunks(s.as_bytes());
+}
+
+// ============================================================================
+// Console output service tap
+// ============================================================================
+//
+// The shell keeps writing UART + FB directly for the local terminal
+// (zero latency, zero IPC), and *in addition* sends a copy of every
+// output byte to `os/console` over IPC. The service mirrors those bytes
+// to the kernel's TCP remote-console ring, so a remote client sees
+// exactly the same stream as the local screen.
+//
+// CID is cached after the first successful Connect; before that and
+// across service restarts the tap is a silent no-op.
+static mut CONSOLE_OUT_CID: u32 = 0;
+
+fn console_out_cid() -> u32 {
+    unsafe {
+        if CONSOLE_OUT_CID != 0 {
+            return CONSOLE_OUT_CID;
+        }
+        let sid = xous::SID::from_array(beetos_api_console::CONSOLE_OUT_SID);
+        match xous::rsyscall(xous::SysCall::Connect(sid)) {
+            Ok(xous::Result::ConnectionID(cid)) => {
+                CONSOLE_OUT_CID = cid;
+                cid
+            }
+            _ => 0,
+        }
+    }
+}
+
+fn tap_byte(c: u8) {
+    let cid = console_out_cid();
+    if cid == 0 {
+        return;
+    }
+    let scalar = xous::ScalarMessage {
+        id: beetos_api_console::ConsoleOp::Putc as usize,
+        arg1: c as usize,
+        arg2: 0,
+        arg3: 0,
+        arg4: 0,
+    };
+    let _ = xous::rsyscall(xous::SysCall::SendMessage(
+        cid,
+        xous::Message::Scalar(scalar),
+    ));
+}
+
+fn tap_chunks(bytes: &[u8]) {
+    let cid = console_out_cid();
+    if cid == 0 {
+        return;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let end = (i + beetos_api_console::WRITE_CHUNK).min(bytes.len());
+        let (args, len) = beetos_api_console::pack_write(&bytes[i..end]);
+        let scalar = xous::ScalarMessage {
+            id: beetos_api_console::encode_write_id(len),
+            arg1: args[0],
+            arg2: args[1],
+            arg3: args[2],
+            arg4: args[3],
+        };
+        let _ = xous::rsyscall(xous::SysCall::SendMessage(
+            cid,
+            xous::Message::Scalar(scalar),
+        ));
+        i = end;
+    }
+}
 
 struct DualWriter;
 impl Write for DualWriter {

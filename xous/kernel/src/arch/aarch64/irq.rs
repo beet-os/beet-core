@@ -161,6 +161,11 @@ fn handle_irq() -> bool {
             timer::TIMER_IRQ => {
                 let count = timer::handle_tick();
                 net_stack::tick(count);
+                // Drain any queued remote-console output onto the wire.
+                // Without this, shell output that wasn't followed by an
+                // input segment (e.g. the reply to `ifconfig` when the
+                // client is silent) never leaves the box.
+                crate::platform::qemu_virt::tcp::tick_flush_console();
                 // Refresh the desktop once per second so the taskbar
                 // clock advances without the user having to type anything.
                 crate::platform::qemu_virt::fb::tick_recompose_if_due(count);
@@ -248,6 +253,22 @@ fn handle_irq() -> bool {
 /// - If a SID is registered via `AcquireInputFocus`, deliver directly to it.
 /// - Otherwise, buffer the char in the kernel ring buffer for delivery when
 ///   the next process registers input focus.
+///
+/// Bypasses the GUI WindowManager — bytes from the remote TCP console
+/// go straight to whoever holds shell input focus. Local keystrokes
+/// keep flowing through the WM first (so GUI windows still work for a
+/// user at the box). Without this split, the boot desktop's focused
+/// Snake game eats every letter from the remote client and the shell
+/// never sees a command.
+#[cfg(feature = "platform-qemu-virt")]
+pub fn dispatch_input_char_public(c: u8) {
+    use crate::services::SystemServices;
+    SystemServices::with_mut(|ss| match ss.display_input_sid() {
+        Some(sid_words) => deliver_char_to_sid(ss, sid_words, c),
+        None => ss.push_display_input_char(c),
+    });
+}
+
 #[cfg(feature = "platform-qemu-virt")]
 fn dispatch_input_char(c: u8) {
     use crate::services::SystemServices;

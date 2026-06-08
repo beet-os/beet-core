@@ -470,6 +470,26 @@ pub enum SysCall {
     #[cfg(beetos)]
     NetGetInfo,
 
+    /// Push up to 32 bytes from userspace into the kernel's TCP
+    /// remote-console TX ring. If a TCP client is connected on port
+    /// 2323, the bytes flush in a segment on the next ACK opportunity;
+    /// otherwise they're dropped (no cross-session buffering).
+    ///
+    /// Bytes ride **inline in the syscall args** (`w0..w3` little-
+    /// endian u64s) — never as a userspace pointer the kernel would
+    /// have to chase. That keeps the kernel-side handler PAN-safe and
+    /// removes the need for a copy_from_user helper. The arg layout
+    /// mirrors [`api/console::ConsoleOp::Write`] one-for-one so the
+    /// `os/console` service can forward a received Scalar straight
+    /// into this syscall with no repacking.
+    ///
+    /// # Arguments
+    ///
+    /// * `len`: number of valid bytes in `w0..w3` (0..32)
+    /// * `w0..w3`: four little-endian u64s of byte payload
+    #[cfg(beetos)]
+    NetConsolePush(usize /* len */, usize /* w0 */, usize /* w1 */, usize /* w2 */, usize /* w3 */),
+
     /// Block the calling thread until any notification bits matching `mask`
     /// are set on the current process.  Returns the bits that fired
     /// (intersection of pending bits and mask) and clears them; the read
@@ -637,6 +657,7 @@ pub enum SysCallNumber {
     ReleaseDisplay = 66,
     AcquireInputFocus = 67,
     ReleaseInputFocus = 68,
+    NetConsolePush = 69,
 
     Invalid,
 }
@@ -712,6 +733,7 @@ impl SysCallNumber {
             66 => ReleaseDisplay,
             67 => AcquireInputFocus,
             68 => ReleaseInputFocus,
+            69 => NetConsolePush,
             _ => Invalid,
         }
     }
@@ -1078,6 +1100,10 @@ impl SysCall {
             SysCall::ReleaseInputFocus => {
                 [SysCallNumber::ReleaseInputFocus as usize, 0, 0, 0, 0, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::NetConsolePush(len, w0, w1, w2, w3) => {
+                [SysCallNumber::NetConsolePush as usize, *len, *w0, *w1, *w2, *w3, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1285,6 +1311,8 @@ impl SysCall {
             }
             #[cfg(beetos)]
             SysCallNumber::ReleaseInputFocus => SysCall::ReleaseInputFocus,
+            #[cfg(beetos)]
+            SysCallNumber::NetConsolePush => SysCall::NetConsolePush(a1, a2, a3, a4, a5),
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1304,7 +1332,8 @@ impl SysCall {
             | SysCallNumber::AcquireDisplay
             | SysCallNumber::ReleaseDisplay
             | SysCallNumber::AcquireInputFocus
-            | SysCallNumber::ReleaseInputFocus => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::ReleaseInputFocus
+            | SysCallNumber::NetConsolePush => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }

@@ -527,6 +527,11 @@ static BLOCK_ELF: &[u8] = include_bytes!(
 static LOG_ELF: &[u8] = include_bytes!(
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/log.stripped")
 );
+/// Console output service: owns stdout fan-out. UART now, TCP remote
+/// console always; framebuffer when AcquireDisplay migrates here.
+static CONSOLE_ELF: &[u8] = include_bytes!(
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aarch64-unknown-none/debug/console.stripped")
+);
 /// hello-std: compiled with Rust std (aarch64-unknown-beetos), stripped to same dir by xtask.
 #[cfg(not(feature = "test-mode"))]
 static HELLO_STD_ELF: &[u8] = include_bytes!(
@@ -549,6 +554,7 @@ static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("procman", PROCMAN_ELF),
     ("fs", FS_ELF),
     ("block", BLOCK_ELF),
+    ("console", CONSOLE_ELF),
 ];
 
 #[cfg(feature = "test-mode")]
@@ -560,6 +566,7 @@ static BINARY_TABLE: &[(&str, &[u8])] = &[
     ("procman", PROCMAN_ELF),
     ("fs", FS_ELF),
     ("block", BLOCK_ELF),
+    ("console", CONSOLE_ELF),
 ];
 
 /// Look up a binary by name in the embedded binary table.
@@ -690,19 +697,27 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     let block_pid = PID::new(6).unwrap();
     create_elf_process(block_pid, BLOCK_ELF, b"block", beetos::PERM_FS_SERVER);
 
-    // PID 7: beetos-test in test-mode only (hello-std is spawnable from the shell).
+    // PID 7: console output service. Owns stdout fan-out (UART + TCP
+    // remote console). The shell taps its puts() into this service in
+    // parallel with its existing direct UART write so a remote client
+    // sees the same stream as the local terminal.
+    let console_pid = PID::new(7).unwrap();
+    create_elf_process(console_pid, CONSOLE_ELF, b"console", beetos::PERM_LOG_SERVER);
+
+    // PID 8: beetos-test in test-mode only (hello-std is spawnable from the shell).
     #[cfg(feature = "test-mode")]
-    let app_pid = PID::new(7).unwrap();
+    let app_pid = PID::new(8).unwrap();
     #[cfg(feature = "test-mode")]
     create_elf_process(app_pid, TEST_ELF, b"beetos-test", beetos::PERM_USER_PROGRAM);
 
-    // Map UART MMIO into log, procman, shell, fs, block (and beetos-test in test-mode).
+    // Map UART MMIO into log, procman, shell, fs, block, console
+    // (and beetos-test in test-mode).
     #[cfg(feature = "platform-qemu-virt")]
     {
         #[cfg(not(feature = "test-mode"))]
-        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid, block_pid];
+        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid, block_pid, console_pid];
         #[cfg(feature = "test-mode")]
-        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid, block_pid, app_pid];
+        let uart_pids: &[PID] = &[log_pid, procman_pid, shell_pid, fs_pid, block_pid, console_pid, app_pid];
         crate::services::SystemServices::with_mut(|ss| {
             crate::mem::MemoryManager::with_mut(|mm| {
                 for &pid in uart_pids {
@@ -831,6 +846,10 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     {
         let idx = block_pid.get() as usize - 1;
         super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
+    }
+    {
+        let idx = console_pid.get() as usize - 1;
+        super::process::set_thread_arg0(idx, SHELL_UART_VA);
     }
     #[cfg(feature = "test-mode")]
     {
