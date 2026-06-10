@@ -1292,8 +1292,15 @@ fn qemu_bench(args: &[String]) -> anyhow::Result<()> {
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
         "-m".to_string(), "2G".to_string(),
+        // Headless on purpose — and *no ramfb*: with a framebuffer
+        // present, the kernel recomposes the boot desktop at 10 Hz
+        // inside the timer IRQ (~90 ms of virtual time per frame in a
+        // debug build!), which lands in measurement windows phase-
+        // dependently and inflated affected benchmarks by up to 12×
+        // (yield read 43 µs/op when its true cost is 3.5 µs). Without
+        // ramfb, fb::is_fb_ready() is false and the whole GUI pipeline
+        // is skipped — benches measure the kernel, not the rasterizer.
         "-display".to_string(), "none".to_string(),
-        "-device".to_string(), "ramfb".to_string(),
         // 1 instruction = 1 virtual ns (shift=0). sleep=off lets idle
         // WFI warp virtual time to the next timer deadline so boot
         // doesn't take minutes of wall time.
