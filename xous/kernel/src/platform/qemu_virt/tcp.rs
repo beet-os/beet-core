@@ -8,7 +8,7 @@
 //!   1. **Kernel-managed remote console** on the well-known
 //!      [`LISTEN_PORT`] (2323). Passive-open only. The single
 //!      [`CONN`] static + 4 KiB [`RING`] back the M7 remote shell —
-//!      receives bytes go straight into the shell input dispatcher,
+//!      received bytes go straight into the shell input dispatcher,
 //!      writes come from the [`SysCall::NetConsolePush`] syscall.
 //!      The smoke test `qemu-smoke-net` exercises this path end-to-end.
 //!
@@ -24,16 +24,41 @@
 //! [`build_and_send`] (frame assembly + TCP checksum) and
 //! [`internet_checksum`] from `net_stack`.
 //!
+//! ## Hardening invariants (userspace sockets)
+//!
+//! - **Ownership**: every syscall-facing operation takes the caller's
+//!   PID and refuses to touch a socket another process created.
+//!   Listener children inherit the listener's owner.
+//! - **No slot leaks**: sockets parked in FinWait1/2, Closing,
+//!   LastAck, TimeWait, an embryonic SynReceived, or a Closed slot
+//!   nobody can re-observe are reaped [`REAP_TICKS`] after entering
+//!   the state (we have no retransmit, so a lost final ACK must not
+//!   pin a slot forever). Process exit reclaims everything the dead
+//!   PID owned via [`cleanup_for_pid`].
+//! - **Honest flow control**: the advertised window is the actual
+//!   free space in the per-socket RX ring (capped at [`RCV_WINDOW`]).
+//!   Inbound payload is accepted only up to capacity and the ACK
+//!   covers exactly what was stored — the peer's retransmit fills the
+//!   rest once `recv` reopens the window (a window-update ACK is sent
+//!   when a previously-starved ring is drained).
+//! - **Sequence-checked FIN**: a FIN only counts when its sequence
+//!   slot lines up with `rcv_nxt`, so retransmitted or out-of-order
+//!   FINs can't corrupt the stream position. Retransmitted FINs in
+//!   CloseWait/TimeWait get a fresh ACK so the peer stops resending.
+//!
 //! ## Deliberate limitations (v1)
 //!
 //! - **No retransmission / no RTO.** QEMU user-mode networking is a
 //!   loopback-quality link; segments don't get lost between host and
 //!   guest. A real NIC port will need a real retransmit timer.
-//! - **No out-of-order reassembly, no window scaling.** Fixed receive
-//!   window, in-order delivery assumed.
+//! - **No out-of-order reassembly, no window scaling.** In-order
+//!   delivery assumed; anything else gets a duplicate ACK.
 //! - **No SACK, no Nagle, no delayed ACK.**
+//! - **No RFC 5961 RST validation.** Blind-RST injection isn't in the
+//!   threat model for a slirp loopback link.
 //! - **Single pending accept per listener.** A second SYN while one
-//!   is still in handshake gets RST.
+//!   is still in handshake gets RST (host connect() fails fast
+//!   instead of hanging on a backlog we don't have).
 //! - **`MAX_USERSPACE_SOCKETS` (= 4) sockets** in the static table.
 
 use super::{net, net_stack};
@@ -42,8 +67,9 @@ use super::{net, net_stack};
 /// and avoids clashing with a host telnet on 23.
 pub const LISTEN_PORT: u16 = 2323;
 
-/// Receive window advertised by the kernel console. One frame's worth
-/// is plenty for a line-oriented console.
+/// Ceiling on the receive window we advertise. The console always
+/// advertises this; userspace sockets advertise the *actual* free
+/// space of their RX ring capped here.
 const RCV_WINDOW: u16 = 1400;
 
 /// Largest payload we put in a single outbound segment. Keeps
@@ -118,7 +144,7 @@ fn next_iss() -> u32 {
 // ============================================================================
 
 /// Cap on userspace sockets. ~2 KiB each → 8 KiB total in BSS.
-pub const MAX_USERSPACE_SOCKETS: usize = 4;
+const MAX_USERSPACE_SOCKETS: usize = 4;
 
 const SOCK_RX_BUF: usize = 1024;
 const SOCK_TX_BUF: usize = 1024;
@@ -126,17 +152,49 @@ const SOCK_TX_BUF: usize = 1024;
 /// Sentinel returned from `accept` when no connection is ready.
 pub const NO_PENDING: u32 = u32::MAX;
 
+/// Ticks (100 Hz) before a socket stuck in a terminal-ish state
+/// (FinWait/Closing/LastAck/TimeWait/embryonic SynReceived) is
+/// reclaimed. 5 s is generous for a loopback link where every
+/// handshake completes in milliseconds.
+const REAP_TICKS: u64 = 500;
+
+/// Ticks between ARP retries for a `connect` whose next hop hasn't
+/// resolved yet: 4 broadcasts/s instead of one per tick.
+const ARP_RETRY_TICKS: u64 = 25;
+
+/// Coarse current-tick mirror, refreshed by [`tick_flush_user`]
+/// (100 Hz). Segment handlers run from the same timer IRQ a few calls
+/// earlier in the chain, so reads are at most one tick (10 ms) stale —
+/// irrelevant against the multi-second reap deadlines it feeds.
+static mut NOW_TICK: u64 = 0;
+
+fn now_tick() -> u64 {
+    unsafe { NOW_TICK }
+}
+
 /// Ephemeral local port allocator. Starts in the IANA dynamic range.
 static mut NEXT_EPHEMERAL_PORT: u16 = 49152;
 
+/// True if any live socket already claims `port` as its local port.
+fn port_in_use(port: u16) -> bool {
+    sockets().iter().any(|s| !matches!(s.state, SockState::Free) && s.local_port == port)
+}
+
 fn alloc_ephemeral_port() -> u16 {
+    // With at most MAX_USERSPACE_SOCKETS ports busy, a handful of
+    // probes always finds a free one.
     unsafe {
-        let p = NEXT_EPHEMERAL_PORT;
-        NEXT_EPHEMERAL_PORT = NEXT_EPHEMERAL_PORT.wrapping_add(1);
-        if NEXT_EPHEMERAL_PORT < 49152 {
-            NEXT_EPHEMERAL_PORT = 49152;
+        for _ in 0..(MAX_USERSPACE_SOCKETS + 2) {
+            let p = NEXT_EPHEMERAL_PORT;
+            NEXT_EPHEMERAL_PORT = NEXT_EPHEMERAL_PORT.wrapping_add(1);
+            if NEXT_EPHEMERAL_PORT < 49152 {
+                NEXT_EPHEMERAL_PORT = 49152;
+            }
+            if !port_in_use(p) {
+                return p;
+            }
         }
-        p
+        NEXT_EPHEMERAL_PORT // unreachable with a 16k range and 4 sockets
     }
 }
 
@@ -178,31 +236,36 @@ impl SockState {
     }
 }
 
-pub struct UserSocket {
-    pub state: SockState,
-    /// Process that created this socket. Sockets are closed if the
-    /// process exits (not enforced yet, but reserved for cleanup).
-    pub owner_pid: u32,
-    pub local_port: u16,
-    pub peer_mac: [u8; 6],
-    pub peer_ip: [u8; 4],
-    pub peer_port: u16,
-    pub snd_nxt: u32,
-    pub rcv_nxt: u32,
+struct UserSocket {
+    state: SockState,
+    /// Process that created this socket (children inherit it from
+    /// their listener). Every syscall operation checks the caller
+    /// against this; [`cleanup_for_pid`] reclaims on process exit.
+    owner_pid: u32,
+    local_port: u16,
+    peer_mac: [u8; 6],
+    peer_ip: [u8; 4],
+    peer_port: u16,
+    snd_nxt: u32,
+    rcv_nxt: u32,
     /// Listener bookkeeping: slot index of an in-progress or accepted
     /// child connection. `NO_PENDING` if no pending child. Only one
     /// pending child per listener for V1 (no backlog).
-    pub pending_child: u32,
+    pending_child: u32,
     /// Set when `connect` has been called but we don't yet have the
     /// peer's MAC (ARP request outstanding). The state stays at
     /// SynSent until ARP resolves and we send the SYN.
-    pub awaiting_arp: bool,
-    pub rx_buf: [u8; SOCK_RX_BUF],
-    pub rx_head: usize,
-    pub rx_tail: usize,
-    pub tx_buf: [u8; SOCK_TX_BUF],
-    pub tx_head: usize,
-    pub tx_tail: usize,
+    awaiting_arp: bool,
+    /// Tick at which the reaper may reclaim this slot; 0 = no
+    /// deadline. Set on entry into the wind-down states and on
+    /// embryonic (SynReceived) children; cleared on Established.
+    expiry_tick: u64,
+    rx_buf: [u8; SOCK_RX_BUF],
+    rx_head: usize,
+    rx_tail: usize,
+    tx_buf: [u8; SOCK_TX_BUF],
+    tx_head: usize,
+    tx_tail: usize,
 }
 
 impl UserSocket {
@@ -218,6 +281,7 @@ impl UserSocket {
             rcv_nxt: 0,
             pending_child: NO_PENDING,
             awaiting_arp: false,
+            expiry_tick: 0,
             rx_buf: [0; SOCK_RX_BUF],
             rx_head: 0,
             rx_tail: 0,
@@ -227,15 +291,31 @@ impl UserSocket {
         }
     }
 
-    fn rx_push(&mut self, b: u8) {
-        let next = (self.rx_head + 1) % SOCK_RX_BUF;
-        if next == self.rx_tail {
-            // Buffer full; drop oldest so newest is preserved (best-
-            // effort — apps that need backpressure must drain faster).
-            self.rx_tail = (self.rx_tail + 1) % SOCK_RX_BUF;
+    fn rx_len(&self) -> usize {
+        (self.rx_head + SOCK_RX_BUF - self.rx_tail) % SOCK_RX_BUF
+    }
+
+    fn rx_free(&self) -> usize {
+        SOCK_RX_BUF - 1 - self.rx_len()
+    }
+
+    /// Append as much of `payload` as fits. Returns the byte count
+    /// actually stored — the caller advances `rcv_nxt` by exactly
+    /// this much, so the ACK never covers bytes we dropped. The
+    /// peer's retransmit delivers the remainder once the app drains
+    /// the ring and the window reopens.
+    fn rx_accept(&mut self, payload: &[u8]) -> usize {
+        let mut n = 0;
+        for &b in payload {
+            let next = (self.rx_head + 1) % SOCK_RX_BUF;
+            if next == self.rx_tail {
+                break;
+            }
+            self.rx_buf[self.rx_head] = b;
+            self.rx_head = next;
+            n += 1;
         }
-        self.rx_buf[self.rx_head] = b;
-        self.rx_head = next;
+        n
     }
 
     fn rx_drain(&mut self, out: &mut [u8]) -> usize {
@@ -287,7 +367,9 @@ static mut USER_SOCKETS: [UserSocket; MAX_USERSPACE_SOCKETS] = [
 
 /// SAFETY: single-threaded kernel; all socket operations happen with
 /// IRQs masked (syscall entry) or from the timer IRQ (which preempts
-/// nothing inside the kernel itself).
+/// nothing inside the kernel itself). Each call derives a fresh
+/// reference from the raw pointer; callers scope their borrows so
+/// uses never interleave.
 fn sockets_mut() -> &'static mut [UserSocket; MAX_USERSPACE_SOCKETS] {
     unsafe { &mut *(&raw mut USER_SOCKETS) }
 }
@@ -322,6 +404,37 @@ fn find_matching(local_port: u16, peer_ip: [u8; 4], peer_port: u16) -> Option<us
             && s.peer_ip == peer_ip
             && !matches!(s.state, SockState::Free | SockState::Listen)
     })
+}
+
+fn mark_expiry(s: &mut UserSocket) {
+    s.expiry_tick = now_tick() + REAP_TICKS;
+}
+
+/// If a listener's pending child died mid-handshake (RST, reap), clear
+/// the stale reference so the listener can serve the next SYN instead
+/// of being wedged forever.
+fn reclaim_stale_child(listener_idx: usize) {
+    let pc = sockets()[listener_idx].pending_child;
+    if pc == NO_PENDING {
+        return;
+    }
+    let ci = pc as usize;
+    if ci >= MAX_USERSPACE_SOCKETS {
+        // Corrupt bookkeeping — drop the reference rather than index
+        // out of bounds (and panic) on the next accept.
+        sockets_mut()[listener_idx].pending_child = NO_PENDING;
+        return;
+    }
+    match sockets()[ci].state {
+        SockState::Free => {
+            sockets_mut()[listener_idx].pending_child = NO_PENDING;
+        }
+        SockState::Closed => {
+            sockets_mut()[ci] = UserSocket::empty();
+            sockets_mut()[listener_idx].pending_child = NO_PENDING;
+        }
+        _ => {}
+    }
 }
 
 // ============================================================================
@@ -447,101 +560,161 @@ fn handle_user_segment(
 ) {
     // First: is this segment for an existing connection?
     if let Some(idx) = find_matching(dst_port, src_ip, src_port) {
-        let socks = sockets_mut();
-        let s = &mut socks[idx];
+        let s = &mut sockets_mut()[idx];
 
         if flags & RST != 0 {
-            s.state = SockState::Closed;
+            // No RFC 5961 sequence validation — see module docs.
+            if matches!(
+                s.state,
+                SockState::FinWait1 | SockState::FinWait2 | SockState::Closing
+                    | SockState::LastAck | SockState::TimeWait
+            ) {
+                // App already released its handle; nobody is left to
+                // observe the reset — reclaim the slot immediately.
+                *s = UserSocket::empty();
+            } else {
+                // App still holds the handle: park the socket in
+                // Closed so state() reports the reset; the slot frees
+                // on the app's close() (or PID cleanup).
+                s.state = SockState::Closed;
+            }
             return;
         }
+
+        // Where the peer's FIN would sit if this segment carries one:
+        // right after its payload.
+        let fin_pos = seq.wrapping_add(payload.len() as u32);
 
         match s.state {
             SockState::SynSent => {
                 // We sent SYN, expect SYN+ACK.
                 if flags & (SYN | ACK) == (SYN | ACK) && ack_num == s.snd_nxt {
                     s.rcv_nxt = seq.wrapping_add(1);
-                    // ACK the SYN.
-                    send_user_segment(idx, our_ip, ACK, &[]);
                     s.state = SockState::Established;
-                    flush_user_pending(idx, our_ip);
+                    s.expiry_tick = 0;
+                    // Always ACKs (completing the handshake); any bytes
+                    // queued by send() before the connect finished ride
+                    // along in the same segment.
+                    flush_user_pending(s, our_ip);
                 }
             }
             SockState::SynReceived => {
-                // Listener child waiting for handshake-completing ACK.
+                // Listener child waiting for the handshake-completing ACK.
                 if flags & ACK != 0 && ack_num == s.snd_nxt {
                     s.state = SockState::Established;
+                    s.expiry_tick = 0;
                     if !payload.is_empty() && seq == s.rcv_nxt {
-                        s.rcv_nxt = s.rcv_nxt.wrapping_add(payload.len() as u32);
-                        for &b in payload {
-                            s.rx_push(b);
-                        }
+                        let accepted = s.rx_accept(payload);
+                        s.rcv_nxt = s.rcv_nxt.wrapping_add(accepted as u32);
+                        flush_user_pending(s, our_ip);
                     }
-                    flush_user_pending(idx, our_ip);
+                    // A bare handshake ACK needs no reply.
                 }
             }
             SockState::Established => {
-                if !payload.is_empty() && seq == s.rcv_nxt {
-                    s.rcv_nxt = s.rcv_nxt.wrapping_add(payload.len() as u32);
-                    for &b in payload {
-                        s.rx_push(b);
+                if !payload.is_empty() {
+                    if seq == s.rcv_nxt {
+                        let accepted = s.rx_accept(payload);
+                        s.rcv_nxt = s.rcv_nxt.wrapping_add(accepted as u32);
+                        flush_user_pending(s, our_ip);
+                    } else {
+                        // Out-of-order / retransmit — re-ACK our
+                        // cumulative position.
+                        send_user_segment(s, our_ip, ACK, &[]);
                     }
-                    flush_user_pending(idx, our_ip);
-                } else if !payload.is_empty() {
-                    send_user_segment(idx, our_ip, ACK, &[]);
                 }
-
-                if flags & FIN != 0 {
+                // Only honour the FIN if its sequence slot is exactly
+                // where we are — a retransmitted FIN or one beyond a
+                // partially-accepted payload waits for the peer's
+                // retransmit (it must not double-advance rcv_nxt).
+                if flags & FIN != 0 && fin_pos == s.rcv_nxt {
                     s.rcv_nxt = s.rcv_nxt.wrapping_add(1);
-                    send_user_segment(idx, our_ip, ACK, &[]);
-                    // Move to CloseWait — app must call close() to send our own FIN.
                     s.state = SockState::CloseWait;
+                    send_user_segment(s, our_ip, ACK, &[]);
+                }
+            }
+            SockState::CloseWait => {
+                // Retransmitted FIN — our ACK was lost or delayed.
+                // Re-ACK so the peer stops resending.
+                if flags & FIN != 0 {
+                    send_user_segment(s, our_ip, ACK, &[]);
                 }
             }
             SockState::FinWait1 => {
-                // We sent FIN. Could see ACK of our FIN, FIN of peer, or both.
-                let our_fin_acked = flags & ACK != 0 && ack_num == s.snd_nxt;
-                let peer_fin = flags & FIN != 0;
-                if !payload.is_empty() && seq == s.rcv_nxt {
+                // Our FIN is out and the app handle is gone: inbound
+                // data is discarded, but it still consumes sequence
+                // space and must be ACKed or the peer retransmits it
+                // forever.
+                let had_payload = !payload.is_empty();
+                if had_payload && seq == s.rcv_nxt {
                     s.rcv_nxt = s.rcv_nxt.wrapping_add(payload.len() as u32);
-                    for &b in payload {
-                        s.rx_push(b);
-                    }
                 }
+                let our_fin_acked = flags & ACK != 0 && ack_num == s.snd_nxt;
+                let peer_fin = flags & FIN != 0 && fin_pos == s.rcv_nxt;
                 if peer_fin {
                     s.rcv_nxt = s.rcv_nxt.wrapping_add(1);
                 }
                 match (our_fin_acked, peer_fin) {
                     (true, true) => {
-                        send_user_segment(idx, our_ip, ACK, &[]);
+                        send_user_segment(s, our_ip, ACK, &[]);
                         s.state = SockState::TimeWait;
+                        mark_expiry(s);
                     }
                     (true, false) => {
+                        if had_payload {
+                            send_user_segment(s, our_ip, ACK, &[]);
+                        }
                         s.state = SockState::FinWait2;
+                        mark_expiry(s);
                     }
                     (false, true) => {
-                        send_user_segment(idx, our_ip, ACK, &[]);
+                        send_user_segment(s, our_ip, ACK, &[]);
                         s.state = SockState::Closing;
+                        mark_expiry(s);
                     }
-                    _ => {}
+                    (false, false) => {
+                        if had_payload {
+                            send_user_segment(s, our_ip, ACK, &[]);
+                        }
+                    }
                 }
             }
             SockState::FinWait2 => {
-                if flags & FIN != 0 {
+                let had_payload = !payload.is_empty();
+                if had_payload && seq == s.rcv_nxt {
+                    s.rcv_nxt = s.rcv_nxt.wrapping_add(payload.len() as u32);
+                }
+                if flags & FIN != 0 && fin_pos == s.rcv_nxt {
                     s.rcv_nxt = s.rcv_nxt.wrapping_add(1);
-                    send_user_segment(idx, our_ip, ACK, &[]);
+                    send_user_segment(s, our_ip, ACK, &[]);
                     s.state = SockState::TimeWait;
+                    mark_expiry(s);
+                } else if had_payload {
+                    send_user_segment(s, our_ip, ACK, &[]);
                 }
             }
             SockState::Closing => {
                 if flags & ACK != 0 && ack_num == s.snd_nxt {
                     s.state = SockState::TimeWait;
+                    mark_expiry(s);
                 }
             }
             SockState::LastAck => {
                 if flags & ACK != 0 && ack_num == s.snd_nxt {
-                    s.state = SockState::Closed;
+                    // close() already consumed the app handle — nobody
+                    // can observe this socket again, free it now.
+                    *s = UserSocket::empty();
                 }
             }
+            SockState::TimeWait => {
+                // Retransmitted final FIN: our last ACK was lost.
+                if flags & FIN != 0 {
+                    send_user_segment(s, our_ip, ACK, &[]);
+                }
+            }
+            // Closed swallows stragglers without a reply (the peer is
+            // being wound down by RST/cleanup paths elsewhere); Free
+            // and Listen are unreachable via find_matching.
             _ => {}
         }
         return;
@@ -550,15 +723,14 @@ fn handle_user_segment(
     // Not a known connection. Maybe a SYN to a listener?
     if flags & SYN != 0 && flags & ACK == 0 {
         if let Some(listener_idx) = find_listener(dst_port) {
-            // Allocate a child socket. The listener must not already
-            // have a pending child (V1: no backlog).
-            let socks = sockets_mut();
-            if socks[listener_idx].pending_child != NO_PENDING {
-                // Already mid-handshake on another peer — refuse.
+            reclaim_stale_child(listener_idx);
+            if sockets()[listener_idx].pending_child != NO_PENDING {
+                // One pending handshake at a time (no backlog): refuse
+                // so the host's connect() fails fast instead of hanging.
                 send_rst_for(src_mac, our_ip, src_ip, dst_port, src_port, seq, ack_num, flags, payload.len());
                 return;
             }
-            let owner_pid = socks[listener_idx].owner_pid;
+            let owner_pid = sockets()[listener_idx].owner_pid;
             let child = match alloc_socket(owner_pid) {
                 Some(i) => i,
                 None => {
@@ -567,9 +739,8 @@ fn handle_user_segment(
                 }
             };
             let iss = next_iss();
-            let socks = sockets_mut();
-            socks[listener_idx].pending_child = child as u32;
-            let c = &mut socks[child];
+            sockets_mut()[listener_idx].pending_child = child as u32;
+            let c = &mut sockets_mut()[child];
             c.local_port = dst_port;
             c.peer_mac = src_mac;
             c.peer_ip = src_ip;
@@ -577,8 +748,11 @@ fn handle_user_segment(
             c.rcv_nxt = seq.wrapping_add(1);
             c.snd_nxt = iss;
             c.state = SockState::SynReceived;
-            send_user_segment(child, our_ip, SYN | ACK, &[]);
-            socks[child].snd_nxt = socks[child].snd_nxt.wrapping_add(1);
+            // Embryonic-connection guard: if the handshake ACK never
+            // arrives, the reaper reclaims the slot.
+            mark_expiry(c);
+            send_user_segment(c, our_ip, SYN | ACK, &[]);
+            c.snd_nxt = c.snd_nxt.wrapping_add(1);
             return;
         }
     }
@@ -599,22 +773,27 @@ fn send_console_segment(c: &mut ConsoleConn, our_ip: [u8; 4], flags: u8, payload
     build_and_send(
         c.peer_mac, our_mac, our_ip, c.peer_ip,
         LISTEN_PORT, c.peer_port,
-        c.snd_nxt, c.rcv_nxt, flags, payload,
+        c.snd_nxt, c.rcv_nxt, RCV_WINDOW, flags, payload,
     );
     c.snd_nxt = c.snd_nxt.wrapping_add(payload.len() as u32);
 }
 
-fn send_user_segment(idx: usize, our_ip: [u8; 4], flags: u8, payload: &[u8]) {
+/// Advertise the real free space of the socket's RX ring (capped at
+/// [`RCV_WINDOW`]) so the peer can never legally send more than we
+/// can buffer.
+fn sock_window(s: &UserSocket) -> u16 {
+    s.rx_free().min(RCV_WINDOW as usize) as u16
+}
+
+fn send_user_segment(s: &mut UserSocket, our_ip: [u8; 4], flags: u8, payload: &[u8]) {
     let our_mac = match net::get_mac() {
         Some(m) => m,
         None => return,
     };
-    let socks = sockets_mut();
-    let s = &mut socks[idx];
     build_and_send(
         s.peer_mac, our_mac, our_ip, s.peer_ip,
         s.local_port, s.peer_port,
-        s.snd_nxt, s.rcv_nxt, flags, payload,
+        s.snd_nxt, s.rcv_nxt, sock_window(s), flags, payload,
     );
     s.snd_nxt = s.snd_nxt.wrapping_add(payload.len() as u32);
 }
@@ -648,13 +827,14 @@ fn send_rst_for(
     build_and_send(
         dst_mac, our_mac, our_ip, peer_ip,
         our_port, peer_port,
-        seq, ack, flags, &[],
+        seq, ack, 0, flags, &[],
     );
 }
 
 /// Build one ETH+IPv4+TCP frame and hand it to the NIC. All fields
 /// computed here; the caller decides what window/sequence numbers
 /// were used (so per-socket bookkeeping stays at the call site).
+#[allow(clippy::too_many_arguments)]
 fn build_and_send(
     dst_mac: [u8; 6],
     src_mac: [u8; 6],
@@ -664,6 +844,7 @@ fn build_and_send(
     peer_port: u16,
     seq: u32,
     ack: u32,
+    window: u16,
     flags: u8,
     payload: &[u8],
 ) {
@@ -698,7 +879,7 @@ fn build_and_send(
     pkt[t + 8..t + 12].copy_from_slice(&ack.to_be_bytes());
     pkt[t + 12] = 0x50;
     pkt[t + 13] = flags;
-    pkt[t + 14..t + 16].copy_from_slice(&RCV_WINDOW.to_be_bytes());
+    pkt[t + 14..t + 16].copy_from_slice(&window.to_be_bytes());
     pkt[t + 16..t + 18].copy_from_slice(&[0x00, 0x00]);
     pkt[t + 18..t + 20].copy_from_slice(&[0x00, 0x00]);
     pkt[t + 20..t + 20 + payload.len()].copy_from_slice(payload);
@@ -787,72 +968,86 @@ pub fn tick_flush_console() {
 }
 
 // ============================================================================
-// Userspace flush + ARP-deferred SYN
+// Userspace flush, reaper + ARP-deferred SYN
 // ============================================================================
 
 /// Drain pending TX bytes from a userspace socket into one segment.
 /// Sends a bare ACK if no payload is queued — used after an inbound
 /// segment to acknowledge while folding in any queued reply.
-fn flush_user_pending(idx: usize, our_ip: [u8; 4]) {
+fn flush_user_pending(s: &mut UserSocket, our_ip: [u8; 4]) {
     let mut buf = [0u8; MAX_SEG_PAYLOAD];
-    let n;
-    {
-        let s = &mut sockets_mut()[idx];
-        n = s.tx_drain(&mut buf);
-    }
+    let n = s.tx_drain(&mut buf);
     if n > 0 {
-        send_user_segment(idx, our_ip, PSH | ACK, &buf[..n]);
+        send_user_segment(s, our_ip, PSH | ACK, &buf[..n]);
     } else {
-        send_user_segment(idx, our_ip, ACK, &[]);
+        send_user_segment(s, our_ip, ACK, &[]);
     }
 }
 
-/// Called every timer tick to drain queued TX on Established userspace
-/// sockets when no inbound segment has arrived to piggy-back the ACK.
-pub fn tick_flush_user() {
-    let our_ip = net_stack::get_ip();
-    if our_ip == [0, 0, 0, 0] {
-        return;
+/// Timer-tick driver for userspace sockets (100 Hz):
+///
+/// 1. **Reap** slots whose wind-down (or embryonic handshake) ran out
+///    of time — without retransmit, a lost final ACK must not pin a
+///    slot forever.
+/// 2. **Flush** queued TX on Established/CloseWait sockets when no
+///    inbound segment arrived to piggy-back the ACK.
+/// 3. **Retry ARP** for SynSent sockets still waiting on the next
+///    hop's MAC (rate-limited to every [`ARP_RETRY_TICKS`]).
+pub fn tick_flush_user(now: u64) {
+    unsafe {
+        NOW_TICK = now;
     }
+    let our_ip = net_stack::get_ip();
     for idx in 0..MAX_USERSPACE_SOCKETS {
-        let needs_flush;
-        let needs_arp_retry;
+        let s = &mut sockets_mut()[idx];
+
+        if s.expiry_tick != 0
+            && now >= s.expiry_tick
+            && matches!(
+                s.state,
+                SockState::FinWait1 | SockState::FinWait2 | SockState::Closing
+                    | SockState::LastAck | SockState::TimeWait
+                    | SockState::SynReceived | SockState::Closed
+            )
         {
-            let s = &sockets()[idx];
-            needs_flush = matches!(s.state, SockState::Established) && s.tx_has_data();
-            needs_arp_retry = matches!(s.state, SockState::SynSent) && s.awaiting_arp;
+            *s = UserSocket::empty();
+            continue;
         }
-        if needs_flush {
-            let mut buf = [0u8; MAX_SEG_PAYLOAD];
-            let n = sockets_mut()[idx].tx_drain(&mut buf);
-            if n > 0 {
-                send_user_segment(idx, our_ip, PSH | ACK, &buf[..n]);
+
+        if our_ip == [0, 0, 0, 0] {
+            continue;
+        }
+
+        match s.state {
+            SockState::Established | SockState::CloseWait if s.tx_has_data() => {
+                let mut buf = [0u8; MAX_SEG_PAYLOAD];
+                let n = s.tx_drain(&mut buf);
+                if n > 0 {
+                    send_user_segment(s, our_ip, PSH | ACK, &buf[..n]);
+                }
             }
-        }
-        if needs_arp_retry {
-            try_resume_connect(idx, our_ip);
+            SockState::SynSent if s.awaiting_arp && now % ARP_RETRY_TICKS == 0 => {
+                try_resume_connect(s, our_ip);
+            }
+            _ => {}
         }
     }
 }
 
 /// If a socket is stuck in SynSent waiting for ARP, check whether the
 /// MAC is now cached and (if so) actually send the SYN.
-fn try_resume_connect(idx: usize, our_ip: [u8; 4]) {
-    let next_hop = {
-        let s = &sockets()[idx];
-        next_hop_for(s.peer_ip)
-    };
+fn try_resume_connect(s: &mut UserSocket, our_ip: [u8; 4]) {
+    let next_hop = next_hop_for(s.peer_ip);
     if let Some(mac) = net_stack::arp_lookup(next_hop) {
-        let socks = sockets_mut();
-        socks[idx].peer_mac = mac;
-        socks[idx].awaiting_arp = false;
-        let iss = next_iss();
-        socks[idx].snd_nxt = iss;
-        send_user_segment(idx, our_ip, SYN, &[]);
-        socks[idx].snd_nxt = socks[idx].snd_nxt.wrapping_add(1);
+        s.peer_mac = mac;
+        s.awaiting_arp = false;
+        s.snd_nxt = next_iss();
+        send_user_segment(s, our_ip, SYN, &[]);
+        s.snd_nxt = s.snd_nxt.wrapping_add(1);
     } else {
-        // Re-issue the ARP request periodically. The net_stack does
-        // its own dedup so spamming is cheap.
+        // No cache entry yet — (re-)issue the ARP request. The caller
+        // rate-limits us to every ARP_RETRY_TICKS, so an unreachable
+        // next hop costs 4 broadcasts/s, not 100.
         net_stack::arp_request(next_hop);
     }
 }
@@ -872,6 +1067,10 @@ fn next_hop_for(peer_ip: [u8; 4]) -> [u8; 4] {
 // ============================================================================
 // Public API called from syscall handlers
 // ============================================================================
+//
+// Every function takes the calling process's PID and refuses to act on
+// a socket it doesn't own. The kernel console path has no PID — it
+// never touches this table.
 
 /// Allocate a fresh userspace socket. Returns its index in the table.
 pub fn user_create(owner_pid: u32) -> Option<usize> {
@@ -879,19 +1078,22 @@ pub fn user_create(owner_pid: u32) -> Option<usize> {
 }
 
 /// Put a Closed socket into Listen on `port`. Returns `Err` if the
-/// socket isn't allocated, isn't Closed, or the port is reserved
-/// (port 2323 is the kernel console) or already in use.
-pub fn user_listen(idx: usize, port: u16) -> Result<(), &'static str> {
+/// socket isn't the caller's, isn't Closed, or the port is reserved
+/// (2323 = kernel console) or already claimed by any live socket.
+pub fn user_listen(idx: usize, port: u16, caller_pid: u32) -> Result<(), &'static str> {
     if idx >= MAX_USERSPACE_SOCKETS {
         return Err("bad sock");
     }
     if port == 0 || port == LISTEN_PORT {
         return Err("reserved port");
     }
-    if find_listener(port).is_some() {
+    if port_in_use(port) {
         return Err("port in use");
     }
     let s = &mut sockets_mut()[idx];
+    if s.owner_pid != caller_pid {
+        return Err("not owner");
+    }
     if !matches!(s.state, SockState::Closed) {
         return Err("not Closed");
     }
@@ -903,35 +1105,53 @@ pub fn user_listen(idx: usize, port: u16) -> Result<(), &'static str> {
 
 /// Try to accept a pending connection on a listener. Returns
 /// `Some(child_idx)` once a child has reached `Established`,
-/// `None` (= NO_PENDING) otherwise.
-pub fn user_accept(idx: usize) -> Option<usize> {
+/// `None` otherwise (mapped to `NO_PENDING` by the syscall layer).
+pub fn user_accept(idx: usize, caller_pid: u32) -> Option<usize> {
     if idx >= MAX_USERSPACE_SOCKETS {
         return None;
     }
-    let socks = sockets_mut();
-    let listener = &socks[idx];
-    if !matches!(listener.state, SockState::Listen) {
+    {
+        let l = &sockets()[idx];
+        if !matches!(l.state, SockState::Listen) || l.owner_pid != caller_pid {
+            return None;
+        }
+    }
+    // A child that died mid-handshake must not wedge the listener.
+    reclaim_stale_child(idx);
+
+    let pc = sockets()[idx].pending_child;
+    if pc == NO_PENDING {
         return None;
     }
-    let child = listener.pending_child;
-    if child == NO_PENDING {
-        return None;
+    let ci = pc as usize;
+    if ci >= MAX_USERSPACE_SOCKETS
+        || !matches!(sockets()[ci].state, SockState::Established)
+    {
+        return None; // still handshaking (or bookkeeping just reset)
     }
-    if !matches!(socks[child as usize].state, SockState::Established) {
-        return None;
-    }
-    socks[idx].pending_child = NO_PENDING;
-    Some(child as usize)
+    sockets_mut()[idx].pending_child = NO_PENDING;
+    Some(ci)
 }
 
 /// Initiate an active open. Returns `Ok(())` on success (SYN sent or
 /// ARP request issued). Caller then polls the socket state.
-pub fn user_connect(idx: usize, peer_ip: [u8; 4], peer_port: u16) -> Result<(), &'static str> {
+pub fn user_connect(
+    idx: usize,
+    peer_ip: [u8; 4],
+    peer_port: u16,
+    caller_pid: u32,
+) -> Result<(), &'static str> {
     if idx >= MAX_USERSPACE_SOCKETS {
         return Err("bad sock");
     }
+    if peer_port == 0 {
+        return Err("bad port");
+    }
     {
         let s = &sockets()[idx];
+        if s.owner_pid != caller_pid {
+            return Err("not owner");
+        }
         if !matches!(s.state, SockState::Closed) {
             return Err("not Closed");
         }
@@ -947,118 +1167,183 @@ pub fn user_connect(idx: usize, peer_ip: [u8; 4], peer_port: u16) -> Result<(), 
     }
     let our_ip = net_stack::get_ip();
     if our_ip == [0, 0, 0, 0] {
-        // No IP yet — let the timer tick retry once DHCP binds.
+        // No IP yet — the timer tick retries once DHCP binds.
         return Ok(());
     }
-    try_resume_connect(idx, our_ip);
+    try_resume_connect(&mut sockets_mut()[idx], our_ip);
     Ok(())
 }
 
 /// Queue bytes for transmission. Returns the number actually buffered
 /// (may be less than `bytes.len()` if the TX ring is full).
-pub fn user_send(idx: usize, bytes: &[u8]) -> Option<usize> {
+pub fn user_send(idx: usize, bytes: &[u8], caller_pid: u32) -> Option<usize> {
     if idx >= MAX_USERSPACE_SOCKETS {
         return None;
     }
     let our_ip = net_stack::get_ip();
-    let needs_flush;
-    let n;
-    {
-        let s = &mut sockets_mut()[idx];
-        if !matches!(s.state, SockState::Established | SockState::CloseWait) {
-            return None;
-        }
-        n = s.tx_push(bytes);
-        needs_flush = matches!(s.state, SockState::Established) && s.tx_has_data();
+    let s = &mut sockets_mut()[idx];
+    if s.owner_pid != caller_pid {
+        return None;
     }
-    if needs_flush && our_ip != [0, 0, 0, 0] {
+    // CloseWait: the peer half-closed but is still reading — sending
+    // stays legal until our own close().
+    if !matches!(s.state, SockState::Established | SockState::CloseWait) {
+        return None;
+    }
+    let n = s.tx_push(bytes);
+    if our_ip != [0, 0, 0, 0] && s.tx_has_data() {
         // Drain immediately so the segment goes out without waiting
         // for the next timer tick.
         let mut buf = [0u8; MAX_SEG_PAYLOAD];
-        let drained = sockets_mut()[idx].tx_drain(&mut buf);
+        let drained = s.tx_drain(&mut buf);
         if drained > 0 {
-            send_user_segment(idx, our_ip, PSH | ACK, &buf[..drained]);
+            send_user_segment(s, our_ip, PSH | ACK, &buf[..drained]);
         }
     }
     Some(n)
 }
 
 /// Drain received bytes into `out`. Returns the number copied.
-pub fn user_recv(idx: usize, out: &mut [u8]) -> Option<usize> {
+pub fn user_recv(idx: usize, out: &mut [u8], caller_pid: u32) -> Option<usize> {
     if idx >= MAX_USERSPACE_SOCKETS {
         return None;
     }
+    let our_ip = net_stack::get_ip();
     let s = &mut sockets_mut()[idx];
-    if matches!(s.state, SockState::Free) {
+    if matches!(s.state, SockState::Free) || s.owner_pid != caller_pid {
         return None;
     }
-    Some(s.rx_drain(out))
+    // If the ring was (nearly) full we have been advertising a closed
+    // window; once the app drains it, tell the peer it reopened or it
+    // will sit on slow zero-window probes.
+    let was_starved = s.rx_free() < 64;
+    let n = s.rx_drain(out);
+    if n > 0
+        && was_starved
+        && matches!(s.state, SockState::Established)
+        && our_ip != [0, 0, 0, 0]
+    {
+        send_user_segment(s, our_ip, ACK, &[]);
+    }
+    Some(n)
 }
 
-/// Initiate close. Sends FIN, transitions to FinWait1 (or LastAck if
-/// we were in CloseWait). A listener simply goes back to Closed.
-pub fn user_close(idx: usize) -> Result<(), &'static str> {
+/// Initiate close on the caller's socket. See [`close_internal`] for
+/// the per-state behaviour.
+pub fn user_close(idx: usize, caller_pid: u32) -> Result<(), &'static str> {
     if idx >= MAX_USERSPACE_SOCKETS {
         return Err("bad sock");
     }
-    let our_ip = net_stack::get_ip();
-    let socks = sockets_mut();
-    let s = &mut socks[idx];
-    match s.state {
-        SockState::Free => return Err("not allocated"),
-        SockState::Listen | SockState::Closed => {
-            s.state = SockState::Free;
-            return Ok(());
+    {
+        let s = &sockets()[idx];
+        if matches!(s.state, SockState::Free) {
+            return Err("not allocated");
         }
-        SockState::Established => {
-            // Flush any pending bytes then send FIN.
-            // Drop borrow so flush_user_pending can re-take it.
+        if s.owner_pid != caller_pid {
+            return Err("not owner");
         }
-        SockState::CloseWait => {}
-        SockState::SynSent | SockState::SynReceived => {
-            // Half-open: just mark free, no segment.
-            s.state = SockState::Free;
-            return Ok(());
-        }
-        _ => return Ok(()),
     }
-    let old_state = s.state;
-    if our_ip != [0, 0, 0, 0] {
-        // Drain queued TX into a final data segment.
-        let mut buf = [0u8; MAX_SEG_PAYLOAD];
-        let n = sockets_mut()[idx].tx_drain(&mut buf);
-        if n > 0 {
-            send_user_segment(idx, our_ip, PSH | ACK, &buf[..n]);
-        }
-        send_user_segment(idx, our_ip, FIN | ACK, &[]);
-        sockets_mut()[idx].snd_nxt = sockets_mut()[idx].snd_nxt.wrapping_add(1);
-    }
-    let s = &mut sockets_mut()[idx];
-    s.state = match old_state {
-        SockState::Established => SockState::FinWait1,
-        SockState::CloseWait => SockState::LastAck,
-        _ => SockState::Closed,
-    };
+    close_internal(idx);
     Ok(())
 }
 
-/// Read-only state query for syscall handlers.
-pub fn user_state(idx: usize) -> Option<SockState> {
+/// Owner-agnostic close, shared by [`user_close`], [`cleanup_for_pid`]
+/// and listener teardown. Established/CloseWait get a graceful FIN
+/// (with queued TX flushed first); half-open and inert sockets are
+/// dropped on the spot; sockets already winding down are left to the
+/// reaper.
+fn close_internal(idx: usize) {
+    let our_ip = net_stack::get_ip();
+    let state = sockets()[idx].state;
+    match state {
+        SockState::Free => {}
+        SockState::Listen => {
+            // A child that was never accepted can't ever be accepted
+            // once the listener is gone — tear it down too.
+            let pc = sockets()[idx].pending_child;
+            if pc != NO_PENDING && (pc as usize) < MAX_USERSPACE_SOCKETS {
+                let ci = pc as usize;
+                match sockets()[ci].state {
+                    SockState::Established | SockState::CloseWait => close_internal(ci),
+                    SockState::SynReceived | SockState::Closed => {
+                        sockets_mut()[ci] = UserSocket::empty();
+                    }
+                    // Free, or already winding down (reaper handles it).
+                    _ => {}
+                }
+            }
+            sockets_mut()[idx] = UserSocket::empty();
+        }
+        SockState::Closed | SockState::SynSent | SockState::SynReceived => {
+            // Nothing (or only half a handshake) committed on the wire:
+            // drop the slot. A peer that completed its side will get a
+            // RST from the no-match path when it next sends.
+            sockets_mut()[idx] = UserSocket::empty();
+        }
+        SockState::Established | SockState::CloseWait => {
+            if our_ip == [0, 0, 0, 0] {
+                sockets_mut()[idx] = UserSocket::empty();
+                return;
+            }
+            let s = &mut sockets_mut()[idx];
+            // Flush queued TX as a final data segment, then FIN.
+            let mut buf = [0u8; MAX_SEG_PAYLOAD];
+            let n = s.tx_drain(&mut buf);
+            if n > 0 {
+                send_user_segment(s, our_ip, PSH | ACK, &buf[..n]);
+            }
+            send_user_segment(s, our_ip, FIN | ACK, &[]);
+            s.snd_nxt = s.snd_nxt.wrapping_add(1);
+            s.state = if state == SockState::Established {
+                SockState::FinWait1
+            } else {
+                SockState::LastAck
+            };
+            mark_expiry(s);
+        }
+        // FinWait1/2, Closing, LastAck, TimeWait: a close is already in
+        // flight; the reaper frees the slot when its deadline passes.
+        _ => {}
+    }
+}
+
+/// Reclaim every socket owned by a terminating process. Called from
+/// the TerminateProcess/TerminatePid syscall handlers so a crashing
+/// (or just sloppy) app can't exhaust the socket table.
+pub fn cleanup_for_pid(pid: u32) {
+    for idx in 0..MAX_USERSPACE_SOCKETS {
+        let owned = {
+            let s = &sockets()[idx];
+            !matches!(s.state, SockState::Free) && s.owner_pid == pid
+        };
+        if owned {
+            close_internal(idx);
+        }
+    }
+}
+
+/// Read-only state query. Returns `None` for an out-of-range index or
+/// a socket owned by someone else (the caller can't distinguish that
+/// from a recycled slot — by design).
+pub fn user_state(idx: usize, caller_pid: u32) -> Option<SockState> {
     if idx >= MAX_USERSPACE_SOCKETS {
         return None;
     }
-    Some(sockets()[idx].state)
+    let s = &sockets()[idx];
+    if !matches!(s.state, SockState::Free) && s.owner_pid != caller_pid {
+        return None;
+    }
+    Some(s.state)
 }
 
 /// Read-only RX queue length query (for select-style polling).
-pub fn user_rx_len(idx: usize) -> usize {
+pub fn user_rx_len(idx: usize, caller_pid: u32) -> usize {
     if idx >= MAX_USERSPACE_SOCKETS {
         return 0;
     }
     let s = &sockets()[idx];
-    if s.rx_head >= s.rx_tail {
-        s.rx_head - s.rx_tail
-    } else {
-        SOCK_RX_BUF - s.rx_tail + s.rx_head
+    if s.owner_pid != caller_pid {
+        return 0;
     }
+    s.rx_len()
 }

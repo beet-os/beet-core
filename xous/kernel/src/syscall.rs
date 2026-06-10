@@ -671,15 +671,30 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             return_result(tid, sender, Result::Scalar5(arg1, arg2, arg3, arg4, arg5))
         }
         SysCall::TrySendMessage(cid, message) => send_message(tid, cid, message),
-        SysCall::TerminateProcess(ret) => SystemServices::with_mut(|ss| ss.terminate_current_process(ret)),
-        SysCall::TerminatePid(pid, exit_code) => SystemServices::with_mut(|ss| {
-            // The process is self-terminating, which is equivalent to TerminateProcess
-            if pid == ss.current_process().pid {
-                Err(Error::InvalidArguments)
-            } else {
-                ss.terminate_process(tid, pid, exit_code)
+        SysCall::TerminateProcess(ret) => {
+            // Reclaim any TCP sockets the exiting process still owns so
+            // a crash-looping app can't exhaust the socket table.
+            #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+            crate::platform::qemu_virt::tcp::cleanup_for_pid(current_pid().get() as u32);
+            SystemServices::with_mut(|ss| ss.terminate_current_process(ret))
+        }
+        SysCall::TerminatePid(pid, exit_code) => {
+            let result = SystemServices::with_mut(|ss| {
+                // The process is self-terminating, which is equivalent to TerminateProcess
+                if pid == ss.current_process().pid {
+                    Err(Error::InvalidArguments)
+                } else {
+                    ss.terminate_process(tid, pid, exit_code)
+                }
+            });
+            // Same TCP-socket reclamation as TerminateProcess, but only
+            // once the kill actually went through.
+            #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+            if result.is_ok() {
+                crate::platform::qemu_virt::tcp::cleanup_for_pid(pid.get() as u32);
             }
-        }),
+            result
+        }
         SysCall::Shutdown(_) => SystemServices::with_mut(|ss| ss.shutdown().map(|_| Result::Ok)),
         SysCall::GetProcessId => Ok(Result::ProcessID(current_pid())),
 
@@ -692,7 +707,12 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             let mac = net::get_mac().unwrap_or([0u8; 6]);
             let mac_hi = u32::from_be_bytes([mac[0], mac[1], mac[2], mac[3]]);
             let mac_lo = u32::from_be_bytes([mac[4], mac[5], 0, 0]);
-            Ok(Result::Scalar5(ip_u32 as usize, mac_hi as usize, mac_lo as usize, 0, 0))
+            // Slot 4 carries the 100 Hz uptime tick so userspace can
+            // build real (wall-clock) deadlines around non-blocking
+            // socket polls — yield-spin counts are CPU-speed dependent
+            // and useless as a time base.
+            let ticks = crate::platform::qemu_virt::timer::tick_count() as usize;
+            Ok(Result::Scalar5(ip_u32 as usize, mac_hi as usize, mac_lo as usize, ticks, 0))
         }
 
         #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
@@ -739,23 +759,26 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         #[cfg(all(beetos, feature = "platform-qemu-virt"))]
         SysCall::NetSocketListen(sock, port) => {
             use crate::platform::qemu_virt::tcp;
-            tcp::user_listen(sock, port as u16).map(|_| Result::Ok).map_err(|_| Error::InvalidArguments)
+            let pid = current_pid().get() as u32;
+            tcp::user_listen(sock, port as u16, pid).map(|_| Result::Ok).map_err(|_| Error::InvalidArguments)
         }
 
         #[cfg(all(beetos, feature = "platform-qemu-virt"))]
         SysCall::NetSocketAccept(sock) => {
             use crate::platform::qemu_virt::tcp;
+            let pid = current_pid().get() as u32;
             // NO_PENDING (= u32::MAX) signals "no connection ready" —
             // userspace polls until it sees a real child id.
-            let child = tcp::user_accept(sock).map(|i| i as usize).unwrap_or(tcp::NO_PENDING as usize);
+            let child = tcp::user_accept(sock, pid).unwrap_or(tcp::NO_PENDING as usize);
             Ok(Result::Scalar1(child))
         }
 
         #[cfg(all(beetos, feature = "platform-qemu-virt"))]
         SysCall::NetSocketConnect(sock, peer_ip_be, peer_port) => {
             use crate::platform::qemu_virt::tcp;
+            let pid = current_pid().get() as u32;
             let ip_bytes = (peer_ip_be as u32).to_be_bytes();
-            tcp::user_connect(sock, ip_bytes, peer_port as u16)
+            tcp::user_connect(sock, ip_bytes, peer_port as u16, pid)
                 .map(|_| Result::Ok)
                 .map_err(|_| Error::InvalidArguments)
         }
@@ -763,14 +786,16 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         #[cfg(all(beetos, feature = "platform-qemu-virt"))]
         SysCall::NetSocketStatus(sock) => {
             use crate::platform::qemu_virt::tcp;
-            let code = tcp::user_state(sock).map(|s| s.code()).unwrap_or(255);
-            let rx = tcp::user_rx_len(sock);
+            let pid = current_pid().get() as u32;
+            let code = tcp::user_state(sock, pid).map(|s| s.code()).unwrap_or(255);
+            let rx = tcp::user_rx_len(sock, pid);
             Ok(Result::Scalar2(code, rx))
         }
 
         #[cfg(all(beetos, feature = "platform-qemu-virt"))]
         SysCall::NetSocketSend(sock, len, w0, w1, w2, w3) => {
             use crate::platform::qemu_virt::tcp;
+            let pid = current_pid().get() as u32;
             // Same PAN-safe inline unpacking as NetConsolePush.
             let len = len.min(32);
             let mut stage = [0u8; 32];
@@ -780,16 +805,17 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
                     stage[i * 8 + j] = ((word >> (j * 8)) & 0xff) as u8;
                 }
             }
-            let n = tcp::user_send(sock, &stage[..len]).unwrap_or(0);
+            let n = tcp::user_send(sock, &stage[..len], pid).unwrap_or(0);
             Ok(Result::Scalar1(n))
         }
 
         #[cfg(all(beetos, feature = "platform-qemu-virt"))]
         SysCall::NetSocketRecv(sock, max_len) => {
             use crate::platform::qemu_virt::tcp;
+            let pid = current_pid().get() as u32;
             let max_len = max_len.min(32);
             let mut stage = [0u8; 32];
-            let n = tcp::user_recv(sock, &mut stage[..max_len]).unwrap_or(0);
+            let n = tcp::user_recv(sock, &mut stage[..max_len], pid).unwrap_or(0);
             // Pack bytes back into four u64s little-endian.
             let mut words = [0u64; 4];
             for i in 0..4 {
@@ -805,7 +831,8 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         #[cfg(all(beetos, feature = "platform-qemu-virt"))]
         SysCall::NetSocketClose(sock) => {
             use crate::platform::qemu_virt::tcp;
-            tcp::user_close(sock).map(|_| Result::Ok).map_err(|_| Error::InvalidArguments)
+            let pid = current_pid().get() as u32;
+            tcp::user_close(sock, pid).map(|_| Result::Ok).map_err(|_| Error::InvalidArguments)
         }
 
         #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]

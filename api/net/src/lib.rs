@@ -324,20 +324,27 @@ impl TcpStream {
 
     /// Send all of `bytes`, looping over chunks. Returns the total
     /// sent (may be less than `bytes.len()` if the socket closes
-    /// mid-write).
+    /// mid-write or the peer stops draining for ~10 s).
     pub fn send_all(&mut self, bytes: &[u8]) -> usize {
         let mut sent = 0;
+        let mut stalls = 0u32;
         while sent < bytes.len() {
             let chunk = &bytes[sent..(sent + CHUNK).min(bytes.len())];
             let n = self.send(chunk);
             if n == 0 {
                 // TX ring full or socket closed; yield and let it
-                // drain on the next timer tick.
+                // drain on the next timer tick. Bounded so a wedged
+                // peer can't spin this thread forever.
+                stalls += 1;
+                if stalls > 10_000 {
+                    break;
+                }
                 xous::yield_slice();
                 if !matches!(self.state(), SockState::Established | SockState::CloseWait) {
                     break;
                 }
             } else {
+                stalls = 0;
                 sent += n;
             }
         }

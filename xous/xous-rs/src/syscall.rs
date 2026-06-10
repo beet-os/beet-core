@@ -463,10 +463,12 @@ pub enum SysCall {
     ///
     /// # Returns
     ///
-    /// * **Scalar5(ip_u32, mac_hi, mac_lo, 0, 0)** where:
+    /// * **Scalar5(ip_u32, mac_hi, mac_lo, ticks, 0)** where:
     ///   - `ip_u32`: IPv4 address as a big-endian u32 (0 if DHCP not yet complete)
     ///   - `mac_hi`: MAC bytes [0..3] packed as big-endian u32
     ///   - `mac_lo`: MAC bytes [4..5] packed as u16 in the low 16 bits
+    ///   - `ticks`: kernel uptime in 100 Hz timer ticks — userspace
+    ///     uses this as a coarse clock for socket-poll deadlines
     #[cfg(beetos)]
     NetGetInfo,
 

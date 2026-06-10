@@ -802,6 +802,17 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     Some(out)
 }
 
+/// Kernel uptime in 100 Hz ticks (rides in NetGetInfo's 4th scalar).
+/// The only wall-clock the shell has — yield-spin counts run at
+/// CPU speed (hundreds of thousands per second on an idle system)
+/// and are useless as a time base.
+fn now_ticks() -> u64 {
+    match xous::rsyscall(xous::SysCall::NetGetInfo) {
+        Ok(xous::Result::Scalar5(_, _, _, ticks, _)) => ticks as u64,
+        _ => 0,
+    }
+}
+
 fn cmd_nettest_listen(args: &[&str]) {
     use beetos_api_net::{SockState, TcpListener};
 
@@ -823,40 +834,41 @@ fn cmd_nettest_listen(args: &[&str]) {
 
     let _ = write!(DualWriter, "nettest: listening on port {}\n", port);
 
-    // Spin in try_accept until a client shows up. The kernel handles
-    // the SYN/ACK automatically; we just poll for the resulting
-    // Established child socket.
-    let mut spins = 0u64;
+    // Poll try_accept until a client shows up (the kernel answers the
+    // SYN on its own) or a real 30 s deadline passes.
+    let deadline = now_ticks() + 3_000; // 30 s at 100 Hz
     let mut stream = loop {
         if let Some(s) = listener.try_accept() {
             break s;
         }
-        xous::yield_slice();
-        spins += 1;
-        // 30 s wall-clock-ish timeout (yield_slice is ~1 ms in our
-        // scheduler).
-        if spins > 30_000 {
+        if now_ticks() > deadline {
             puts("nettest-listen: timeout waiting for client\n");
             return;
         }
+        xous::yield_slice();
     };
 
     puts("nettest: client connected, echoing...\n");
 
     let mut buf = [0u8; 32];
-    let mut quiet = 0u64;
+    let mut idle_deadline = now_ticks() + 1_000; // 10 s of client silence
     loop {
         let n = stream.recv(&mut buf);
         if n > 0 {
             stream.send_all(&buf[..n]);
-            quiet = 0;
+            idle_deadline = now_ticks() + 1_000;
         } else {
-            xous::yield_slice();
-            quiet += 1;
-            if quiet > 5_000 {
-                // Client went silent for ~5s. Wrap up.
+            // Nothing buffered. If the peer already sent FIN
+            // (CloseWait) — or the connection died — we're done as
+            // soon as the ring is drained; only a live connection
+            // waits out the idle timeout.
+            if !matches!(stream.state(), SockState::Established) {
                 break;
             }
+            if now_ticks() > idle_deadline {
+                break;
+            }
+            xous::yield_slice();
         }
         match stream.state() {
             SockState::Established | SockState::CloseWait => {}
@@ -896,8 +908,9 @@ fn cmd_nettest_connect(args: &[&str]) {
         }
     };
 
-    // Wait for handshake to complete (ARP request + SYN/SYN-ACK/ACK).
-    let mut spins = 0u64;
+    // Wait for the handshake (ARP request + SYN/SYN-ACK/ACK) with a
+    // real 10 s deadline.
+    let deadline = now_ticks() + 1_000;
     loop {
         match stream.state() {
             SockState::Established => break,
@@ -907,12 +920,11 @@ fn cmd_nettest_connect(args: &[&str]) {
                 return;
             }
         }
-        xous::yield_slice();
-        spins += 1;
-        if spins > 10_000 {
+        if now_ticks() > deadline {
             puts("nettest-connect: timeout waiting for Established\n");
             return;
         }
+        xous::yield_slice();
     }
     puts("nettest: connected\n");
 
@@ -920,7 +932,7 @@ fn cmd_nettest_connect(args: &[&str]) {
     let _ = write!(DualWriter, "nettest: sent {} bytes\n", sent);
 
     let mut buf = [0u8; 32];
-    let mut quiet = 0u64;
+    let mut idle_deadline = now_ticks() + 1_000; // 10 s without a reply
     let mut got_any = false;
     loop {
         let n = stream.recv(&mut buf);
@@ -937,13 +949,12 @@ fn cmd_nettest_connect(args: &[&str]) {
                 putc(b'\n');
             }
             got_any = true;
-            quiet = 0;
+            idle_deadline = now_ticks() + 1_000;
         } else {
-            xous::yield_slice();
-            quiet += 1;
-            if quiet > 3_000 {
+            if now_ticks() > idle_deadline {
                 break;
             }
+            xous::yield_slice();
         }
         if got_any && !matches!(stream.state(), SockState::Established) {
             break;
