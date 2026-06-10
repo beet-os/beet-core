@@ -417,7 +417,9 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         | SysCall::NetSocketStatus(..)
         | SysCall::NetSocketSend(..)
         | SysCall::NetSocketRecv(..)
-        | SysCall::NetSocketClose(..) => Ok(()),
+        | SysCall::NetSocketClose(..)
+        | SysCall::NetPingSend(..)
+        | SysCall::NetPingPoll => Ok(()),
 
         // Notification syscalls
         #[cfg(beetos)]
@@ -835,11 +837,31 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             tcp::user_close(sock, pid).map(|_| Result::Ok).map_err(|_| Error::InvalidArguments)
         }
 
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetPingSend(dst_ip_be, seq) => {
+            use crate::platform::qemu_virt::net_stack;
+            let dst = (dst_ip_be as u32).to_be_bytes();
+            let sent = net_stack::ping_send(dst, seq as u16);
+            Ok(Result::Scalar1(sent as usize))
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetPingPoll => {
+            use crate::platform::qemu_virt::net_stack;
+            match net_stack::ping_poll() {
+                Some((ip, seq)) => {
+                    Ok(Result::Scalar2(u32::from_be_bytes(ip) as usize, seq as usize))
+                }
+                None => Ok(Result::Scalar2(0, 0)),
+            }
+        }
+
         #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
         SysCall::NetSocketCreate | SysCall::NetSocketListen(_, _) | SysCall::NetSocketAccept(_)
         | SysCall::NetSocketConnect(_, _, _) | SysCall::NetSocketStatus(_)
         | SysCall::NetSocketSend(_, _, _, _, _, _) | SysCall::NetSocketRecv(_, _)
-        | SysCall::NetSocketClose(_) => Err(Error::InvalidSyscall),
+        | SysCall::NetSocketClose(_)
+        | SysCall::NetPingSend(_, _) | SysCall::NetPingPoll => Err(Error::InvalidSyscall),
 
         #[cfg(beetos)]
         SysCall::GetBinaryName(index) => {

@@ -213,6 +213,79 @@ pub fn get_gateway() -> [u8; 4] {
     unsafe { STATE.gateway }
 }
 
+/// Next-hop IP for a destination: same-subnet peers are addressed
+/// directly, anything else goes through the default gateway. Subnet
+/// mask hardcoded /24 (QEMU slirp's 10.0.2.0/24); a real-NIC port
+/// will need the DHCP-provided mask.
+pub fn next_hop_for(peer_ip: [u8; 4]) -> [u8; 4] {
+    let our = get_ip();
+    if our[..3] == peer_ip[..3] {
+        peer_ip
+    } else {
+        get_gateway()
+    }
+}
+
+/// Send one ICMP echo request to `dst` (id = [`PING_ID`]). Returns
+/// `false` — after issuing an ARP request — when the next hop's MAC
+/// isn't cached yet; the caller retries until `true`.
+pub fn ping_send(dst: [u8; 4], seq: u16) -> bool {
+    let our_ip = get_ip();
+    if our_ip == [0, 0, 0, 0] {
+        return false;
+    }
+    let our_mac = match net::get_mac() {
+        Some(m) => m,
+        None => return false,
+    };
+    let next_hop = next_hop_for(dst);
+    let dst_mac = match arp_lookup(next_hop) {
+        Some(m) => m,
+        None => {
+            arp_request(next_hop);
+            return false;
+        }
+    };
+
+    // 8-byte ICMP header + 32-byte pattern payload (classic ping size).
+    const DATA: usize = 32;
+    let icmp_len = 8 + DATA;
+    let total = 14 + 20 + icmp_len;
+    let mut pkt = [0u8; 14 + 20 + 8 + DATA];
+
+    pkt[0..6].copy_from_slice(&dst_mac);
+    pkt[6..12].copy_from_slice(&our_mac);
+    pkt[12..14].copy_from_slice(&[0x08, 0x00]);
+
+    let ip_total = (20 + icmp_len) as u16;
+    pkt[14] = 0x45;
+    pkt[16..18].copy_from_slice(&ip_total.to_be_bytes());
+    pkt[20..22].copy_from_slice(&[0x40, 0x00]); // don't fragment
+    pkt[22] = 64; // TTL
+    pkt[23] = 1; // ICMP
+    pkt[26..30].copy_from_slice(&our_ip);
+    pkt[30..34].copy_from_slice(&dst);
+    let ip_csum = internet_checksum(&pkt[14..34]);
+    pkt[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+
+    pkt[34] = 8; // echo request
+    pkt[38..40].copy_from_slice(&PING_ID.to_be_bytes());
+    pkt[40..42].copy_from_slice(&seq.to_be_bytes());
+    for i in 0..DATA {
+        pkt[42 + i] = 0x20 + (i as u8); // " !\"#$..." pattern
+    }
+    let icmp_csum = internet_checksum(&pkt[34..34 + icmp_len]);
+    pkt[36..38].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    net::send_packet(&pkt[..total]);
+    true
+}
+
+/// Take the last captured echo reply, if any: (source IP, sequence).
+pub fn ping_poll() -> Option<([u8; 4], u16)> {
+    unsafe { LAST_PONG.take() }
+}
+
 // ============================================================================
 // Packet processing
 // ============================================================================
@@ -320,13 +393,35 @@ fn handle_ipv4(frame: &[u8], ip: &[u8]) {
     }
 }
 
+/// ICMP identifier stamped on every echo request we send; replies
+/// carrying any other id belong to someone else and are ignored.
+const PING_ID: u16 = 0xBEE7;
+
+/// Last echo reply that matched [`PING_ID`]: (source IP, sequence).
+/// Single-slot — the shell's `ping` sends one request at a time and
+/// polls between sends, so depth-1 is enough.
+static mut LAST_PONG: Option<([u8; 4], u16)> = None;
+
 fn handle_icmp(frame: &[u8], src_ip: [u8; 4], dst_ip: [u8; 4], icmp: &[u8]) {
     let our_ip = unsafe { STATE.ip };
     if our_ip == [0, 0, 0, 0] || dst_ip != our_ip {
         return;
     }
-    if icmp.len() < 8 || icmp[0] != 8 {
-        return; // not ICMP echo request
+    if icmp.len() < 8 {
+        return;
+    }
+
+    if icmp[0] == 0 {
+        // Echo reply — capture it if it answers one of our requests.
+        let id = u16::from_be_bytes([icmp[4], icmp[5]]);
+        if id == PING_ID {
+            let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
+            unsafe { LAST_PONG = Some((src_ip, seq)) };
+        }
+        return;
+    }
+    if icmp[0] != 8 {
+        return; // neither echo reply nor echo request
     }
 
     let src_mac: [u8; 6] = match frame[6..12].try_into() {

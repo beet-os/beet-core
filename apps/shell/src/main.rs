@@ -90,40 +90,50 @@ fn release_input_focus() {
 }
 
 // ============================================================================
-// Combined output (UART + FB)
+// Combined output (FB + console service, UART fallback)
 // ============================================================================
+//
+// Phase 2 of the console migration: the shell no longer writes the
+// UART directly on the steady-state path — `os/console` owns the UART
+// (and the TCP remote-console mirror). The shell keeps rendering the
+// framebuffer console itself because it owns the display while it
+// holds it (AcquireDisplay protocol). Until the service has registered
+// (first instants of boot), bytes fall back to the direct UART write
+// so early output is never lost.
 
 fn putc(c: u8) {
-    uart_putc(c);
     fb_putc(c);
-    // Tap: mirror to the console output service (which fans out to TCP).
-    // Fire-and-forget Scalar; never blocks the shell.
-    tap_byte(c);
+    if console_out_cid() != 0 {
+        tap_byte(c);
+    } else {
+        uart_putc(c);
+    }
 }
 
 fn puts(s: &str) {
     for b in s.bytes() {
-        uart_putc(b);
         fb_putc(b);
     }
-    // Tap once per call, in 32-byte chunks: amortises the IPC cost vs.
-    // one IPC per byte and matches how the shell actually batches output
-    // (a prompt, a path, a help line — all small contiguous strings).
-    tap_chunks(s.as_bytes());
+    if console_out_cid() != 0 {
+        // One IPC per 32-byte chunk: amortises the cost vs. one per
+        // byte and matches how the shell batches output (a prompt, a
+        // path, a help line — all small contiguous strings).
+        tap_chunks(s.as_bytes());
+    } else {
+        for b in s.bytes() {
+            uart_putc(b);
+        }
+    }
 }
 
 // ============================================================================
-// Console output service tap
+// Console output service
 // ============================================================================
 //
-// The shell keeps writing UART + FB directly for the local terminal
-// (zero latency, zero IPC), and *in addition* sends a copy of every
-// output byte to `os/console` over IPC. The service mirrors those bytes
-// to the kernel's TCP remote-console ring, so a remote client sees
-// exactly the same stream as the local screen.
-//
-// CID is cached after the first successful Connect; before that and
-// across service restarts the tap is a silent no-op.
+// CID is cached after the first successful Connect; before that the
+// fallback above writes the UART directly (Connect behaves like
+// TryConnect in BeetOS, so probing it on every call until the service
+// appears costs one fast syscall, not a block).
 static mut CONSOLE_OUT_CID: u32 = 0;
 
 fn console_out_cid() -> u32 {
@@ -346,6 +356,7 @@ fn execute_line(line: &[u8]) {
         "blkinfo" => cmd_blkinfo(),
         "mem" => cmd_mem(),
         "ifconfig" => cmd_ifconfig(),
+        "ping" => cmd_ping(cmd_args),
         "nettest-listen" => cmd_nettest_listen(cmd_args),
         "nettest-connect" => cmd_nettest_connect(cmd_args),
         "bench" => cmd_bench(),
@@ -377,6 +388,7 @@ fn cmd_help() {
     puts("  blkinfo           Block device info\n");
     puts("  mem               Filesystem statistics\n");
     puts("  ifconfig          Show network interface configuration\n");
+    puts("  ping <ip> [count] ICMP echo (default 4 packets)\n");
     puts("  nettest-listen <port>     Echo server: listen, accept one, echo, close\n");
     puts("  nettest-connect <ip> <port>   Connect, send 'hi', print reply, close\n");
     puts("  bench             Kernel micro-benchmarks (syscall/IPC/MMU)\n");
@@ -813,6 +825,83 @@ fn now_ticks() -> u64 {
         Ok(xous::Result::Scalar5(_, _, _, ticks, _)) => ticks as u64,
         _ => 0,
     }
+}
+
+fn cmd_ping(args: &[&str]) {
+    use xous::arch::perf;
+
+    let ip = match args.first().and_then(|s| parse_ipv4(s)) {
+        Some(ip) => ip,
+        None => {
+            puts("usage: ping <ip> [count]\n");
+            return;
+        }
+    };
+    let count = args
+        .get(1)
+        .and_then(|s| parse_u16(s))
+        .map(|n| n as u64)
+        .unwrap_or(4)
+        .max(1);
+
+    let freq = perf::frequency().max(1);
+    let mut received = 0u64;
+
+    for seq in 0..count {
+        // Send — the kernel returns 0 while it resolves the next hop's
+        // MAC (ARP), so retry against a real 1 s deadline.
+        let send_deadline = now_ticks() + 100;
+        let sent_at = loop {
+            match xous::rsyscall(xous::SysCall::NetPingSend(
+                u32::from_be_bytes(ip) as usize,
+                seq as usize,
+            )) {
+                Ok(xous::Result::Scalar1(1)) => break Some(perf::counter()),
+                Ok(xous::Result::Scalar1(_)) => {} // ARP pending
+                _ => break None,                   // syscall refused (no platform?)
+            }
+            if now_ticks() > send_deadline {
+                break None;
+            }
+            xous::yield_slice();
+        };
+        let Some(sent_at) = sent_at else {
+            let _ = write!(DualWriter, "ping: seq={} send failed (no route)\n", seq);
+            continue;
+        };
+
+        // Wait up to 1 s for the matching reply.
+        let reply_deadline = now_ticks() + 100;
+        let mut got = false;
+        loop {
+            if let Ok(xous::Result::Scalar2(src, rseq)) =
+                xous::rsyscall(xous::SysCall::NetPingPoll)
+            {
+                if src != 0 && rseq == seq as usize {
+                    let dt = perf::counter().wrapping_sub(sent_at);
+                    let us = (dt as u128 * 1_000_000 / freq as u128) as u64;
+                    let s = (src as u32).to_be_bytes();
+                    let _ = write!(
+                        DualWriter,
+                        "reply from {}.{}.{}.{}: seq={} time={} us\n",
+                        s[0], s[1], s[2], s[3], seq, us,
+                    );
+                    received += 1;
+                    got = true;
+                    break;
+                }
+            }
+            if now_ticks() > reply_deadline {
+                break;
+            }
+            xous::yield_slice();
+        }
+        if !got {
+            let _ = write!(DualWriter, "ping: seq={} timeout\n", seq);
+        }
+    }
+
+    let _ = write!(DualWriter, "ping: {} sent, {} received\n", count, received);
 }
 
 fn cmd_nettest_listen(args: &[&str]) {
@@ -1449,6 +1538,10 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    puts("PANIC in shell!\n");
+    // Direct UART, bypassing the console service: mid-panic the IPC
+    // machinery can't be trusted, and the service might be the victim.
+    for b in b"PANIC in shell!\n" {
+        uart_putc(*b);
+    }
     loop { unsafe { core::arch::asm!("wfe", options(nomem, nostack)) }; }
 }

@@ -1579,6 +1579,21 @@ fn try_console_session(host_port: u16) -> anyhow::Result<()> {
     );
     println!("  [ok] 'ifconfig' -> contains 10.0.2.15");
 
+    // ICMP path: ping the slirp gateway. Exercises echo-request TX
+    // (ARP-resolved next hop), slirp's reply, and the echo-reply
+    // capture + NetPingPoll syscall. 2 packets keeps the smoke fast.
+    stream.write_all(b"ping 10.0.2.2 2\n")?;
+    let reply = drain(&mut stream);
+    anyhow::ensure!(
+        reply.contains("reply from 10.0.2.2"),
+        "ping got no reply from the gateway, got: {reply:?}"
+    );
+    anyhow::ensure!(
+        reply.contains("2 sent, 2 received"),
+        "ping lost packets on a loopback link, got: {reply:?}"
+    );
+    println!("  [ok] 'ping 10.0.2.2' -> 2/2 replies");
+
     Ok(())
 }
 

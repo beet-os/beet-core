@@ -1037,7 +1037,7 @@ pub fn tick_flush_user(now: u64) {
 /// If a socket is stuck in SynSent waiting for ARP, check whether the
 /// MAC is now cached and (if so) actually send the SYN.
 fn try_resume_connect(s: &mut UserSocket, our_ip: [u8; 4]) {
-    let next_hop = next_hop_for(s.peer_ip);
+    let next_hop = net_stack::next_hop_for(s.peer_ip);
     if let Some(mac) = net_stack::arp_lookup(next_hop) {
         s.peer_mac = mac;
         s.awaiting_arp = false;
@@ -1052,17 +1052,6 @@ fn try_resume_connect(s: &mut UserSocket, our_ip: [u8; 4]) {
     }
 }
 
-/// Pick the next-hop IP for a destination: same-subnet → peer directly,
-/// otherwise → gateway. Subnet mask is hardcoded /24 for QEMU's
-/// 10.0.2.0/24; real-NIC will need to read the mask from DHCP.
-fn next_hop_for(peer_ip: [u8; 4]) -> [u8; 4] {
-    let our = net_stack::get_ip();
-    if our[..3] == peer_ip[..3] {
-        peer_ip
-    } else {
-        net_stack::get_gateway()
-    }
-}
 
 // ============================================================================
 // Public API called from syscall handlers

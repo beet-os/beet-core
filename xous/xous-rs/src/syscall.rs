@@ -567,6 +567,28 @@ pub enum SysCall {
     #[cfg(beetos)]
     NetSocketClose(usize /* sock */),
 
+    /// Send one ICMP echo request. Non-blocking: returns 0 (after
+    /// kicking off ARP resolution of the next hop) when the MAC isn't
+    /// cached yet — retry until it returns 1.
+    ///
+    /// # Arguments
+    /// * `dst_ip`: IPv4 destination packed as big-endian u32
+    /// * `seq`: echo sequence number (the kernel stamps its own id)
+    ///
+    /// # Returns
+    /// * **Scalar1(sent)**: 1 if the request went out, 0 if ARP pending
+    #[cfg(beetos)]
+    NetPingSend(usize /* dst_ip_be */, usize /* seq */),
+
+    /// Take the last ICMP echo reply that answered a [`NetPingSend`],
+    /// if any. Non-blocking, single-slot, cleared on read.
+    ///
+    /// # Returns
+    /// * **Scalar2(src_ip_be, seq)** — both 0 when no reply is pending
+    ///   (0.0.0.0 is not a valid reply source, so no ambiguity)
+    #[cfg(beetos)]
+    NetPingPoll,
+
     /// Block the calling thread until any notification bits matching `mask`
     /// are set on the current process.  Returns the bits that fired
     /// (intersection of pending bits and mask) and clears them; the read
@@ -743,6 +765,8 @@ pub enum SysCallNumber {
     NetSocketSend = 75,
     NetSocketRecv = 76,
     NetSocketClose = 77,
+    NetPingSend = 78,
+    NetPingPoll = 79,
 
     Invalid,
 }
@@ -827,6 +851,8 @@ impl SysCallNumber {
             75 => NetSocketSend,
             76 => NetSocketRecv,
             77 => NetSocketClose,
+            78 => NetPingSend,
+            79 => NetPingPoll,
             _ => Invalid,
         }
     }
@@ -1229,6 +1255,14 @@ impl SysCall {
             SysCall::NetSocketClose(sock) => {
                 [SysCallNumber::NetSocketClose as usize, *sock, 0, 0, 0, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::NetPingSend(dst_ip_be, seq) => {
+                [SysCallNumber::NetPingSend as usize, *dst_ip_be, *seq, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::NetPingPoll => {
+                [SysCallNumber::NetPingPoll as usize, 0, 0, 0, 0, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1454,6 +1488,10 @@ impl SysCall {
             SysCallNumber::NetSocketRecv => SysCall::NetSocketRecv(a1, a2),
             #[cfg(beetos)]
             SysCallNumber::NetSocketClose => SysCall::NetSocketClose(a1),
+            #[cfg(beetos)]
+            SysCallNumber::NetPingSend => SysCall::NetPingSend(a1, a2),
+            #[cfg(beetos)]
+            SysCallNumber::NetPingPoll => SysCall::NetPingPoll,
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1482,7 +1520,9 @@ impl SysCall {
             | SysCallNumber::NetSocketStatus
             | SysCallNumber::NetSocketSend
             | SysCallNumber::NetSocketRecv
-            | SysCallNumber::NetSocketClose => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::NetSocketClose
+            | SysCallNumber::NetPingSend
+            | SysCallNumber::NetPingPoll => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }
