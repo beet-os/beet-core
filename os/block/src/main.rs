@@ -75,12 +75,30 @@ fn handle_read(lba: u64, n_blocks: u32, data: &mut [u8]) -> BlockResult {
     BlockResult::Ok
 }
 
-/// Writes are not supported by today's transitional in-RAM disk
-/// backing (the kernel mapped it read-only).  Future driver
-/// backends will route this through SDHCI Host::write_block or
-/// NvmeBlockDevice::write_blocks.
-fn handle_write(_lba: u64, _n_blocks: u32, _data: &[u8]) -> BlockResult {
-    BlockResult::Io
+/// Persist `n_blocks * BLOCK_SIZE` bytes to the disk mirror, then ask
+/// the kernel to flush the same sectors to the underlying virtio-blk
+/// device. The mirror is mapped writable into our address space (see
+/// `boot.rs::disk_va`), and `SysCall::BlockFlush` is restricted to
+/// this PID by the kernel.
+fn handle_write(lba: u64, n_blocks: u32, data: &[u8]) -> BlockResult {
+    let needed = (n_blocks as usize) * BLOCK_SIZE as usize;
+    if data.len() < needed { return BlockResult::BadBuffer; }
+
+    let cap_blocks = capacity_blocks();
+    let end = lba.saturating_add(n_blocks as u64);
+    if end > cap_blocks { return BlockResult::OutOfRange; }
+
+    unsafe {
+        if DISK_BASE == 0 || DISK_SIZE == 0 { return BlockResult::NotReady; }
+        let dst_off = (lba as usize) * BLOCK_SIZE as usize;
+        let dst = (DISK_BASE + dst_off) as *mut u8;
+        core::ptr::copy_nonoverlapping(data.as_ptr(), dst, needed);
+    }
+
+    match xous::rsyscall(xous::SysCall::BlockFlush(lba as usize, n_blocks as usize)) {
+        Ok(xous::Result::Ok) => BlockResult::Ok,
+        _ => BlockResult::Io,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -783,10 +783,13 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
                     }
 
                     if read_ok {
-                        // Map disk pages read-only into the block service
-                        // only. The fs service reaches them via IPC
-                        // (BlockClient → BLOCK_SID → ReadBlocks) — the
-                        // direct mapping was the transitional shim.
+                        // Map disk pages writable into the block service so
+                        // BlockOp::WriteBlocks can land in the mirror; the
+                        // mirror is then flushed back to virtio-blk via
+                        // SysCall::BlockFlush (M8 write path). The fs
+                        // service still reaches the data via IPC
+                        // (BlockClient → BLOCK_SID → ReadBlocks/WriteBlocks),
+                        // not through this direct mapping.
                         crate::services::SystemServices::with_mut(|ss| {
                             crate::mem::MemoryManager::with_mut(|mm| {
                                 let process = ss.process_mut(block_pid).expect("disk-map block");
@@ -796,14 +799,18 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
                                         mm,
                                         disk_phys_pages[i],
                                         va as *mut usize,
-                                        xous::MemoryFlags::empty(),
+                                        xous::MemoryFlags::W,
                                         true,
                                     ).ok();
                                 }
                             });
                         });
 
-                        crate::platform::qemu_virt::uart::puts("Disk: mapped into block service\n");
+                        // Tell the virtio-blk driver where each mirror page
+                        // lives so SysCall::BlockFlush can push them back.
+                        blk::register_mirror(&disk_phys_pages[..disk_pages]);
+
+                        crate::platform::qemu_virt::uart::puts("Disk: mapped into block service (R/W)\n");
                         (DISK_DATA_VA, disk_bytes)
                     } else {
                         crate::platform::qemu_virt::uart::puts("Disk: read failed\n");

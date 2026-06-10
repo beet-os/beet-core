@@ -419,7 +419,8 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         | SysCall::NetSocketRecv(..)
         | SysCall::NetSocketClose(..)
         | SysCall::NetPingSend(..)
-        | SysCall::NetPingPoll => Ok(()),
+        | SysCall::NetPingPoll
+        | SysCall::BlockFlush(..) => Ok(()),
 
         // Notification syscalls
         #[cfg(beetos)]
@@ -856,12 +857,31 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             }
         }
 
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::BlockFlush(lba, n_blocks) => {
+            use crate::platform::qemu_virt::blk;
+            // PID 6 is the block service (boot.rs creates it under that
+            // fixed slot). Nobody else gets to drive virtio-blk writes,
+            // since the syscall reaches through the mirror by physical
+            // address without any user pointer.
+            if current_pid().get() != 6 {
+                return Err(Error::AccessDenied);
+            }
+            if n_blocks == 0 || n_blocks > u32::MAX as usize {
+                return Err(Error::InvalidArguments);
+            }
+            blk::flush_mirror(lba as u64, n_blocks as u32)
+                .map(|_| Result::Ok)
+                .map_err(|_| Error::InvalidArguments)
+        }
+
         #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
         SysCall::NetSocketCreate | SysCall::NetSocketListen(_, _) | SysCall::NetSocketAccept(_)
         | SysCall::NetSocketConnect(_, _, _) | SysCall::NetSocketStatus(_)
         | SysCall::NetSocketSend(_, _, _, _, _, _) | SysCall::NetSocketRecv(_, _)
         | SysCall::NetSocketClose(_)
-        | SysCall::NetPingSend(_, _) | SysCall::NetPingPoll => Err(Error::InvalidSyscall),
+        | SysCall::NetPingSend(_, _) | SysCall::NetPingPoll
+        | SysCall::BlockFlush(_, _) => Err(Error::InvalidSyscall),
 
         #[cfg(beetos)]
         SysCall::GetBinaryName(index) => {

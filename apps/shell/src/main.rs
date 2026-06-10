@@ -354,6 +354,8 @@ fn execute_line(line: &[u8]) {
         "rm" => cmd_rm(cmd_args),
         "mkdir" => cmd_mkdir(cmd_args),
         "blkinfo" => cmd_blkinfo(),
+        "dread" => cmd_dread(cmd_args),
+        "dwrite" => cmd_dwrite(cmd_args, line_str),
         "mem" => cmd_mem(),
         "ifconfig" => cmd_ifconfig(),
         "ping" => cmd_ping(cmd_args),
@@ -386,6 +388,8 @@ fn cmd_help() {
     puts("  rm <path>         Remove a file or empty directory\n");
     puts("  mkdir <path>      Create a directory\n");
     puts("  blkinfo           Block device info\n");
+    puts("  dread <lba>       Read one 512-byte block (printable preview)\n");
+    puts("  dwrite <lba> <text>  Write one 512-byte block (zero-padded)\n");
     puts("  mem               Filesystem statistics\n");
     puts("  ifconfig          Show network interface configuration\n");
     puts("  ping <ip> [count] ICMP echo (default 4 packets)\n");
@@ -737,6 +741,108 @@ fn cmd_blkinfo() {
     }
 }
 
+/// Allocate a one-page buffer and acquire a block-service client.
+/// Returns `None` and prints an error if either step fails.
+fn open_block(buf_label: &str) -> Option<(beetos_api_block::BlockClient, xous::MemoryRange)> {
+    let client = match beetos_api_block::BlockClient::connect_with_retries(8) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = write!(DualWriter, "{}: block service unavailable\n", buf_label);
+            return None;
+        }
+    };
+    let page = match xous::MemorySize::new(beetos::PAGE_SIZE) {
+        Some(s) => s,
+        None => {
+            let _ = write!(DualWriter, "{}: bad page size\n", buf_label);
+            return None;
+        }
+    };
+    let buf = match xous::rsyscall(xous::SysCall::MapMemory(
+        None, None, page, xous::MemoryFlags::W,
+    )) {
+        Ok(xous::Result::MemoryRange(r)) => r,
+        _ => {
+            let _ = write!(DualWriter, "{}: alloc FAILED\n", buf_label);
+            return None;
+        }
+    };
+    Some((client, buf))
+}
+
+fn cmd_dread(args: &[&str]) {
+    let lba = match args.first().and_then(|s| parse_u64(s)) {
+        Some(v) => v,
+        None => { puts("usage: dread <lba>\n"); return; }
+    };
+    let Some((client, buf)) = open_block("dread") else { return };
+
+    let res = client.read_blocks(lba, 1, buf);
+    if let Err(e) = res {
+        let _ = write!(DualWriter, "dread: read FAILED ({:?})\n", e);
+        xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
+        return;
+    }
+    let slice = unsafe {
+        core::slice::from_raw_parts(buf.as_ptr(), buf.len())
+    };
+    let data = beetos_api_block::data(slice);
+    // 512 bytes is enough to dominate the line; just print up to the
+    // first NUL or 64 chars, whichever comes first, then a printable
+    // count summary.
+    let stop = data.iter().position(|&b| b == 0).unwrap_or(data.len()).min(64);
+    let _ = write!(DualWriter, "lba {}: ", lba);
+    for &b in &data[..stop] {
+        if (0x20..=0x7e).contains(&b) {
+            putc(b);
+        } else {
+            putc(b'.');
+        }
+    }
+    putc(b'\n');
+    let nz = data.iter().filter(|&&b| b != 0).count();
+    let _ = write!(DualWriter, "  {} non-zero byte(s) in block\n", nz);
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
+}
+
+fn cmd_dwrite(args: &[&str], line: &str) {
+    let lba = match args.first().and_then(|s| parse_u64(s)) {
+        Some(v) => v,
+        None => { puts("usage: dwrite <lba> <text>\n"); return; }
+    };
+    // Re-extract the payload from the original command line so embedded
+    // spaces survive (the splitter would shred them).
+    let mut tokens = line.split_whitespace();
+    tokens.next(); // dwrite
+    tokens.next(); // lba
+    let payload = match tokens.next() {
+        Some(p) => p,
+        None => { puts("usage: dwrite <lba> <text>\n"); return; }
+    };
+
+    let Some((client, buf)) = open_block("dwrite") else { return };
+
+    let slice = unsafe {
+        core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len())
+    };
+    let data = beetos_api_block::data_mut(slice);
+    // Zero-pad so the on-disk block is deterministic — any host-side
+    // verifier sees exactly what was written, no stale tail bytes.
+    for b in data.iter_mut() { *b = 0; }
+    let n = payload.len().min(data.len());
+    data[..n].copy_from_slice(&payload.as_bytes()[..n]);
+
+    match client.write_blocks(lba, 1, buf) {
+        Ok(()) => {
+            let _ = write!(DualWriter, "dwrite: wrote {} byte(s) at lba {}\n", n, lba);
+        }
+        Err(e) => {
+            let _ = write!(DualWriter, "dwrite: FAILED ({:?})\n", e);
+        }
+    }
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
+}
+
 fn cmd_ifconfig() {
     match xous::rsyscall(xous::SysCall::NetGetInfo) {
         Ok(xous::Result::Scalar5(ip_u32, mac_hi, mac_lo, _, _)) => {
@@ -771,6 +877,20 @@ fn cmd_ifconfig() {
         }
         _ => puts("ifconfig: NetGetInfo syscall failed\n"),
     }
+}
+
+fn parse_u64(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for b in s.bytes() {
+        if !(b'0'..=b'9').contains(&b) {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(n)
 }
 
 fn parse_u16(s: &str) -> Option<u16> {

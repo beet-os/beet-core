@@ -17,7 +17,6 @@ pub const SECTOR_SIZE: usize = 512;
 
 /// virtio-blk request types.
 const VIRTIO_BLK_T_IN: u32 = 0;   // read
-#[allow(dead_code)]
 const VIRTIO_BLK_T_OUT: u32 = 1;  // write
 
 /// virtio-blk status codes.
@@ -216,6 +215,65 @@ pub fn handle_irq() {
 /// Return the IRQ number for the block device, if present.
 pub fn irq_number() -> Option<u32> {
     unsafe { (*(&raw const BLK_DEV)).as_ref().map(|d| d.irq) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mirror metadata + writeback (M8 write path)
+//
+// At boot the kernel reads the whole disk into a list of physical pages and
+// maps them into the block service. To keep that mirror coherent with the
+// device, the block service issues a `BlockFlush(lba, n)` syscall after every
+// IPC write — the kernel finds the matching mirror bytes via MIRROR_PAGES /
+// MIRROR_PAGE_COUNT and pushes them to virtio sector by sector. No userspace
+// buffer crosses the EL0/EL1 boundary, so the handler stays PAN-safe by
+// construction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MAX_MIRROR_PAGES: usize = 256;
+static mut MIRROR_PAGES: [usize; MAX_MIRROR_PAGES] = [0; MAX_MIRROR_PAGES];
+static mut MIRROR_PAGE_COUNT: usize = 0;
+
+/// Record the mirror's physical page list. Called once at boot after the
+/// disk has been read into RAM and mapped into the block service.
+pub fn register_mirror(pages: &[usize]) {
+    let n = pages.len().min(MAX_MIRROR_PAGES);
+    unsafe {
+        MIRROR_PAGES[..n].copy_from_slice(&pages[..n]);
+        MIRROR_PAGE_COUNT = n;
+    }
+}
+
+/// Flush a contiguous run of sectors from the in-RAM mirror to the
+/// underlying virtio-blk device. Returns [`BlkError::OutOfRange`] when
+/// the range exceeds the mirror, [`BlkError::NoDevice`] when no mirror
+/// was registered (no disk at boot, or platform without virtio-blk).
+pub fn flush_mirror(lba: u64, n_sectors: u32) -> Result<(), BlkError> {
+    let mirror_pages = unsafe { MIRROR_PAGE_COUNT };
+    if mirror_pages == 0 {
+        return Err(BlkError::NoDevice);
+    }
+    let sectors_per_page = beetos::PAGE_SIZE / SECTOR_SIZE;
+    let total_sectors = (mirror_pages * sectors_per_page) as u64;
+    let end = lba.saturating_add(n_sectors as u64);
+    if end > total_sectors {
+        return Err(BlkError::OutOfRange);
+    }
+
+    let mut sec = lba;
+    let stop = lba + n_sectors as u64;
+    while sec < stop {
+        let page = (sec as usize) / sectors_per_page;
+        let sec_in_page = (sec as usize) % sectors_per_page;
+        // Drain to the end of this mirror page in one virtio call.
+        let run = ((sectors_per_page - sec_in_page) as u64).min(stop - sec);
+        let pa = unsafe { MIRROR_PAGES[page] };
+        let kva = beetos::phys_to_virt(pa) + sec_in_page * SECTOR_SIZE;
+        let bytes = (run as usize) * SECTOR_SIZE;
+        let buf = unsafe { core::slice::from_raw_parts(kva as *const u8, bytes) };
+        write_sectors(sec, buf)?;
+        sec += run;
+    }
+    Ok(())
 }
 
 // ============================================================================

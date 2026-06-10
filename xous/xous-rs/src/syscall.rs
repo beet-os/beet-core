@@ -589,6 +589,22 @@ pub enum SysCall {
     #[cfg(beetos)]
     NetPingPoll,
 
+    /// Push `n_blocks` 512-byte sectors starting at `lba` from the
+    /// block-service in-RAM mirror to the underlying virtio-blk
+    /// device. Restricted to the block service PID — the kernel uses
+    /// its own mapping of the mirror (recorded at boot), so no
+    /// userspace pointer crosses the EL0/EL1 boundary.
+    ///
+    /// # Arguments
+    /// * `lba`: starting sector
+    /// * `n_blocks`: count
+    ///
+    /// # Errors
+    /// * **AccessDenied**: caller is not the block service
+    /// * **InvalidArguments**: range exceeds the mirror, or no mirror
+    #[cfg(beetos)]
+    BlockFlush(usize /* lba */, usize /* n_blocks */),
+
     /// Block the calling thread until any notification bits matching `mask`
     /// are set on the current process.  Returns the bits that fired
     /// (intersection of pending bits and mask) and clears them; the read
@@ -767,6 +783,7 @@ pub enum SysCallNumber {
     NetSocketClose = 77,
     NetPingSend = 78,
     NetPingPoll = 79,
+    BlockFlush = 80,
 
     Invalid,
 }
@@ -853,6 +870,7 @@ impl SysCallNumber {
             77 => NetSocketClose,
             78 => NetPingSend,
             79 => NetPingPoll,
+            80 => BlockFlush,
             _ => Invalid,
         }
     }
@@ -1263,6 +1281,10 @@ impl SysCall {
             SysCall::NetPingPoll => {
                 [SysCallNumber::NetPingPoll as usize, 0, 0, 0, 0, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::BlockFlush(lba, n) => {
+                [SysCallNumber::BlockFlush as usize, *lba, *n, 0, 0, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1492,6 +1514,8 @@ impl SysCall {
             SysCallNumber::NetPingSend => SysCall::NetPingSend(a1, a2),
             #[cfg(beetos)]
             SysCallNumber::NetPingPoll => SysCall::NetPingPoll,
+            #[cfg(beetos)]
+            SysCallNumber::BlockFlush => SysCall::BlockFlush(a1, a2),
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1522,7 +1546,8 @@ impl SysCall {
             | SysCallNumber::NetSocketRecv
             | SysCallNumber::NetSocketClose
             | SysCallNumber::NetPingSend
-            | SysCallNumber::NetPingPoll => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::NetPingPoll
+            | SysCallNumber::BlockFlush => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }
