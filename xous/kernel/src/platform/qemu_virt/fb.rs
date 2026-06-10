@@ -560,6 +560,72 @@ pub fn compose_desktop() {
 /// Trigger a periodic recompose from the timer IRQ — drives the
 /// taskbar clock, spinner, and background animation without needing
 /// explicit input.  Called by `handle_irq` ~10 times a second.
+// ─────────────────────────────────────────────────────────────────────────────
+// Deferred composition (IRQs request, idle paints)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A full software compose of the 1280×800 desktop is far too slow to
+// run with IRQs masked (~9 ms release, ~90 ms in a debug build — at
+// 10 Hz that masked the CPU for most of its life and lost UART input
+// beyond the 16-byte FIFO). IRQ handlers therefore only *request* a
+// repaint — cheap flag writes — and the actual painting happens in the
+// kernel idle loop with IRQs unmasked, guarded so input arriving
+// mid-paint can't mutate the WindowManager while compose walks it.
+
+/// A repaint is wanted (timer cadence, key, or pointer activity).
+static mut COMPOSE_REQUESTED: bool = false;
+/// A 10 Hz animation boundary passed; step animations on next paint.
+static mut ANIM_STEP_DUE: bool = false;
+/// The idle-context compose is currently walking the WindowManager.
+static mut COMPOSE_IN_PROGRESS: bool = false;
+
+/// Keys that arrived while a compose was walking the WM, drained
+/// through the normal routing right after the paint. 16 is plenty:
+/// one paint lasts well under two keyboard auto-repeats.
+static mut PENDING_KEYS: [u8; 16] = [0; 16];
+static mut PENDING_HEAD: usize = 0;
+static mut PENDING_TAIL: usize = 0;
+
+/// Ask the idle loop for a repaint. Safe from any IRQ handler.
+#[inline]
+pub fn request_compose() {
+    unsafe { COMPOSE_REQUESTED = true }
+}
+
+/// True while the idle-context compose walks the WindowManager —
+/// IRQ handlers must not mutate the WM (or repaint) while this holds.
+#[inline]
+pub fn compose_in_progress() -> bool {
+    unsafe { COMPOSE_IN_PROGRESS }
+}
+
+/// Park a key that can't take the WM path right now (paint in
+/// progress). Returns `false` when the queue is full — the caller
+/// drops the key, same outcome as a UART FIFO overrun.
+pub fn queue_key_during_compose(c: u8) -> bool {
+    unsafe {
+        let next = (PENDING_HEAD + 1) % PENDING_KEYS.len();
+        if next == PENDING_TAIL {
+            return false;
+        }
+        PENDING_KEYS[PENDING_HEAD] = c;
+        PENDING_HEAD = next;
+        true
+    }
+}
+
+fn pop_pending_key() -> Option<u8> {
+    unsafe {
+        if PENDING_HEAD == PENDING_TAIL {
+            return None;
+        }
+        let c = PENDING_KEYS[PENDING_TAIL];
+        PENDING_TAIL = (PENDING_TAIL + 1) % PENDING_KEYS.len();
+        Some(c)
+    }
+}
+
+/// 10 Hz pacing from the timer IRQ: request a paint, never do one.
 pub fn tick_recompose_if_due(tick: u64) {
     // Terminal-only boots (no `-device ramfb`) skip the entire GUI
     // pipeline so the timer IRQ stays cheap and the shell isn't
@@ -568,11 +634,50 @@ pub fn tick_recompose_if_due(tick: u64) {
     // 10 Hz: smooth enough for the spinner and bouncing accent, well
     // below the 100 Hz timer so we don't melt the (software!) rasterizer.
     if tick % 10 == 0 {
-        // Advance any interactive content (snake game etc.) BEFORE
-        // composing so the frame we paint is the freshly-stepped one.
-        with_wm(|wm| { wm.animation_step(); });
-        compose_desktop();
+        unsafe {
+            ANIM_STEP_DUE = true;
+            COMPOSE_REQUESTED = true;
+        }
     }
+}
+
+/// Idle-loop entry point: paint if a repaint was requested.
+///
+/// Must be called with IRQs masked. Unmasks them around the heavy
+/// compose so input/net/timer stay live during the paint, and
+/// re-masks before returning. Returns `true` if it painted — the
+/// caller should re-run the scheduler, since an IRQ during the paint
+/// may have readied a thread.
+pub fn idle_compose_if_requested() -> bool {
+    unsafe {
+        if !FB_READY || !COMPOSE_REQUESTED {
+            return false;
+        }
+        COMPOSE_REQUESTED = false;
+        let step = ANIM_STEP_DUE;
+        ANIM_STEP_DUE = false;
+        COMPOSE_IN_PROGRESS = true;
+
+        // NB: no `nomem` on these asm blocks — they double as compiler
+        // barriers so the flag writes above/below can't drift across
+        // the mask boundary.
+        core::arch::asm!("msr daifclr, #2", options(nostack));
+        if step {
+            with_wm(|wm| { wm.animation_step(); });
+        }
+        compose_desktop();
+        core::arch::asm!("msr daifset, #2", options(nostack));
+
+        COMPOSE_IN_PROGRESS = false;
+    }
+
+    // Route keys that were parked mid-paint. IRQs are masked again, so
+    // this runs in the same conditions as normal IRQ-context delivery
+    // (WM first now that the walk is over, IPC fallback otherwise).
+    while let Some(c) = pop_pending_key() {
+        crate::arch::irq::dispatch_input_char_public(c);
+    }
+    true
 }
 
 /// Convenience: write a colored status line below the boot banner.

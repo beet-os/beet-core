@@ -169,8 +169,10 @@ fn handle_irq() -> bool {
                 // Drain queued TX on userspace sockets, reap expired
                 // wind-down states, and retry ARP-deferred connects.
                 crate::platform::qemu_virt::tcp::tick_flush_user(count);
-                // Refresh the desktop once per second so the taskbar
-                // clock advances without the user having to type anything.
+                // Request a desktop repaint at 10 Hz (flag only — the
+                // actual compose runs from the idle loop with IRQs
+                // unmasked; painting here would mask IRQs for the
+                // whole rasterization).
                 crate::platform::qemu_virt::fb::tick_recompose_if_due(count);
             }
             uart::UART_IRQ => {
@@ -194,16 +196,24 @@ fn handle_irq() -> bool {
             }
             irq_id if input::tablet_irq_number() == Some(irq_id) => {
                 input::ack_irq_for(irq_id);
-                let changed = input::drain_tablet_events(
-                    |x, y| {
-                        crate::platform::qemu_virt::fb::with_wm(|wm| wm.set_cursor(x, y));
-                    },
-                    || {
-                        crate::platform::qemu_virt::fb::with_wm(|wm| { wm.click_at_cursor(); });
-                    },
-                );
-                if changed {
-                    crate::platform::qemu_virt::fb::compose_desktop();
+                if crate::platform::qemu_virt::fb::compose_in_progress() {
+                    // Paint in progress: drain (ack) the events but
+                    // drop them — the next motion re-syncs the cursor,
+                    // and a click inside a paint window is rarer than
+                    // the WM corruption mutating mid-walk would cause.
+                    input::drain_tablet_events(|_, _| {}, || {});
+                } else {
+                    let changed = input::drain_tablet_events(
+                        |x, y| {
+                            crate::platform::qemu_virt::fb::with_wm(|wm| wm.set_cursor(x, y));
+                        },
+                        || {
+                            crate::platform::qemu_virt::fb::with_wm(|wm| { wm.click_at_cursor(); });
+                        },
+                    );
+                    if changed {
+                        crate::platform::qemu_virt::fb::request_compose();
+                    }
                 }
             }
             irq_id => {
@@ -277,19 +287,28 @@ fn dispatch_input_char(c: u8) {
     use crate::services::SystemServices;
 
     // GUI-first routing: if any GUI window is focused, the kernel-side
-    // WindowManager consumes the keystroke and triggers a recompose.
+    // WindowManager consumes the keystroke and requests a recompose
+    // (painted later from the idle loop — never in IRQ context).
     // We only fall through to the IPC path when no window wanted the
     // key. This lets the shell keep working when the desktop has no
     // focused interactive window. Terminal-only boots (no ramfb) skip
     // the entire WM consult so keys go straight to the shell.
-    let consumed = if crate::platform::qemu_virt::fb::is_fb_ready() {
-        crate::platform::qemu_virt::fb::with_wm(|wm| wm.handle_key(c))
-    } else {
-        false
-    };
-    if consumed {
-        crate::platform::qemu_virt::fb::compose_desktop();
-        return;
+    let fb_live = crate::platform::qemu_virt::fb::is_fb_ready();
+    if fb_live && crate::platform::qemu_virt::fb::compose_in_progress() {
+        // The idle-context paint is walking the WM right now — don't
+        // mutate it mid-walk. Park the key; it re-enters this routing
+        // as soon as the paint completes.
+        if crate::platform::qemu_virt::fb::queue_key_during_compose(c) {
+            return;
+        }
+        // Queue full — fall through to the IPC path (lossless for the
+        // shell; a focused window misses the key, like a FIFO overrun).
+    } else if fb_live {
+        let consumed = crate::platform::qemu_virt::fb::with_wm(|wm| wm.handle_key(c));
+        if consumed {
+            crate::platform::qemu_virt::fb::request_compose();
+            return;
+        }
     }
 
     SystemServices::with_mut(|ss| {
@@ -435,6 +454,18 @@ unsafe fn idle_wait_then_load(frame: *mut super::process::Thread) {
         let pid = crate::arch::process::current_pid();
         if pid.get() != 1 {
             break;
+        }
+        // Deferred GUI work first: the desktop paint runs here — in
+        // idle, with IRQs unmasked inside — instead of in the timer
+        // IRQ (a full software compose is way too slow to run with
+        // IRQs masked). A wake-up IRQ may land during the paint, so on
+        // return re-run the scheduler instead of going to sleep.
+        #[cfg(feature = "platform-qemu-virt")]
+        if crate::platform::qemu_virt::fb::idle_compose_if_requested() {
+            let _ = crate::services::SystemServices::with_mut(|ss| {
+                crate::scheduler::Scheduler::with_mut(|s| s.activate_current(ss))
+            });
+            continue;
         }
         // Enable IRQs, wait for an interrupt, then re-mask.
         // The kernel IRQ handler (EL1 SPx) will run and return here.
