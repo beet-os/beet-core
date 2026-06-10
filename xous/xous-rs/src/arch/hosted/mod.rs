@@ -26,6 +26,24 @@ pub mod irq {
     }
 }
 
+/// Hosted stand-in for the AArch64 virtual counter: nanoseconds since
+/// the first read, at a nominal 1 GHz. Lets `bench`-style code compile
+/// and run unmodified in hosted mode.
+pub mod perf {
+    use std::sync::LazyLock;
+    use std::time::Instant;
+
+    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+    pub fn counter() -> u64 {
+        EPOCH.elapsed().as_nanos() as u64
+    }
+
+    pub fn frequency() -> u64 {
+        1_000_000_000
+    }
+}
+
 static NETWORK_CONNECT_ADDRESS: LazyLock<SocketAddr> = LazyLock::new(|| {
     std::env::var("XOUS_SERVER")
         .map(|s| {

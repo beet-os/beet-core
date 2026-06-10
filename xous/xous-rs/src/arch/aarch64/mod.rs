@@ -11,6 +11,8 @@ pub use syscall_impl::*;
 
 pub mod irq;
 
+pub mod perf;
+
 mod mem;
 pub use mem::*;
 

@@ -1,0 +1,9 @@
+# Kernel micro-benchmark baseline (ns/op under QEMU -icount shift=0).
+# Deterministic: 1 ns = 1 instruction. Regenerate with
+#   cargo xtask qemu-bench --update
+cpu_mix 222725
+syscall_null 3357
+yield 43480
+ipc_scalar 30295
+map_unmap 1890703
+memcpy_16k 8564

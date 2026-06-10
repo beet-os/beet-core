@@ -102,6 +102,16 @@ Reproducible visuals:
 - `cargo xtask qemu-screenshot [--wait SECS] [--out PATH]` — capture
   the FB via QMP `screendump`, PPM → PNG via ImageMagick
 
+Performance gate:
+- `cargo xtask qemu-bench [--update] [--tolerance PCT]` — kernel
+  micro-benchmarks (null syscall, yield, IPC round-trip, page
+  map/unmap, 16K memcpy) run by the shell's `bench` command, timed
+  with CNTVCT_EL0 under QEMU `-icount` (deterministic: 1 ns = 1
+  instruction). Compares against `xtask/qemu-bench-baseline.txt`
+  (±30% default); rerun with `--update` after an intentional perf
+  change. `cpu_mix` is a pure-CPU calibration point — if it moves,
+  blame the environment (QEMU version), not the kernel.
+
 ## How to Develop (hosted mode)
 
 **Primary development workflow — no hardware needed:**

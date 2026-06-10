@@ -71,6 +71,15 @@ pub fn init() {
         TICK_COUNT = 0;
     }
 
+    // Let EL0 read the virtual counter (CNTVCT_EL0 + CNTFRQ_EL0)
+    // directly: CNTKCTL_EL1.EL0VCTEN (bit 1). Userspace benchmarks
+    // (`bench` in the shell) need cycle-accurate timing without
+    // paying for a syscall on every sample. Read-only access — the
+    // timer *registers* (CNTP/CNTV ctl) stay EL1-only.
+    unsafe {
+        core::arch::asm!("msr cntkctl_el1, {}", in(reg) 0b10u64, options(nomem, nostack));
+    }
+
     // Set first timer deadline
     set_tval(interval);
     // Enable timer, unmask interrupt

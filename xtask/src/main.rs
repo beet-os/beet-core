@@ -13,6 +13,7 @@ fn main() -> anyhow::Result<()> {
         Some("qemu-smoke-nodisk") => qemu_smoke_nodisk()?,
         Some("qemu-smoke-net") => qemu_smoke_net()?,
         Some("qemu-smoke-net-userspace") => qemu_smoke_net_userspace()?,
+        Some("qemu-bench") => qemu_bench(&args[1..])?,
         Some("qemu-screenshot") => qemu_screenshot(&args[1..])?,
         Some("qemu-animation") => qemu_animation(&args[1..])?,
         Some("rpi5") => rpi5()?,
@@ -31,6 +32,9 @@ fn main() -> anyhow::Result<()> {
             println!("  qemu-smoke-nodisk  Boot QEMU *without* a disk image — verifies graceful degradation");
             println!("  qemu-smoke-net     Boot QEMU with networking, drive the TCP remote console over a host socket");
             println!("  qemu-smoke-net-userspace   Boot QEMU and exercise api/net via shell commands (listen + connect)");
+            println!("  qemu-bench [--update] [--tolerance PCT]");
+            println!("                     Run kernel micro-benchmarks under deterministic icount and");
+            println!("                     compare against xtask/qemu-bench-baseline.txt (CI perf gate)");
             println!("  qemu-screenshot [--wait SECS] [--out PATH]");
             println!("                     Boot QEMU and capture the framebuffer (default: 6s, target/beetos-fb.png)");
             println!("  qemu-animation [--frames N] [--interval SECS] [--out PATH]");
@@ -1223,6 +1227,218 @@ fn qemu_smoke_net_userspace() -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => anyhow::bail!("Result: NET USERSPACE SMOKE TEST FAILED — {e}"),
+    }
+}
+
+/// Kernel performance gate: boot QEMU with `-icount shift=0,sleep=off`
+/// (virtual time advances with the *instruction count*, so in-guest
+/// CNTVCT measurements are deterministic across runs and host
+/// machines), drive the shell's `bench` command over the TCP console,
+/// and compare each result against `xtask/qemu-bench-baseline.txt`.
+///
+/// `--update` rewrites the baseline; `--tolerance PCT` overrides the
+/// default ±30% regression threshold. The `cpu_mix` entry is a pure-
+/// CPU calibration point: if it moves, the measurement environment
+/// changed (QEMU version, icount config) — not the kernel.
+fn qemu_bench(args: &[String]) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let mut update = false;
+    let mut tolerance = 0.30f64;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--update" => update = true,
+            "--tolerance" => {
+                i += 1;
+                tolerance = args
+                    .get(i)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|p| p / 100.0)
+                    .ok_or_else(|| anyhow::anyhow!("--tolerance needs a percentage"))?;
+            }
+            other => anyhow::bail!("unknown qemu-bench arg: {other}"),
+        }
+        i += 1;
+    }
+
+    let root = workspace_root();
+
+    let nostd_target = root.join("target/aarch64-unknown-none/debug");
+    std::fs::create_dir_all(&nostd_target)?;
+    let hello_std = nostd_target.join("hello-std.stripped");
+    if !hello_std.exists() {
+        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
+    }
+
+    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
+    let kernel = elf_to_image(&kernel_elf)?;
+
+    let serial_log = root.join("target/qemu-bench-serial.log");
+    let _ = std::fs::remove_file(&serial_log);
+
+    const HOST_CONSOLE_PORT: u16 = 5561;
+
+    println!();
+    println!("Launching QEMU kernel benchmarks (icount: deterministic virtual time)...");
+    println!("  serial log: {}", serial_log.display());
+    println!();
+
+    let qemu_args = vec![
+        "-machine".to_string(), "virt,gic-version=3".to_string(),
+        "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-m".to_string(), "2G".to_string(),
+        "-display".to_string(), "none".to_string(),
+        "-device".to_string(), "ramfb".to_string(),
+        // 1 instruction = 1 virtual ns (shift=0). sleep=off lets idle
+        // WFI warp virtual time to the next timer deadline so boot
+        // doesn't take minutes of wall time.
+        "-icount".to_string(), "shift=0,sleep=off".to_string(),
+        "-chardev".to_string(),
+        format!("file,id=c0,path={}", serial_log.display()),
+        "-serial".to_string(), "chardev:c0".to_string(),
+        "-netdev".to_string(),
+        format!("user,id=net0,hostfwd=tcp:127.0.0.1:{HOST_CONSOLE_PORT}-:2323"),
+        "-device".to_string(), "virtio-net-device,netdev=net0".to_string(),
+        "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
+    ];
+
+    let mut child = Command::new("qemu-system-aarch64")
+        .args(&qemu_args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let result = (|| -> anyhow::Result<Vec<(String, u64)>> {
+        let deadline = Instant::now() + Duration::from_secs(180);
+
+        wait_for_marker(&serial_log, "virtio-net: IP=", deadline)?;
+
+        let mut console = retry_connect(HOST_CONSOLE_PORT, deadline)?;
+        console.set_read_timeout(Some(Duration::from_millis(200)))?;
+        console.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let initial = drain_until(&mut console, "bsh>", Duration::from_secs(90));
+        anyhow::ensure!(initial.contains("bsh>"), "never saw the shell prompt: {initial:?}");
+        let _ = drain_quiet(&mut console, Duration::from_millis(300), Duration::from_secs(2));
+
+        console.write_all(b"bench\n")?;
+        console.flush()?;
+        // icount trades wall-clock speed for determinism; the suite is
+        // sized to finish well inside this window.
+        let out = drain_until(&mut console, "[bench] done", Duration::from_secs(150));
+        anyhow::ensure!(out.contains("[bench] done"), "bench never completed, got: {out:?}");
+
+        let mut results = Vec::new();
+        for line in out.lines() {
+            // "[bench] syscall_null 1042 ns/op n=10000"
+            let Some(rest) = line.trim().strip_prefix("[bench] ") else { continue };
+            let mut parts = rest.split_whitespace();
+            let (Some(name), Some(ns), Some(unit)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if unit != "ns/op" {
+                continue;
+            }
+            if let Ok(ns) = ns.parse::<u64>() {
+                results.push((name.to_string(), ns));
+            }
+        }
+        anyhow::ensure!(!results.is_empty(), "no benchmark lines parsed from: {out:?}");
+        Ok(results)
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let results = result?;
+
+    let baseline_path = root.join("xtask/qemu-bench-baseline.txt");
+    let baseline: BTreeMap<String, u64> = std::fs::read_to_string(&baseline_path)
+        .ok()
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| {
+                    let l = l.trim();
+                    if l.is_empty() || l.starts_with('#') {
+                        return None;
+                    }
+                    let mut parts = l.split_whitespace();
+                    Some((parts.next()?.to_string(), parts.next()?.parse::<u64>().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if update || baseline.is_empty() {
+        let mut text = String::from(
+            "# Kernel micro-benchmark baseline (ns/op under QEMU -icount shift=0).\n\
+             # Deterministic: 1 ns = 1 instruction. Regenerate with\n\
+             #   cargo xtask qemu-bench --update\n",
+        );
+        println!("  {:<14} {:>12}", "benchmark", "ns/op");
+        for (name, ns) in &results {
+            println!("  {name:<14} {ns:>12}");
+            text.push_str(&format!("{name} {ns}\n"));
+        }
+        std::fs::write(&baseline_path, text)?;
+        println!();
+        println!("Result: BASELINE WRITTEN to {}", baseline_path.display());
+        return Ok(());
+    }
+
+    println!("  {:<14} {:>12} {:>12} {:>9}", "benchmark", "baseline", "now", "delta");
+    let mut regressions = Vec::new();
+    let mut improvements = Vec::new();
+    for (name, now) in &results {
+        match baseline.get(name) {
+            Some(&base) => {
+                let delta = (*now as f64 - base as f64) / base as f64;
+                println!(
+                    "  {name:<14} {base:>12} {now:>12} {:>+8.1}%",
+                    delta * 100.0
+                );
+                if delta > tolerance {
+                    regressions.push(format!("{name}: {base} → {now} ns/op ({:+.1}%)", delta * 100.0));
+                } else if delta < -tolerance {
+                    improvements.push(name.clone());
+                }
+            }
+            None => {
+                println!("  {name:<14} {:>12} {now:>12}       new", "-");
+                regressions.push(format!(
+                    "{name}: not in baseline — run `cargo xtask qemu-bench --update`"
+                ));
+            }
+        }
+    }
+    for name in baseline.keys() {
+        if !results.iter().any(|(n, _)| n == name) {
+            regressions.push(format!(
+                "{name}: in baseline but not reported — run `cargo xtask qemu-bench --update`"
+            ));
+        }
+    }
+
+    println!();
+    if !improvements.is_empty() {
+        println!(
+            "Note: {} improved beyond tolerance — consider refreshing the baseline (--update).",
+            improvements.join(", ")
+        );
+    }
+    if regressions.is_empty() {
+        println!("Result: BENCH PASSED (tolerance ±{:.0}%)", tolerance * 100.0);
+        Ok(())
+    } else {
+        for r in &regressions {
+            println!("  REGRESSION: {r}");
+        }
+        anyhow::bail!("Result: BENCH FAILED — {} regression(s)", regressions.len());
     }
 }
 

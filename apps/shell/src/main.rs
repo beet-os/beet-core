@@ -348,6 +348,7 @@ fn execute_line(line: &[u8]) {
         "ifconfig" => cmd_ifconfig(),
         "nettest-listen" => cmd_nettest_listen(cmd_args),
         "nettest-connect" => cmd_nettest_connect(cmd_args),
+        "bench" => cmd_bench(),
 
         // External programs (spawned via procman)
         _ => try_spawn_via_procman(cmd, cmd_args),
@@ -378,6 +379,7 @@ fn cmd_help() {
     puts("  ifconfig          Show network interface configuration\n");
     puts("  nettest-listen <port>     Echo server: listen, accept one, echo, close\n");
     puts("  nettest-connect <ip> <port>   Connect, send 'hi', print reply, close\n");
+    puts("  bench             Kernel micro-benchmarks (syscall/IPC/MMU)\n");
 }
 
 fn cmd_echo(args: &[&str]) {
@@ -962,6 +964,185 @@ fn cmd_nettest_connect(args: &[&str]) {
     }
     puts("nettest: done\n");
     stream.close();
+}
+
+// ============================================================================
+// Kernel micro-benchmarks
+// ============================================================================
+
+/// Print one benchmark result. Format is parsed by `cargo xtask
+/// qemu-bench` — keep `[bench] <name> <ns> ns/op n=<iters>` stable.
+fn bench_report(name: &str, total_ticks: u64, freq: u64, iters: u64) {
+    let ns = (total_ticks as u128)
+        .saturating_mul(1_000_000_000)
+        / (freq as u128).max(1)
+        / (iters as u128).max(1);
+    let _ = write!(DualWriter, "[bench] {} {} ns/op n={}\n", name, ns as u64, iters);
+}
+
+/// Micro-benchmarks for the kernel hot paths, timed with the virtual
+/// counter (CNTVCT_EL0, EL0-readable thanks to CNTKCTL_EL1.EL0VCTEN).
+/// Under `cargo xtask qemu-bench` QEMU runs with `-icount`, making the
+/// counter advance with the instruction count — results are then
+/// deterministic and comparable against a checked-in baseline.
+fn cmd_bench() {
+    use core::hint::black_box;
+    use xous::arch::perf;
+
+    let freq = perf::frequency();
+    if freq == 0 {
+        puts("bench: cycle counter unavailable\n");
+        return;
+    }
+    let _ = write!(DualWriter, "[bench] counter {} Hz\n", freq);
+
+    // Pure-CPU integer mix. Calibration point: insensitive to kernel
+    // changes, so a shift here means the *measurement environment*
+    // moved (QEMU version, icount config), not the kernel.
+    {
+        const N: u64 = 200;
+        let t0 = perf::counter();
+        let mut acc = 0u64;
+        for i in 0..N {
+            let mut x = i.wrapping_add(0x9E37_79B9);
+            for j in 0..2048u64 {
+                x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(13) ^ j;
+            }
+            acc = acc.wrapping_add(x);
+        }
+        let t1 = perf::counter();
+        black_box(acc);
+        bench_report("cpu_mix", t1.wrapping_sub(t0), freq, N);
+    }
+
+    // Cheapest possible syscall: EL0→EL1 trap, dispatch, return.
+    // Watches the exception vectors + context save/restore.
+    {
+        const N: u64 = 10_000;
+        let t0 = perf::counter();
+        for _ in 0..N {
+            let _ = black_box(xous::rsyscall(xous::SysCall::GetThreadId));
+        }
+        let t1 = perf::counter();
+        bench_report("syscall_null", t1.wrapping_sub(t0), freq, N);
+    }
+
+    // Scheduler round-trip (immediate return when nothing else is
+    // runnable — measures the pick-next path, not a real switch).
+    {
+        const N: u64 = 10_000;
+        let t0 = perf::counter();
+        for _ in 0..N {
+            xous::yield_slice();
+        }
+        let t1 = perf::counter();
+        bench_report("yield", t1.wrapping_sub(t0), freq, N);
+    }
+
+    // Full IPC round-trip: BlockingScalar to the fs service — sender
+    // blocks, server wakes, replies, sender wakes. Two context
+    // switches plus the message plumbing.
+    {
+        const N: u64 = 1_000;
+        if fs_stats().is_some() {
+            let t0 = perf::counter();
+            for _ in 0..N {
+                black_box(fs_stats());
+            }
+            let t1 = perf::counter();
+            bench_report("ipc_scalar", t1.wrapping_sub(t0), freq, N);
+        } else {
+            puts("[bench] ipc_scalar skipped (fs unavailable)\n");
+        }
+    }
+
+    // Map one page, touch it, unmap it: page allocator, page tables,
+    // TLB maintenance.
+    {
+        const N: u64 = 1_000;
+        let mut ok = true;
+        let t0 = perf::counter();
+        match xous::MemorySize::new(beetos::PAGE_SIZE) {
+            Some(page_size) => {
+                for _ in 0..N {
+                    match xous::rsyscall(xous::SysCall::MapMemory(
+                        None, None, page_size, xous::MemoryFlags::W,
+                    )) {
+                        Ok(xous::Result::MemoryRange(r)) => {
+                            // Touch so the mapping is realised even if
+                            // the kernel ever goes demand-paged.
+                            unsafe { core::ptr::write_volatile(r.as_mut_ptr(), 0xA5u8) };
+                            let _ = xous::rsyscall(xous::SysCall::UnmapMemory(r));
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            None => ok = false,
+        }
+        let t1 = perf::counter();
+        if ok {
+            bench_report("map_unmap", t1.wrapping_sub(t0), freq, N);
+        } else {
+            puts("[bench] map_unmap skipped (MapMemory failed)\n");
+        }
+    }
+
+    // Copy one 16 KiB page between two kernel-allocated pages —
+    // memory subsystem sanity (and a second calibration point).
+    {
+        const N: u64 = 500;
+        let page_size = match xous::MemorySize::new(beetos::PAGE_SIZE) {
+            Some(s) => s,
+            None => {
+                puts("[bench] memcpy_16k skipped\n");
+                puts("[bench] done\n");
+                return;
+            }
+        };
+        let map = |_: ()| -> Option<xous::MemoryRange> {
+            match xous::rsyscall(xous::SysCall::MapMemory(
+                None, None, page_size, xous::MemoryFlags::W,
+            )) {
+                Ok(xous::Result::MemoryRange(r)) => Some(r),
+                _ => None,
+            }
+        };
+        match (map(()), map(())) {
+            (Some(src), Some(dst)) => {
+                unsafe { core::ptr::write_bytes(src.as_mut_ptr(), 0x5A, src.len()) };
+                let t0 = perf::counter();
+                for _ in 0..N {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            dst.as_mut_ptr(),
+                            beetos::PAGE_SIZE,
+                        );
+                    }
+                    black_box(unsafe { core::ptr::read_volatile(dst.as_ptr()) });
+                }
+                let t1 = perf::counter();
+                bench_report("memcpy_16k", t1.wrapping_sub(t0), freq, N);
+                let _ = xous::rsyscall(xous::SysCall::UnmapMemory(src));
+                let _ = xous::rsyscall(xous::SysCall::UnmapMemory(dst));
+            }
+            (s, d) => {
+                if let Some(r) = s {
+                    let _ = xous::rsyscall(xous::SysCall::UnmapMemory(r));
+                }
+                if let Some(r) = d {
+                    let _ = xous::rsyscall(xous::SysCall::UnmapMemory(r));
+                }
+                puts("[bench] memcpy_16k skipped (MapMemory failed)\n");
+            }
+        }
+    }
+
+    puts("[bench] done\n");
 }
 
 fn cmd_mem() {

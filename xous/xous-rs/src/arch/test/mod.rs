@@ -22,6 +22,23 @@ pub mod irq {
     }
 }
 
+/// Test-arch stand-in for the AArch64 virtual counter (see the hosted
+/// twin): nanoseconds since the first read, nominal 1 GHz.
+pub mod perf {
+    use std::sync::LazyLock;
+    use std::time::Instant;
+
+    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+    pub fn counter() -> u64 {
+        EPOCH.elapsed().as_nanos() as u64
+    }
+
+    pub fn frequency() -> u64 {
+        1_000_000_000
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ProcessKey([u8; 16]);
 impl ProcessKey {
