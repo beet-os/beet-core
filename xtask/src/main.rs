@@ -12,6 +12,7 @@ fn main() -> anyhow::Result<()> {
         Some("qemu-smoke") => qemu_smoke()?,
         Some("qemu-smoke-nodisk") => qemu_smoke_nodisk()?,
         Some("qemu-smoke-net") => qemu_smoke_net()?,
+        Some("qemu-smoke-net-userspace") => qemu_smoke_net_userspace()?,
         Some("qemu-screenshot") => qemu_screenshot(&args[1..])?,
         Some("qemu-animation") => qemu_animation(&args[1..])?,
         Some("rpi5") => rpi5()?,
@@ -29,6 +30,7 @@ fn main() -> anyhow::Result<()> {
             println!("  qemu-smoke         Boot QEMU and verify expected progress markers (CI)");
             println!("  qemu-smoke-nodisk  Boot QEMU *without* a disk image — verifies graceful degradation");
             println!("  qemu-smoke-net     Boot QEMU with networking, drive the TCP remote console over a host socket");
+            println!("  qemu-smoke-net-userspace   Boot QEMU and exercise api/net via shell commands (listen + connect)");
             println!("  qemu-screenshot [--wait SECS] [--out PATH]");
             println!("                     Boot QEMU and capture the framebuffer (default: 6s, target/beetos-fb.png)");
             println!("  qemu-animation [--frames N] [--interval SECS] [--out PATH]");
@@ -1019,6 +1021,275 @@ fn qemu_smoke_net() -> anyhow::Result<()> {
         }
         Err(e) => anyhow::bail!("Result: NET SMOKE TEST FAILED — {e}"),
     }
+}
+
+/// Userspace-socket smoke test. Boots QEMU, drives the *real* shell
+/// over the kernel TCP console to invoke `nettest-listen` (proves
+/// passive open from a userspace app), then `nettest-connect` (proves
+/// active open through ARP + SYN to a host listener at the slirp
+/// gateway, 10.0.2.2).
+///
+/// Three host-side TCP endpoints involved:
+///   - 127.0.0.1:HOST_CONSOLE_PORT → guest :2323 — kernel console.
+///     Drives shell input.
+///   - 127.0.0.1:HOST_USER_PORT → guest :USER_LISTEN_PORT — the
+///     shell's `nettest-listen` opens a userspace TcpListener; we
+///     connect there from the host and exchange a byte pattern.
+///   - host TcpListener on `HOST_LISTEN_PORT` — `nettest-connect`
+///     opens an outbound TcpStream to 10.0.2.2:HOST_LISTEN_PORT (slirp
+///     NATs that back to the host); we accept and exchange bytes.
+fn qemu_smoke_net_userspace() -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root();
+
+    let nostd_target = root.join("target/aarch64-unknown-none/debug");
+    std::fs::create_dir_all(&nostd_target)?;
+    let hello_std = nostd_target.join("hello-std.stripped");
+    if !hello_std.exists() {
+        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
+    }
+
+    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
+    let kernel = elf_to_image(&kernel_elf)?;
+
+    let serial_log = root.join("target/qemu-smoke-net-userspace-serial.log");
+    let _ = std::fs::remove_file(&serial_log);
+
+    const HOST_CONSOLE_PORT: u16 = 5557;
+    const HOST_USER_PORT: u16 = 5558;
+    const USER_LISTEN_PORT: u16 = 7777;
+    const HOST_LISTEN_PORT: u16 = 5559;
+
+    // Start the host listener BEFORE QEMU so the guest's connect()
+    // finds it immediately when fired.
+    let host_listener = TcpListener::bind(("127.0.0.1", HOST_LISTEN_PORT))?;
+    host_listener.set_nonblocking(true)?;
+
+    println!();
+    println!("Launching QEMU userspace-net smoke test (timeout: 60s)...");
+    println!("  serial log: {}", serial_log.display());
+    println!("  hostfwd console: 127.0.0.1:{HOST_CONSOLE_PORT} -> guest :2323");
+    println!("  hostfwd user:    127.0.0.1:{HOST_USER_PORT} -> guest :{USER_LISTEN_PORT}");
+    println!("  outbound:        host listener on 127.0.0.1:{HOST_LISTEN_PORT} (guest sees 10.0.2.2:{HOST_LISTEN_PORT})");
+    println!();
+
+    let qemu_args = vec![
+        "-machine".to_string(), "virt,gic-version=3".to_string(),
+        "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-m".to_string(), "2G".to_string(),
+        "-display".to_string(), "none".to_string(),
+        "-device".to_string(), "ramfb".to_string(),
+        "-chardev".to_string(),
+        format!("file,id=c0,path={}", serial_log.display()),
+        "-serial".to_string(), "chardev:c0".to_string(),
+        "-netdev".to_string(),
+        format!(
+            "user,id=net0,hostfwd=tcp:127.0.0.1:{HOST_CONSOLE_PORT}-:2323,hostfwd=tcp:127.0.0.1:{HOST_USER_PORT}-:{USER_LISTEN_PORT}"
+        ),
+        "-device".to_string(), "virtio-net-device,netdev=net0".to_string(),
+        "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
+    ];
+
+    let mut child = Command::new("qemu-system-aarch64")
+        .args(&qemu_args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let result = (|| -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        // 1. DHCP.
+        wait_for_marker(&serial_log, "virtio-net: IP=", deadline)?;
+        println!("  [ok] DHCP bound");
+
+        // 2. Open the console.
+        let mut console = retry_connect(HOST_CONSOLE_PORT, deadline)?;
+        console.set_read_timeout(Some(Duration::from_millis(200)))?;
+        console.set_write_timeout(Some(Duration::from_secs(2)))?;
+        // The shell takes a moment to finish booting and emit the
+        // first prompt. drain_until_then_quiet keeps reading until it
+        // sees "bsh>" (a stable end-of-boot marker), then waits a brief
+        // quiet period for the post-prompt motd to land.
+        let initial = drain_until(&mut console, "bsh>", Duration::from_secs(15));
+        if !initial.contains("bsh>") {
+            anyhow::bail!("never saw the shell prompt: {initial:?}");
+        }
+        // Soak any remaining straggler bytes so subsequent reads only
+        // contain the post-command output.
+        let _ = drain_quiet(&mut console, Duration::from_millis(300), Duration::from_secs(2));
+        println!("  [ok] console connected, shell prompt visible");
+
+        // 3. nettest-listen: ask the shell to start a userspace
+        // listener on USER_LISTEN_PORT.
+        let cmd = format!("nettest-listen {USER_LISTEN_PORT}\n");
+        println!("  [..] writing {} bytes: {cmd:?}", cmd.len());
+        console.write_all(cmd.as_bytes())?;
+        console.flush()?;
+        let reply = drain_until(
+            &mut console,
+            &format!("listening on port {USER_LISTEN_PORT}"),
+            Duration::from_secs(5),
+        );
+        anyhow::ensure!(
+            reply.contains(&format!("listening on port {USER_LISTEN_PORT}")),
+            "shell never reported listen, got: {reply:?}"
+        );
+        println!("  [ok] shell opened userspace listener");
+
+        // 4. Connect from host to the guest's userspace listener and
+        // exchange a byte pattern.
+        let mut user = retry_connect(HOST_USER_PORT, Instant::now() + Duration::from_secs(10))?;
+        user.set_read_timeout(Some(Duration::from_millis(200)))?;
+        user.set_write_timeout(Some(Duration::from_secs(2)))?;
+        const PATTERN: &[u8] = b"abc123\n";
+        user.write_all(PATTERN)?;
+        let echoed = drain_quiet(&mut user, Duration::from_millis(500), Duration::from_secs(5));
+        anyhow::ensure!(
+            echoed.as_bytes().contains(&b'a') && echoed.contains("abc"),
+            "userspace listener didn't echo our bytes, got: {echoed:?}"
+        );
+        println!("  [ok] userspace listener echoed: {echoed:?}");
+        // Close — that triggers the shell's loop to wrap up via FIN.
+        drop(user);
+
+        // Wait for the shell prompt to come back.
+        let _ = drain_quiet(&mut console, Duration::from_millis(800), Duration::from_secs(8));
+        println!("  [ok] passive-open path verified");
+
+        // 5. nettest-connect: shell opens an outbound socket to the
+        // slirp gateway (10.0.2.2) on HOST_LISTEN_PORT. The host
+        // listener (started before QEMU) accepts it.
+        console.write_all(
+            format!("nettest-connect 10.0.2.2 {HOST_LISTEN_PORT}\n").as_bytes()
+        )?;
+
+        // Accept the inbound connection on the host listener.
+        let accept_deadline = Instant::now() + Duration::from_secs(15);
+        let (mut server, _peer) = loop {
+            match host_listener.accept() {
+                Ok(s) => break s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= accept_deadline {
+                        anyhow::bail!("host listener never received connection from guest");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => anyhow::bail!("host accept failed: {e}"),
+            }
+        };
+        println!("  [ok] guest connected to host listener");
+        server.set_read_timeout(Some(Duration::from_millis(500)))?;
+        server.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+        // Read what the guest sent.
+        let mut greeting = [0u8; 64];
+        let n = server.read(&mut greeting).unwrap_or(0);
+        let greeting_str = String::from_utf8_lossy(&greeting[..n]).to_string();
+        anyhow::ensure!(
+            greeting_str.contains("hi from BeetOS"),
+            "guest greeting missing, got: {greeting_str:?}"
+        );
+        println!("  [ok] guest sent: {greeting_str:?}");
+
+        // Reply, then close.
+        server.write_all(b"hello back\n")?;
+        drop(server);
+
+        // The shell's nettest-connect prints `recv: hello back` then
+        // closes — should appear on the console socket.
+        let reply = drain_until(&mut console, "recv: hello back", Duration::from_secs(8));
+        anyhow::ensure!(
+            reply.contains("recv: hello back"),
+            "shell didn't print recv from host, got: {reply:?}"
+        );
+        println!("  [ok] active-open path verified");
+
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    println!();
+    match result {
+        Ok(()) => {
+            println!("Result: NET USERSPACE SMOKE TEST PASSED");
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("Result: NET USERSPACE SMOKE TEST FAILED — {e}"),
+    }
+}
+
+fn retry_connect(port: u16, deadline: std::time::Instant) -> anyhow::Result<std::net::TcpStream> {
+    use std::time::Duration;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    anyhow::bail!("could not connect to 127.0.0.1:{port}: {last}")
+}
+
+fn drain_quiet(
+    stream: &mut std::net::TcpStream,
+    quiet: std::time::Duration,
+    overall: std::time::Duration,
+) -> String {
+    use std::io::Read;
+    use std::time::Instant;
+    let mut buf = [0u8; 1024];
+    let mut acc = String::new();
+    let deadline = Instant::now() + overall;
+    let mut last_byte_at = Instant::now();
+    while Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                last_byte_at = Instant::now();
+            }
+            Err(_) => {
+                if last_byte_at.elapsed() >= quiet {
+                    break;
+                }
+            }
+        }
+    }
+    acc
+}
+
+fn drain_until(
+    stream: &mut std::net::TcpStream,
+    needle: &str,
+    overall: std::time::Duration,
+) -> String {
+    use std::io::Read;
+    use std::time::Instant;
+    let mut buf = [0u8; 1024];
+    let mut acc = String::new();
+    let deadline = Instant::now() + overall;
+    while Instant::now() < deadline {
+        if acc.contains(needle) {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => acc.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(_) => continue,
+        }
+    }
+    acc
 }
 
 /// One full remote-console exchange: connect, read the banner, then

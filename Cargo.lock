@@ -82,6 +82,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "beetos-api-net"
+version = "0.1.0"
+dependencies = [
+ "xous",
+]
+
+[[package]]
 name = "beetos-api-procman"
 version = "0.1.0"
 

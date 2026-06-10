@@ -409,6 +409,15 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         SysCall::NetGetInfo => Ok(()),
         #[cfg(beetos)]
         SysCall::NetConsolePush(..) => Ok(()),
+        #[cfg(beetos)]
+        SysCall::NetSocketCreate
+        | SysCall::NetSocketListen(..)
+        | SysCall::NetSocketAccept(..)
+        | SysCall::NetSocketConnect(..)
+        | SysCall::NetSocketStatus(..)
+        | SysCall::NetSocketSend(..)
+        | SysCall::NetSocketRecv(..)
+        | SysCall::NetSocketClose(..) => Ok(()),
 
         // Notification syscalls
         #[cfg(beetos)]
@@ -716,6 +725,94 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             // No network stack on this platform yet.
             Ok(Result::Ok)
         }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetSocketCreate => {
+            use crate::platform::qemu_virt::tcp;
+            let pid = current_pid().get() as u32;
+            match tcp::user_create(pid) {
+                Some(sock) => Ok(Result::Scalar1(sock)),
+                None => Err(Error::OutOfMemory),
+            }
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetSocketListen(sock, port) => {
+            use crate::platform::qemu_virt::tcp;
+            tcp::user_listen(sock, port as u16).map(|_| Result::Ok).map_err(|_| Error::InvalidArguments)
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetSocketAccept(sock) => {
+            use crate::platform::qemu_virt::tcp;
+            // NO_PENDING (= u32::MAX) signals "no connection ready" —
+            // userspace polls until it sees a real child id.
+            let child = tcp::user_accept(sock).map(|i| i as usize).unwrap_or(tcp::NO_PENDING as usize);
+            Ok(Result::Scalar1(child))
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetSocketConnect(sock, peer_ip_be, peer_port) => {
+            use crate::platform::qemu_virt::tcp;
+            let ip_bytes = (peer_ip_be as u32).to_be_bytes();
+            tcp::user_connect(sock, ip_bytes, peer_port as u16)
+                .map(|_| Result::Ok)
+                .map_err(|_| Error::InvalidArguments)
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetSocketStatus(sock) => {
+            use crate::platform::qemu_virt::tcp;
+            let code = tcp::user_state(sock).map(|s| s.code()).unwrap_or(255);
+            let rx = tcp::user_rx_len(sock);
+            Ok(Result::Scalar2(code, rx))
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetSocketSend(sock, len, w0, w1, w2, w3) => {
+            use crate::platform::qemu_virt::tcp;
+            // Same PAN-safe inline unpacking as NetConsolePush.
+            let len = len.min(32);
+            let mut stage = [0u8; 32];
+            let words = [w0 as u64, w1 as u64, w2 as u64, w3 as u64];
+            for (i, word) in words.iter().enumerate() {
+                for j in 0..8 {
+                    stage[i * 8 + j] = ((word >> (j * 8)) & 0xff) as u8;
+                }
+            }
+            let n = tcp::user_send(sock, &stage[..len]).unwrap_or(0);
+            Ok(Result::Scalar1(n))
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetSocketRecv(sock, max_len) => {
+            use crate::platform::qemu_virt::tcp;
+            let max_len = max_len.min(32);
+            let mut stage = [0u8; 32];
+            let n = tcp::user_recv(sock, &mut stage[..max_len]).unwrap_or(0);
+            // Pack bytes back into four u64s little-endian.
+            let mut words = [0u64; 4];
+            for i in 0..4 {
+                let mut w = 0u64;
+                for j in 0..8 {
+                    w |= (stage[i * 8 + j] as u64) << (j * 8);
+                }
+                words[i] = w;
+            }
+            Ok(Result::Scalar5(n, words[0] as usize, words[1] as usize, words[2] as usize, words[3] as usize))
+        }
+
+        #[cfg(all(beetos, feature = "platform-qemu-virt"))]
+        SysCall::NetSocketClose(sock) => {
+            use crate::platform::qemu_virt::tcp;
+            tcp::user_close(sock).map(|_| Result::Ok).map_err(|_| Error::InvalidArguments)
+        }
+
+        #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]
+        SysCall::NetSocketCreate | SysCall::NetSocketListen(_, _) | SysCall::NetSocketAccept(_)
+        | SysCall::NetSocketConnect(_, _, _) | SysCall::NetSocketStatus(_)
+        | SysCall::NetSocketSend(_, _, _, _, _, _) | SysCall::NetSocketRecv(_, _)
+        | SysCall::NetSocketClose(_) => Err(Error::InvalidSyscall),
 
         #[cfg(beetos)]
         SysCall::GetBinaryName(index) => {

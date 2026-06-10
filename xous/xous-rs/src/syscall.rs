@@ -490,6 +490,81 @@ pub enum SysCall {
     #[cfg(beetos)]
     NetConsolePush(usize /* len */, usize /* w0 */, usize /* w1 */, usize /* w2 */, usize /* w3 */),
 
+    /// Allocate a fresh userspace TCP socket. The returned `sock_id`
+    /// is opaque (an index into the kernel's socket table).
+    ///
+    /// # Returns
+    /// * **Scalar1(sock_id)**: index of the newly allocated socket
+    ///
+    /// # Errors
+    /// * **OutOfMemory**: the socket table is full
+    #[cfg(beetos)]
+    NetSocketCreate,
+
+    /// Put a Closed socket into LISTEN on `port`.
+    ///
+    /// # Arguments
+    /// * `sock`: socket id from `NetSocketCreate`
+    /// * `port`: local port (1..65535; port 2323 is reserved for the kernel console)
+    #[cfg(beetos)]
+    NetSocketListen(usize /* sock */, usize /* port */),
+
+    /// Try to accept a pending incoming connection on a listener.
+    /// Non-blocking: returns the sentinel [`NO_PENDING`] if no child
+    /// has yet completed the three-way handshake.
+    ///
+    /// [`NO_PENDING`]: u32::MAX
+    ///
+    /// # Returns
+    /// * **Scalar1(child_sock_id_or_NO_PENDING)**
+    #[cfg(beetos)]
+    NetSocketAccept(usize /* sock */),
+
+    /// Initiate an active open to `(peer_ip, peer_port)`. Non-blocking:
+    /// the kernel issues an ARP request if needed and queues the SYN.
+    /// Caller polls `NetSocketStatus` until the state reaches
+    /// Established.
+    ///
+    /// # Arguments
+    /// * `sock`: socket id from `NetSocketCreate`
+    /// * `peer_ip`: IPv4 address packed as big-endian u32
+    /// * `peer_port`: destination port
+    #[cfg(beetos)]
+    NetSocketConnect(usize /* sock */, usize /* peer_ip_be */, usize /* peer_port */),
+
+    /// Query a socket's current state and pending-RX byte count.
+    ///
+    /// # Returns
+    /// * **Scalar2(state_code, rx_len)** — see [`net_sock_state`] for codes
+    #[cfg(beetos)]
+    NetSocketStatus(usize /* sock */),
+
+    /// Queue up to 32 bytes for transmission on `sock`. Bytes ride
+    /// inline in `w0..w3` (mirrors `NetConsolePush` layout). Returns
+    /// the number actually buffered.
+    #[cfg(beetos)]
+    NetSocketSend(
+        usize /* sock */,
+        usize /* len */,
+        usize /* w0 */,
+        usize /* w1 */,
+        usize /* w2 */,
+        usize /* w3 */,
+    ),
+
+    /// Drain up to 32 bytes from `sock`'s RX queue. Non-blocking:
+    /// returns `len=0` if no data is queued.
+    ///
+    /// # Returns
+    /// * **Scalar5(len, w0, w1, w2, w3)** — bytes packed little-endian
+    #[cfg(beetos)]
+    NetSocketRecv(usize /* sock */, usize /* max_len */),
+
+    /// Initiate close on `sock`. Sends FIN, drains TX, eventually frees
+    /// the slot. Returns immediately (no wait for TIME-WAIT).
+    #[cfg(beetos)]
+    NetSocketClose(usize /* sock */),
+
     /// Block the calling thread until any notification bits matching `mask`
     /// are set on the current process.  Returns the bits that fired
     /// (intersection of pending bits and mask) and clears them; the read
@@ -658,6 +733,14 @@ pub enum SysCallNumber {
     AcquireInputFocus = 67,
     ReleaseInputFocus = 68,
     NetConsolePush = 69,
+    NetSocketCreate = 70,
+    NetSocketListen = 71,
+    NetSocketAccept = 72,
+    NetSocketConnect = 73,
+    NetSocketStatus = 74,
+    NetSocketSend = 75,
+    NetSocketRecv = 76,
+    NetSocketClose = 77,
 
     Invalid,
 }
@@ -734,6 +817,14 @@ impl SysCallNumber {
             67 => AcquireInputFocus,
             68 => ReleaseInputFocus,
             69 => NetConsolePush,
+            70 => NetSocketCreate,
+            71 => NetSocketListen,
+            72 => NetSocketAccept,
+            73 => NetSocketConnect,
+            74 => NetSocketStatus,
+            75 => NetSocketSend,
+            76 => NetSocketRecv,
+            77 => NetSocketClose,
             _ => Invalid,
         }
     }
@@ -1104,6 +1195,38 @@ impl SysCall {
             SysCall::NetConsolePush(len, w0, w1, w2, w3) => {
                 [SysCallNumber::NetConsolePush as usize, *len, *w0, *w1, *w2, *w3, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::NetSocketCreate => {
+                [SysCallNumber::NetSocketCreate as usize, 0, 0, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::NetSocketListen(sock, port) => {
+                [SysCallNumber::NetSocketListen as usize, *sock, *port, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::NetSocketAccept(sock) => {
+                [SysCallNumber::NetSocketAccept as usize, *sock, 0, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::NetSocketConnect(sock, ip, port) => {
+                [SysCallNumber::NetSocketConnect as usize, *sock, *ip, *port, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::NetSocketStatus(sock) => {
+                [SysCallNumber::NetSocketStatus as usize, *sock, 0, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::NetSocketSend(sock, len, w0, w1, w2, w3) => {
+                [SysCallNumber::NetSocketSend as usize, *sock, *len, *w0, *w1, *w2, *w3, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::NetSocketRecv(sock, max_len) => {
+                [SysCallNumber::NetSocketRecv as usize, *sock, *max_len, 0, 0, 0, 0, 0]
+            }
+            #[cfg(beetos)]
+            SysCall::NetSocketClose(sock) => {
+                [SysCallNumber::NetSocketClose as usize, *sock, 0, 0, 0, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1313,6 +1436,22 @@ impl SysCall {
             SysCallNumber::ReleaseInputFocus => SysCall::ReleaseInputFocus,
             #[cfg(beetos)]
             SysCallNumber::NetConsolePush => SysCall::NetConsolePush(a1, a2, a3, a4, a5),
+            #[cfg(beetos)]
+            SysCallNumber::NetSocketCreate => SysCall::NetSocketCreate,
+            #[cfg(beetos)]
+            SysCallNumber::NetSocketListen => SysCall::NetSocketListen(a1, a2),
+            #[cfg(beetos)]
+            SysCallNumber::NetSocketAccept => SysCall::NetSocketAccept(a1),
+            #[cfg(beetos)]
+            SysCallNumber::NetSocketConnect => SysCall::NetSocketConnect(a1, a2, a3),
+            #[cfg(beetos)]
+            SysCallNumber::NetSocketStatus => SysCall::NetSocketStatus(a1),
+            #[cfg(beetos)]
+            SysCallNumber::NetSocketSend => SysCall::NetSocketSend(a1, a2, a3, a4, a5, a6),
+            #[cfg(beetos)]
+            SysCallNumber::NetSocketRecv => SysCall::NetSocketRecv(a1, a2),
+            #[cfg(beetos)]
+            SysCallNumber::NetSocketClose => SysCall::NetSocketClose(a1),
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1333,7 +1472,15 @@ impl SysCall {
             | SysCallNumber::ReleaseDisplay
             | SysCallNumber::AcquireInputFocus
             | SysCallNumber::ReleaseInputFocus
-            | SysCallNumber::NetConsolePush => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::NetConsolePush
+            | SysCallNumber::NetSocketCreate
+            | SysCallNumber::NetSocketListen
+            | SysCallNumber::NetSocketAccept
+            | SysCallNumber::NetSocketConnect
+            | SysCallNumber::NetSocketStatus
+            | SysCallNumber::NetSocketSend
+            | SysCallNumber::NetSocketRecv
+            | SysCallNumber::NetSocketClose => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }

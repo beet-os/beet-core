@@ -346,6 +346,8 @@ fn execute_line(line: &[u8]) {
         "blkinfo" => cmd_blkinfo(),
         "mem" => cmd_mem(),
         "ifconfig" => cmd_ifconfig(),
+        "nettest-listen" => cmd_nettest_listen(cmd_args),
+        "nettest-connect" => cmd_nettest_connect(cmd_args),
 
         // External programs (spawned via procman)
         _ => try_spawn_via_procman(cmd, cmd_args),
@@ -374,6 +376,8 @@ fn cmd_help() {
     puts("  blkinfo           Block device info\n");
     puts("  mem               Filesystem statistics\n");
     puts("  ifconfig          Show network interface configuration\n");
+    puts("  nettest-listen <port>     Echo server: listen, accept one, echo, close\n");
+    puts("  nettest-connect <ip> <port>   Connect, send 'hi', print reply, close\n");
 }
 
 fn cmd_echo(args: &[&str]) {
@@ -753,6 +757,200 @@ fn cmd_ifconfig() {
         }
         _ => puts("ifconfig: NetGetInfo syscall failed\n"),
     }
+}
+
+fn parse_u16(s: &str) -> Option<u16> {
+    let mut n: u32 = 0;
+    if s.is_empty() {
+        return None;
+    }
+    for b in s.bytes() {
+        if !(b'0'..=b'9').contains(&b) {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+        if n > 65535 {
+            return None;
+        }
+    }
+    Some(n as u16)
+}
+
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = s.split('.');
+    for slot in out.iter_mut() {
+        let part = parts.next()?;
+        let mut n: u32 = 0;
+        if part.is_empty() {
+            return None;
+        }
+        for b in part.bytes() {
+            if !(b'0'..=b'9').contains(&b) {
+                return None;
+            }
+            n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+            if n > 255 {
+                return None;
+            }
+        }
+        *slot = n as u8;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+fn cmd_nettest_listen(args: &[&str]) {
+    use beetos_api_net::{SockState, TcpListener};
+
+    let port = match args.first().and_then(|s| parse_u16(s)) {
+        Some(p) if p != 0 && p != 2323 => p,
+        _ => {
+            puts("usage: nettest-listen <port>  (1..65535, not 2323)\n");
+            return;
+        }
+    };
+
+    let listener = match TcpListener::bind(port) {
+        Some(l) => l,
+        None => {
+            puts("nettest-listen: bind failed\n");
+            return;
+        }
+    };
+
+    let _ = write!(DualWriter, "nettest: listening on port {}\n", port);
+
+    // Spin in try_accept until a client shows up. The kernel handles
+    // the SYN/ACK automatically; we just poll for the resulting
+    // Established child socket.
+    let mut spins = 0u64;
+    let mut stream = loop {
+        if let Some(s) = listener.try_accept() {
+            break s;
+        }
+        xous::yield_slice();
+        spins += 1;
+        // 30 s wall-clock-ish timeout (yield_slice is ~1 ms in our
+        // scheduler).
+        if spins > 30_000 {
+            puts("nettest-listen: timeout waiting for client\n");
+            return;
+        }
+    };
+
+    puts("nettest: client connected, echoing...\n");
+
+    let mut buf = [0u8; 32];
+    let mut quiet = 0u64;
+    loop {
+        let n = stream.recv(&mut buf);
+        if n > 0 {
+            stream.send_all(&buf[..n]);
+            quiet = 0;
+        } else {
+            xous::yield_slice();
+            quiet += 1;
+            if quiet > 5_000 {
+                // Client went silent for ~5s. Wrap up.
+                break;
+            }
+        }
+        match stream.state() {
+            SockState::Established | SockState::CloseWait => {}
+            _ => break,
+        }
+    }
+
+    puts("nettest: client done, closing\n");
+    stream.close();
+}
+
+fn cmd_nettest_connect(args: &[&str]) {
+    use beetos_api_net::{SockState, TcpStream};
+
+    let (ip, port) = match (
+        args.first().and_then(|s| parse_ipv4(s)),
+        args.get(1).and_then(|s| parse_u16(s)),
+    ) {
+        (Some(ip), Some(port)) if port != 0 => (ip, port),
+        _ => {
+            puts("usage: nettest-connect <ip> <port>\n");
+            return;
+        }
+    };
+
+    let _ = write!(
+        DualWriter,
+        "nettest: connecting to {}.{}.{}.{}:{}...\n",
+        ip[0], ip[1], ip[2], ip[3], port,
+    );
+
+    let mut stream = match TcpStream::connect(ip, port) {
+        Some(s) => s,
+        None => {
+            puts("nettest-connect: connect failed\n");
+            return;
+        }
+    };
+
+    // Wait for handshake to complete (ARP request + SYN/SYN-ACK/ACK).
+    let mut spins = 0u64;
+    loop {
+        match stream.state() {
+            SockState::Established => break,
+            SockState::SynSent => {}
+            other => {
+                let _ = write!(DualWriter, "nettest-connect: unexpected state {:?}\n", other);
+                return;
+            }
+        }
+        xous::yield_slice();
+        spins += 1;
+        if spins > 10_000 {
+            puts("nettest-connect: timeout waiting for Established\n");
+            return;
+        }
+    }
+    puts("nettest: connected\n");
+
+    let sent = stream.send_all(b"hi from BeetOS\n");
+    let _ = write!(DualWriter, "nettest: sent {} bytes\n", sent);
+
+    let mut buf = [0u8; 32];
+    let mut quiet = 0u64;
+    let mut got_any = false;
+    loop {
+        let n = stream.recv(&mut buf);
+        if n > 0 {
+            puts("nettest: recv: ");
+            for &b in &buf[..n] {
+                if (0x20..=0x7e).contains(&b) || b == b'\n' {
+                    putc(b);
+                } else {
+                    putc(b'.');
+                }
+            }
+            if buf[n - 1] != b'\n' {
+                putc(b'\n');
+            }
+            got_any = true;
+            quiet = 0;
+        } else {
+            xous::yield_slice();
+            quiet += 1;
+            if quiet > 3_000 {
+                break;
+            }
+        }
+        if got_any && !matches!(stream.state(), SockState::Established) {
+            break;
+        }
+    }
+    puts("nettest: done\n");
+    stream.close();
 }
 
 fn cmd_mem() {

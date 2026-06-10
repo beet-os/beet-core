@@ -166,6 +166,9 @@ fn handle_irq() -> bool {
                 // input segment (e.g. the reply to `ifconfig` when the
                 // client is silent) never leaves the box.
                 crate::platform::qemu_virt::tcp::tick_flush_console();
+                // Drain queued TX on userspace sockets and retry
+                // ARP-deferred connects.
+                crate::platform::qemu_virt::tcp::tick_flush_user();
                 // Refresh the desktop once per second so the taskbar
                 // clock advances without the user having to type anything.
                 crate::platform::qemu_virt::fb::tick_recompose_if_due(count);

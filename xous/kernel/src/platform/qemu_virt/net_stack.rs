@@ -45,6 +45,98 @@ static mut STATE: NetState = NetState {
     req_retries: 0,
 };
 
+// ============================================================================
+// ARP cache
+// ============================================================================
+//
+// Tiny LRU-replacement cache for IP→MAC. Sized for the V1 use case
+// (gateway + 1-2 peers); rolls oldest entry on overflow.
+
+const ARP_CACHE_SIZE: usize = 4;
+
+#[derive(Clone, Copy)]
+struct ArpEntry {
+    ip: [u8; 4],
+    mac: [u8; 6],
+    valid: bool,
+}
+
+static mut ARP_CACHE: [ArpEntry; ARP_CACHE_SIZE] = [
+    ArpEntry { ip: [0; 4], mac: [0; 6], valid: false }; ARP_CACHE_SIZE
+];
+static mut ARP_LRU: usize = 0;
+
+fn arp_cache_insert(ip: [u8; 4], mac: [u8; 6]) {
+    unsafe {
+        let cache = &mut *(&raw mut ARP_CACHE);
+        // Update existing entry if present.
+        for e in cache.iter_mut() {
+            if e.valid && e.ip == ip {
+                e.mac = mac;
+                return;
+            }
+        }
+        // Otherwise drop into a free slot, else the LRU one.
+        for e in cache.iter_mut() {
+            if !e.valid {
+                e.ip = ip;
+                e.mac = mac;
+                e.valid = true;
+                return;
+            }
+        }
+        let idx = ARP_LRU;
+        cache[idx] = ArpEntry { ip, mac, valid: true };
+        ARP_LRU = (ARP_LRU + 1) % ARP_CACHE_SIZE;
+    }
+}
+
+/// Look up an IP in the ARP cache. Returns `None` if no entry —
+/// caller should issue an [`arp_request`] and retry later.
+pub fn arp_lookup(ip: [u8; 4]) -> Option<[u8; 6]> {
+    unsafe {
+        let cache = &*(&raw const ARP_CACHE);
+        for e in cache.iter() {
+            if e.valid && e.ip == ip {
+                return Some(e.mac);
+            }
+        }
+    }
+    None
+}
+
+/// Send an ARP request for `target_ip`. The reply (when it arrives)
+/// will populate the cache via [`handle_arp`]. Caller polls
+/// [`arp_lookup`] until it returns Some.
+pub fn arp_request(target_ip: [u8; 4]) {
+    let our_ip = unsafe { STATE.ip };
+    if our_ip == [0, 0, 0, 0] {
+        return;
+    }
+    let our_mac = match net::get_mac() {
+        Some(m) => m,
+        None => return,
+    };
+
+    let mut pkt = [0u8; 42];
+    // Ethernet: broadcast destination.
+    pkt[0..6].copy_from_slice(&[0xFF; 6]);
+    pkt[6..12].copy_from_slice(&our_mac);
+    pkt[12..14].copy_from_slice(&[0x08, 0x06]);
+    // ARP request.
+    let a = &mut pkt[14..];
+    a[0..2].copy_from_slice(&[0x00, 0x01]);
+    a[2..4].copy_from_slice(&[0x08, 0x00]);
+    a[4] = 6;
+    a[5] = 4;
+    a[6..8].copy_from_slice(&[0x00, 0x01]); // op: request
+    a[8..14].copy_from_slice(&our_mac);
+    a[14..18].copy_from_slice(&our_ip);
+    a[18..24].copy_from_slice(&[0; 6]); // target hw addr: unknown
+    a[24..28].copy_from_slice(&target_ip);
+    net::send_packet(&pkt);
+}
+
 /// Retry DHCP every 2 seconds (200 ticks at 100 Hz).
 const DHCP_RETRY_TICKS: u64 = 200;
 
@@ -116,6 +208,11 @@ pub fn get_ip() -> [u8; 4] {
     unsafe { STATE.ip }
 }
 
+/// Returns the DHCP-learned default gateway IP (all zeros if not bound).
+pub fn get_gateway() -> [u8; 4] {
+    unsafe { STATE.gateway }
+}
+
 // ============================================================================
 // Packet processing
 // ============================================================================
@@ -138,8 +235,29 @@ fn handle_arp(arp: &[u8]) {
         return;
     }
     let op = u16::from_be_bytes([arp[6], arp[7]]);
+
+    let sender_mac: [u8; 6] = match arp[8..14].try_into() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let sender_ip: [u8; 4] = match arp[14..18].try_into() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Every ARP packet (request or reply) carries the sender's
+    // IP↔MAC binding — cache it. This catches the gateway's MAC
+    // for free on slirp's gratuitous-ARP-like exchange.
+    if sender_ip != [0; 4] {
+        arp_cache_insert(sender_ip, sender_mac);
+    }
+
+    if op == 2 {
+        // Reply — cache already updated above, nothing else to do.
+        return;
+    }
     if op != 1 {
-        return; // only handle ARP requests
+        return;
     }
 
     let target_ip: [u8; 4] = match arp[24..28].try_into() {
@@ -151,14 +269,6 @@ fn handle_arp(arp: &[u8]) {
         return; // not for us or no IP yet
     }
 
-    let sender_mac: [u8; 6] = match arp[8..14].try_into() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let sender_ip: [u8; 4] = match arp[14..18].try_into() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
     let our_mac = match net::get_mac() {
         Some(m) => m,
         None => return,
