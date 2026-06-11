@@ -56,8 +56,10 @@ beetos/         ← shared no_std crate
                   ├ gfx — software 2D rasterizer (Surface, primitives)
                   └ gui — fixed-size window manager + widget framework
                     (see docs/gui.md)
-api/            ← BeetOS service APIs (console, keyboard, storage, net)
+api/            ← BeetOS service APIs (console, keyboard, storage,
+                  block, net, cryptblock, fs, procman)
 os/             ← BeetOS service implementations / drivers
+                  (fs, block, console, …)
 apps/           ← user applications (shell)
 loader/         ← loads kernel + services into RAM
 boot/m1n1/      ← git submodule (Asahi bootloader)
@@ -86,8 +88,17 @@ BeetOS has an allocation-free GUI layer living in the `beetos` crate
   `MandelState`, mouse cursor sprite, keyboard routing via
   `handle_key` (Tab/Shift+arrow/Ctrl+arrow/Shift+Enter),
   `compose_animated` for timer-driven animation.
-- Kernel-side seam: `qemu_virt::fb::with_wm`, `compose_desktop`,
-  `tick_recompose_if_due` (called from the 100 Hz timer IRQ at ~10 Hz).
+- Kernel-side seam: `qemu_virt::fb::with_wm`, `compose_desktop`.
+  **Composition is deferred**: IRQ handlers (timer 10 Hz cadence,
+  keyboard, tablet) only *request* a repaint via flag; the actual
+  paint runs from the kernel idle loop with IRQs unmasked
+  (`fb::idle_compose_if_requested`, called by
+  `arch/aarch64/irq.rs::idle_wait_then_load`). Never call
+  `compose_desktop()` from IRQ context — one full compose masks IRQs
+  for ~90 ms in a debug build (lost UART input, late virtio rings,
+  poisoned in-guest measurements). While a paint walks the
+  WindowManager, concurrent keys are parked in a small ring and
+  re-routed after; pointer events are dropped (next motion re-syncs).
   Keyboard events from virtio-input go through the WindowManager
   first in `arch/aarch64/irq.rs::dispatch_input_char`; unconsumed
   keys still flow to the existing IPC path so the shell keeps working.
@@ -98,19 +109,28 @@ built straight on top of Rust GPU drivers (VC7/AGX/virtio-gpu),
 explicitly bypassing the Vulkan/Metal layer.
 
 Reproducible visuals:
-- `cargo xtask qemu-smoke` — boot check, 9 progress markers, exits 0/1
 - `cargo xtask qemu-screenshot [--wait SECS] [--out PATH]` — capture
   the FB via QMP `screendump`, PPM → PNG via ImageMagick
+- `cargo xtask qemu-animation [--frames N]` — stitched GIF, proves the
+  10 Hz deferred compose animates
 
-Performance gate:
+Performance gate (full docs: `docs/benchmarks.md` — **read it before
+touching kernel hot paths or adding in-guest timing**):
 - `cargo xtask qemu-bench [--update] [--tolerance PCT]` — kernel
   micro-benchmarks (null syscall, yield, IPC round-trip, page
   map/unmap, 16K memcpy) run by the shell's `bench` command, timed
   with CNTVCT_EL0 under QEMU `-icount` (deterministic: 1 ns = 1
-  instruction). Compares against `xtask/qemu-bench-baseline.txt`
-  (±30% default); rerun with `--update` after an intentional perf
-  change. `cpu_mix` is a pure-CPU calibration point — if it moves,
-  blame the environment (QEMU version), not the kernel.
+  instruction, run-to-run ±0.1%). Compares against
+  `xtask/qemu-bench-baseline.txt` (±30% default); rerun with
+  `--update` after an intentional perf change. `cpu_mix` is a
+  pure-CPU calibration point — if it moves, blame the environment
+  (QEMU version), not the kernel.
+- Run it before/after any change to syscalls, scheduler, IPC, or mem.
+  Numbers are debug-build instruction counts, not real-world time.
+- The bench boots **headless on purpose**: with ramfb present the
+  10 Hz desktop compose (~90 ms/frame in debug) lands in measurement
+  windows phase-dependently and once inflated `yield` 12×. Any new
+  in-guest timing must boot headless or account for the idle compose.
 
 ## How to Develop (hosted mode)
 
@@ -223,6 +243,18 @@ These are C files. Reimplement the protocol in Rust — do not translate C line-
 2. **QEMU virt** (`cargo xtask qemu`): Tests real AArch64 arch code (page tables, exceptions, context switch) on standard hardware (GIC, PL011). Any developer can run this. Ideal for CI.
 3. **Apple M1 hardware** (via m1n1 USB proxy): Tests Apple platform code, real drivers. 7-second cycle. Requires physical hardware.
 4. **Conditional compilation**: `#[cfg(beetos)]` for hardware paths, `#[cfg(not(beetos))]` for hosted paths. `#[cfg(test)]` for unit tests.
+
+**QEMU CI suite** — run the relevant ones before pushing; all of them
+for kernel-level changes:
+
+| command | covers |
+|---|---|
+| `cargo xtask qemu-smoke` | boot markers, disk attached, shell up (13 markers) |
+| `cargo xtask qemu-smoke-nodisk` | graceful degradation without a disk |
+| `cargo xtask qemu-smoke-net` | DHCP, TCP remote console, `ifconfig`, `ping` end-to-end |
+| `cargo xtask qemu-smoke-net-userspace` | `api/net` sockets: listen (passive) + connect (active) |
+| `cargo xtask qemu-smoke-crypt` | `api/cryptblock`: two boots — format/seal/read, plaintext absent from the host image, wrong-passphrase rejection, decrypt-after-reboot |
+| `cargo xtask qemu-bench` | kernel perf gate (see `docs/benchmarks.md`) |
 
 ## Git Workflow
 
