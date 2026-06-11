@@ -14,6 +14,7 @@ xous = { path = "../../xous/xous-rs" }
 beetos = { path = "../../beetos" }
 beetos-api-fs = { path = "../../api/fs" }
 beetos-api-block = { path = "../../api/block" }
+beetos-api-cryptblock = { path = "../../api/cryptblock" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beetos)'] }

@@ -1480,7 +1480,8 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
 
     const HOST_CONSOLE_PORT: u16 = 5562;
     const PASS: &str = "p4ss-crypt-smoke";
-    const SECRET: &str = "CRYPT_SMOKE_SECRET_42";
+    // ≤16 bytes: `write` packs content into two scalar words.
+    const SECRET: &str = "S3CR3T_M8_OK_42";
 
     let root = workspace_root();
 
@@ -1557,16 +1558,17 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
         Ok(())
     };
 
-    // ── Boot 1: format, seal, read back ────────────────────────────
+    // ── Boot 1: format, write a /data file, read it back ───────────
     let (mut child, serial1) = boot("boot1")?;
     let result1 = (|| -> anyhow::Result<()> {
         let mut console = connect_console(&serial1)?;
-        cmd(&mut console, &format!("cryptfmt {PASS}"), "session open")?;
-        println!("  [ok] area formatted");
-        cmd(&mut console, &format!("cwrite 3 {SECRET}"), "sealed")?;
-        println!("  [ok] secret sealed into slot 3");
-        cmd(&mut console, "cread 3", SECRET)?;
-        println!("  [ok] decrypts in-session");
+        cmd(&mut console, &format!("cryptfmt {PASS}"), "formatted and unlocked")?;
+        println!("  [ok] /data formatted");
+        cmd(&mut console, &format!("write /data/secret {SECRET}"), "bsh>")?;
+        cmd(&mut console, "cat /data/secret", SECRET)?;
+        println!("  [ok] /data/secret written + decrypts in-session");
+        cmd(&mut console, "ls /data", "secret (")?;
+        println!("  [ok] ls /data lists the file");
         Ok(())
     })();
     let _ = child.kill();
@@ -1588,18 +1590,24 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
     );
     println!("  [ok] header magic present");
 
-    // ── Boot 2: auth + persistence across reboot ───────────────────
+    // ── Boot 2: locked behaviour, auth, persistence ────────────────
     let (mut child, serial2) = boot("boot2")?;
     let result2 = (|| -> anyhow::Result<()> {
         let mut console = connect_console(&serial2)?;
-        cmd(&mut console, "cryptopen totally-wrong", "BadPassphrase")?;
+        cmd(&mut console, "cat /data/secret", "locked (cryptopen first)")?;
+        println!("  [ok] /data refuses reads while locked");
+        cmd(&mut console, "cryptopen totally-wrong", "bad passphrase")?;
         println!("  [ok] wrong passphrase rejected");
-        cmd(&mut console, &format!("cryptopen {PASS}"), "session open")?;
+        cmd(&mut console, &format!("cryptopen {PASS}"), "unlocked")?;
         println!("  [ok] reopened after reboot");
-        cmd(&mut console, "cread 3", SECRET)?;
-        println!("  [ok] slot decrypts across reboot");
-        cmd(&mut console, "cread 7", "Empty")?;
-        println!("  [ok] untouched slot reads Empty");
+        cmd(&mut console, "cat /data/secret", SECRET)?;
+        println!("  [ok] file decrypts across reboot");
+        cmd(&mut console, "rm /data/secret", "bsh>")?;
+        cmd(&mut console, "cat /data/secret", "not found")?;
+        println!("  [ok] rm erases the slot");
+        cmd(&mut console, "cryptlock", "locked")?;
+        cmd(&mut console, "ls /data", "locked (cryptopen first)")?;
+        println!("  [ok] cryptlock drops the session");
         Ok(())
     })();
     let _ = child.kill();

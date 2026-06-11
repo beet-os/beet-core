@@ -349,6 +349,20 @@ mod disk {
             let sector = Self::read_sector(&self.client, buf, lba)?;
             open_sector(&self.key, lba, &sector)
         }
+
+        /// Erase `slot` back to the never-written state (raw zero
+        /// sector — subsequent reads return [`CryptError::Empty`]).
+        pub fn erase_slot(
+            &self,
+            buf: xous::MemoryRange,
+            slot: u64,
+        ) -> Result<(), CryptError> {
+            if slot >= CRYPT_SLOTS {
+                return Err(CryptError::BadArgument);
+            }
+            let lba = self.base_lba + 1 + slot;
+            Self::write_sector(&self.client, buf, lba, &[0u8; SECTOR_SIZE])
+        }
     }
 }
 

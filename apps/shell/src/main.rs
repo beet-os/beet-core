@@ -358,8 +358,7 @@ fn execute_line(line: &[u8]) {
         "dwrite" => cmd_dwrite(cmd_args, line_str),
         "cryptfmt" => cmd_cryptfmt(cmd_args),
         "cryptopen" => cmd_cryptopen(cmd_args),
-        "cwrite" => cmd_cwrite(cmd_args, line_str),
-        "cread" => cmd_cread(cmd_args),
+        "cryptlock" => cmd_cryptlock(),
         "mem" => cmd_mem(),
         "ifconfig" => cmd_ifconfig(),
         "ping" => cmd_ping(cmd_args),
@@ -394,10 +393,9 @@ fn cmd_help() {
     puts("  blkinfo           Block device info\n");
     puts("  dread <lba>       Read one 512-byte block (printable preview)\n");
     puts("  dwrite <lba> <text>  Write one 512-byte block (zero-padded)\n");
-    puts("  cryptfmt <pass>   Format the encrypted area (AES-256-GCM)\n");
-    puts("  cryptopen <pass>  Open the encrypted area\n");
-    puts("  cwrite <slot> <text>  Seal text into an encrypted slot\n");
-    puts("  cread <slot>      Decrypt + authenticate a slot\n");
+    puts("  cryptfmt <pass>   Format the encrypted /data area (AES-256-GCM)\n");
+    puts("  cryptopen <pass>  Unlock /data (then use write/cat/ls/rm on /data/...)\n");
+    puts("  cryptlock         Lock /data (drop the key)\n");
     puts("  mem               Filesystem statistics\n");
     puts("  ifconfig          Show network interface configuration\n");
     puts("  ping <ip> [count] ICMP echo (default 4 packets)\n");
@@ -613,6 +611,9 @@ fn cmd_ls(args: &[&str]) {
         Some(code) if code == FsError::NotFound as usize => {
             let _ = write!(DualWriter, "ls: {}: not found\n", path);
         }
+        Some(code) if code == FsError::Locked as usize => {
+            let _ = write!(DualWriter, "ls: {}: locked (cryptopen first)\n", path);
+        }
         Some(code) if code == FsError::NotDirectory as usize => {
             let _ = write!(DualWriter, "ls: {}: not a directory\n", path);
         }
@@ -638,6 +639,12 @@ fn cmd_cat(args: &[&str]) {
         }
         Some(code) if code == FsError::InvalidPath as usize => {
             let _ = write!(DualWriter, "cat: {}: invalid path\n", path);
+        }
+        Some(code) if code == FsError::Locked as usize => {
+            let _ = write!(DualWriter, "cat: {}: locked (cryptopen first)\n", path);
+        }
+        Some(code) if code == FsError::Corrupt as usize => {
+            let _ = write!(DualWriter, "cat: {}: CORRUPT (auth failed)\n", path);
         }
         None => puts("cat: fs service not available\n"),
         _ => puts("cat: error\n"),
@@ -674,6 +681,9 @@ fn cmd_write(args: &[&str], full_line: &str) {
         }
         Some(code) if code == FsError::IsDirectory as usize => {
             let _ = write!(DualWriter, "write: {}: is a directory\n", path);
+        }
+        Some(code) if code == FsError::Locked as usize => {
+            let _ = write!(DualWriter, "write: {}: locked (cryptopen first)\n", path);
         }
         Some(code) if code == FsError::NoSpace as usize => {
             puts("write: no space left\n");
@@ -722,6 +732,9 @@ fn cmd_rm(args: &[&str]) {
         }
         Some(code) if code == FsError::NotEmpty as usize => {
             let _ = write!(DualWriter, "rm: {}: directory not empty\n", args[0]);
+        }
+        Some(code) if code == FsError::Locked as usize => {
+            let _ = write!(DualWriter, "rm: {}: locked (cryptopen first)\n", args[0]);
         }
         Some(code) if code == FsError::ReadOnly as usize => {
             let _ = write!(DualWriter, "rm: {}: read-only\n", args[0]);
@@ -852,36 +865,22 @@ fn cmd_dwrite(args: &[&str], line: &str) {
 }
 
 // ============================================================================
-// Encrypted area (api/cryptblock — AES-256-GCM over the block service)
+// Encrypted /data area (owned by the fs service; we just send ops)
 // ============================================================================
-
-/// Session state: the open CryptDisk (passphrase already verified).
-/// One slot is plenty for the shell.
-static mut CRYPT_SESSION: Option<beetos_api_cryptblock::CryptDisk> = None;
-
-fn crypt_session() -> Option<beetos_api_cryptblock::CryptDisk> {
-    unsafe { *core::ptr::addr_of!(CRYPT_SESSION) }
-}
 
 fn cmd_cryptfmt(args: &[&str]) {
     let pass = match args.first() {
         Some(p) if !p.is_empty() => *p,
         _ => { puts("usage: cryptfmt <passphrase>\n"); return; }
     };
-    let Some((client, buf)) = open_block("cryptfmt") else { return };
-    match beetos_api_cryptblock::CryptDisk::format(client, buf, pass.as_bytes()) {
-        Ok(disk) => {
-            unsafe { CRYPT_SESSION = Some(disk) };
-            let _ = write!(
-                DualWriter,
-                "cryptfmt: formatted ({} slots of {} bytes), session open\n",
-                beetos_api_cryptblock::CRYPT_SLOTS,
-                beetos_api_cryptblock::SLOT_PAYLOAD,
-            );
+    // The buffer op's "path" field carries the passphrase.
+    match fs_buf_op(FsOp::CryptFormat, pass) {
+        Some(code) if code == FsError::Ok as usize => {
+            puts("cryptfmt: /data formatted and unlocked\n");
         }
-        Err(e) => { let _ = write!(DualWriter, "cryptfmt: FAILED ({:?})\n", e); }
+        Some(code) => { let _ = write!(DualWriter, "cryptfmt: error {}\n", code); }
+        None => puts("cryptfmt: fs service not available\n"),
     }
-    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
 }
 
 fn cmd_cryptopen(args: &[&str]) {
@@ -889,72 +888,26 @@ fn cmd_cryptopen(args: &[&str]) {
         Some(p) if !p.is_empty() => *p,
         _ => { puts("usage: cryptopen <passphrase>\n"); return; }
     };
-    let Some((client, buf)) = open_block("cryptopen") else { return };
-    match beetos_api_cryptblock::CryptDisk::open(client, buf, pass.as_bytes()) {
-        Ok(disk) => {
-            unsafe { CRYPT_SESSION = Some(disk) };
-            puts("cryptopen: session open\n");
+    match fs_buf_op(FsOp::CryptOpen, pass) {
+        Some(code) if code == FsError::Ok as usize => {
+            puts("cryptopen: /data unlocked\n");
         }
-        Err(e) => {
-            unsafe { CRYPT_SESSION = None };
-            let _ = write!(DualWriter, "cryptopen: FAILED ({:?})\n", e);
+        Some(code) if code == FsError::Locked as usize => {
+            puts("cryptopen: bad passphrase\n");
         }
+        Some(code) if code == FsError::NotFound as usize => {
+            puts("cryptopen: /data not formatted (cryptfmt first)\n");
+        }
+        Some(code) => { let _ = write!(DualWriter, "cryptopen: error {}\n", code); }
+        None => puts("cryptopen: fs service not available\n"),
     }
-    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
 }
 
-fn cmd_cwrite(args: &[&str], line: &str) {
-    let slot = match args.first().and_then(|s| parse_u64(s)) {
-        Some(v) => v,
-        None => { puts("usage: cwrite <slot> <text>\n"); return; }
-    };
-    let mut tokens = line.split_whitespace();
-    tokens.next(); // cwrite
-    tokens.next(); // slot
-    let payload = match tokens.next() {
-        Some(p) => p,
-        None => { puts("usage: cwrite <slot> <text>\n"); return; }
-    };
-    let Some(disk) = crypt_session() else {
-        puts("cwrite: no open session (cryptfmt/cryptopen first)\n");
-        return;
-    };
-    let Some((_, buf)) = open_block("cwrite") else { return };
-    match disk.write_slot(buf, slot, payload.as_bytes()) {
-        Ok(()) => {
-            let _ = write!(
-                DualWriter,
-                "cwrite: sealed {} byte(s) into slot {}\n",
-                payload.len(), slot,
-            );
-        }
-        Err(e) => { let _ = write!(DualWriter, "cwrite: FAILED ({:?})\n", e); }
+fn cmd_cryptlock() {
+    match fs_scalar(FsOp::CryptLock, 0, 0, 0, 0) {
+        Some(code) if code == FsError::Ok as usize => puts("cryptlock: /data locked\n"),
+        _ => puts("cryptlock: failed\n"),
     }
-    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
-}
-
-fn cmd_cread(args: &[&str]) {
-    let slot = match args.first().and_then(|s| parse_u64(s)) {
-        Some(v) => v,
-        None => { puts("usage: cread <slot>\n"); return; }
-    };
-    let Some(disk) = crypt_session() else {
-        puts("cread: no open session (cryptfmt/cryptopen first)\n");
-        return;
-    };
-    let Some((_, buf)) = open_block("cread") else { return };
-    match disk.read_slot(buf, slot) {
-        Ok(plain) => {
-            let stop = plain.iter().position(|&b| b == 0).unwrap_or(plain.len());
-            let _ = write!(DualWriter, "slot {}: ", slot);
-            for &b in &plain[..stop] {
-                if (0x20..=0x7e).contains(&b) { putc(b); } else { putc(b'.'); }
-            }
-            putc(b'\n');
-        }
-        Err(e) => { let _ = write!(DualWriter, "cread: FAILED ({:?})\n", e); }
-    }
-    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
 }
 
 fn cmd_ifconfig() {

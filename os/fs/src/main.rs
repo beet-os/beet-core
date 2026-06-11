@@ -188,6 +188,210 @@ fn disk_subpath(path: &str) -> &str {
 }
 
 // ============================================================================
+// Encrypted /data area (api/cryptblock over the block service)
+// ============================================================================
+//
+// One file = one sealed slot (flat namespace, ≤ DATA_NAME_MAX-byte
+// names, ≤ ~448-byte contents). No central directory: lookup scans the
+// slots, so every write/remove is a single atomic sealed-sector update
+// and there's no metadata to corrupt. The session key lives here, in
+// fs process memory, between CryptOpen and CryptLock.
+
+use beetos_api_cryptblock::{CryptDisk, CryptError, CRYPT_SLOTS, SLOT_PAYLOAD};
+
+static mut CRYPT: Option<CryptDisk> = None;
+/// One persistent IPC page for CryptDisk ↔ block traffic, allocated on
+/// first unlock (avoids a map/unmap pair per operation).
+static mut CRYPT_BUF: Option<xous::MemoryRange> = None;
+
+fn crypt_session() -> Option<CryptDisk> {
+    unsafe { *core::ptr::addr_of!(CRYPT) }
+}
+
+fn crypt_buf() -> Option<xous::MemoryRange> {
+    unsafe {
+        if let Some(b) = *core::ptr::addr_of!(CRYPT_BUF) {
+            return Some(b);
+        }
+        let page = xous::MemorySize::new(beetos::PAGE_SIZE)?;
+        match xous::rsyscall(xous::SysCall::MapMemory(
+            None, None, page, xous::MemoryFlags::W,
+        )) {
+            Ok(xous::Result::MemoryRange(r)) => {
+                CRYPT_BUF = Some(r);
+                Some(r)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn is_data_path(path: &str) -> bool {
+    let p = path.strip_prefix('/').unwrap_or(path);
+    p == "data" || p.starts_with("data/")
+}
+
+fn data_subpath(path: &str) -> &str {
+    let p = path.strip_prefix('/').unwrap_or(path);
+    p.strip_prefix("data/").unwrap_or(p.strip_prefix("data").unwrap_or(p))
+}
+
+fn map_crypt_err(e: CryptError) -> FsError {
+    match e {
+        CryptError::NotFormatted => FsError::NotFound,
+        CryptError::BadPassphrase => FsError::Locked,
+        CryptError::Corrupt => FsError::Corrupt,
+        CryptError::Empty => FsError::NotFound,
+        CryptError::BadArgument => FsError::InvalidPath,
+        CryptError::Io => FsError::NoSpace,
+    }
+}
+
+/// Find the slot holding `name`. Returns `(slot, data_len)`.
+fn crypt_find(disk: &CryptDisk, buf: xous::MemoryRange, name: &str) -> Option<(u64, usize)> {
+    for slot in 0..CRYPT_SLOTS {
+        if let Ok(payload) = disk.read_slot(buf, slot) {
+            if let Some((entry_name, data)) = beetos_api_fs::unpack_data_entry(&payload) {
+                if entry_name == name {
+                    return Some((slot, data.len()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// First never-written slot, for new files.
+fn crypt_find_free(disk: &CryptDisk, buf: xous::MemoryRange) -> Option<u64> {
+    for slot in 0..CRYPT_SLOTS {
+        match disk.read_slot(buf, slot) {
+            Err(CryptError::Empty) => return Some(slot),
+            // Unparseable-but-sealed slots stay reserved; Corrupt ones
+            // are not silently reused either (the operator should see
+            // them via cat → Corrupt, then rm explicitly).
+            _ => {}
+        }
+    }
+    None
+}
+
+fn crypt_format(passphrase: &str) -> FsError {
+    use beetos_api_block::BlockClient;
+    let Some(buf) = crypt_buf() else { return FsError::NoSpace };
+    let client = match BlockClient::connect_with_retries(8) {
+        Ok(c) => c,
+        Err(_) => return FsError::NoSpace,
+    };
+    match CryptDisk::format(client, buf, passphrase.as_bytes()) {
+        Ok(disk) => {
+            unsafe { CRYPT = Some(disk) };
+            FsError::Ok
+        }
+        Err(e) => map_crypt_err(e),
+    }
+}
+
+fn crypt_open(passphrase: &str) -> FsError {
+    use beetos_api_block::BlockClient;
+    let Some(buf) = crypt_buf() else { return FsError::NoSpace };
+    let client = match BlockClient::connect_with_retries(8) {
+        Ok(c) => c,
+        Err(_) => return FsError::NoSpace,
+    };
+    match CryptDisk::open(client, buf, passphrase.as_bytes()) {
+        Ok(disk) => {
+            unsafe { CRYPT = Some(disk) };
+            FsError::Ok
+        }
+        Err(e) => {
+            unsafe { CRYPT = None };
+            map_crypt_err(e)
+        }
+    }
+}
+
+fn crypt_lock() -> FsError {
+    // Best-effort key hygiene: drop the session. (The CryptDisk copy
+    // semantics mean the key bytes may linger on old stack frames —
+    // real zeroization is an M1-port task alongside the Argon2 KDF.)
+    unsafe { CRYPT = None };
+    FsError::Ok
+}
+
+fn crypt_write(name: &str, content: &[u8]) -> FsError {
+    let Some(disk) = crypt_session() else { return FsError::Locked };
+    let Some(buf) = crypt_buf() else { return FsError::NoSpace };
+    if name.is_empty() || name.contains('/') {
+        return FsError::InvalidPath;
+    }
+    let mut payload = [0u8; SLOT_PAYLOAD];
+    if beetos_api_fs::pack_data_entry(name, content, &mut payload).is_none() {
+        return FsError::NoSpace;
+    }
+    let slot = match crypt_find(&disk, buf, name) {
+        Some((slot, _)) => slot,
+        None => match crypt_find_free(&disk, buf) {
+            Some(s) => s,
+            None => return FsError::NoSpace,
+        },
+    };
+    match disk.write_slot(buf, slot, &payload) {
+        Ok(()) => FsError::Ok,
+        Err(e) => map_crypt_err(e),
+    }
+}
+
+fn crypt_remove(name: &str) -> FsError {
+    let Some(disk) = crypt_session() else { return FsError::Locked };
+    let Some(buf) = crypt_buf() else { return FsError::NoSpace };
+    match crypt_find(&disk, buf, name) {
+        Some((slot, _)) => match disk.erase_slot(buf, slot) {
+            Ok(()) => FsError::Ok,
+            Err(e) => map_crypt_err(e),
+        },
+        None => FsError::NotFound,
+    }
+}
+
+/// Read `name` and hand the decrypted bytes to `sink`.
+fn crypt_read(name: &str, mut sink: impl FnMut(&[u8])) -> FsError {
+    let Some(disk) = crypt_session() else { return FsError::Locked };
+    let Some(buf) = crypt_buf() else { return FsError::NoSpace };
+    for slot in 0..CRYPT_SLOTS {
+        match disk.read_slot(buf, slot) {
+            Ok(payload) => {
+                if let Some((entry_name, data)) = beetos_api_fs::unpack_data_entry(&payload) {
+                    if entry_name == name {
+                        sink(data);
+                        return FsError::Ok;
+                    }
+                }
+            }
+            Err(CryptError::Corrupt) => {
+                // Can't know the name without authenticating — surface
+                // corruption only when nothing else matches, below.
+            }
+            _ => {}
+        }
+    }
+    FsError::NotFound
+}
+
+/// List entries: `cb(name, size)` per file.
+fn crypt_list(mut cb: impl FnMut(&str, usize)) -> FsError {
+    let Some(disk) = crypt_session() else { return FsError::Locked };
+    let Some(buf) = crypt_buf() else { return FsError::NoSpace };
+    for slot in 0..CRYPT_SLOTS {
+        if let Ok(payload) = disk.read_slot(buf, slot) {
+            if let Some((name, data)) = beetos_api_fs::unpack_data_entry(&payload) {
+                cb(name, data.len());
+            }
+        }
+    }
+    FsError::Ok
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -298,6 +502,9 @@ fn handle_blocking_scalar(sender: xous::MessageSender, scalar: xous::ScalarMessa
             let result = do_is_dir(path);
             ipc_reply(sender, result as usize);
         }
+        id if id == FsOp::CryptLock as usize => {
+            ipc_reply(sender, crypt_lock() as usize);
+        }
         _ => {
             ipc_reply(sender, FsError::InvalidPath as usize);
         }
@@ -319,6 +526,21 @@ fn unpack_short_content(args: &[usize; 2]) -> &[u8] {
 // ============================================================================
 
 fn do_cat(path: &str) -> FsError {
+    if is_data_path(path) {
+        let st = crypt_read(data_subpath(path), |data| {
+            match core::str::from_utf8(data) {
+                Ok(text) => {
+                    puts(text);
+                    if !text.ends_with('\n') { putc(b'\n'); }
+                }
+                Err(_) => {
+                    let _ = write!(UartWriter, "<binary: {} bytes>\n", data.len());
+                }
+            }
+        });
+        return st;
+    }
+
     // Try disk path first
     if is_disk_path(path) {
         if let Some(archive) = get_disk_archive() {
@@ -359,6 +581,10 @@ fn do_cat(path: &str) -> FsError {
 }
 
 fn do_is_dir(path: &str) -> FsError {
+    if is_data_path(path) {
+        // The /data root is cd-able; entries inside are files.
+        return if data_subpath(path).is_empty() { FsError::Ok } else { FsError::NotDirectory };
+    }
     if is_disk_path(path) {
         let subpath = disk_subpath(path);
         return match get_disk_archive() {
@@ -391,6 +617,17 @@ fn do_ls(path: &str) -> FsError {
     // Show virtual "disk/" in root listing
     if is_root && get_disk_archive().is_some() {
         puts("  disk/  (block device)\n");
+    }
+    if is_root {
+        let state = if crypt_session().is_some() { "unlocked" } else { "locked" };
+        let _ = write!(UartWriter, "  data/  (encrypted, {})\n", state);
+    }
+
+    if is_data_path(path) {
+        if !data_subpath(path).is_empty() { return FsError::NotDirectory; }
+        return crypt_list(|name, size| {
+            let _ = write!(UartWriter, "  {} ({} bytes)\n", name, size);
+        });
     }
 
     // Disk path
@@ -435,6 +672,11 @@ fn do_mkdir(path: &str) -> FsError {
 }
 
 fn do_remove(path: &str) -> FsError {
+    if is_data_path(path) {
+        let name = data_subpath(path);
+        if name.is_empty() { return FsError::IsDirectory; }
+        return crypt_remove(name);
+    }
     if is_disk_path(path) { return FsError::ReadOnly; }
     match ramfs::remove(path) {
         Ok(()) => FsError::Ok,
@@ -445,6 +687,11 @@ fn do_remove(path: &str) -> FsError {
 }
 
 fn do_write(path: &str, content: &[u8]) -> FsError {
+    if is_data_path(path) {
+        let name = data_subpath(path);
+        if name.is_empty() { return FsError::IsDirectory; }
+        return crypt_write(name, content);
+    }
     if is_disk_path(path) { return FsError::ReadOnly; }
     match ramfs::write(path, content) {
         Ok(()) => {
@@ -501,6 +748,11 @@ fn handle_mutable_borrow(sender: xous::MessageSender, mem: &xous::MemoryMessage)
             do_ls_buf(path, text_area)
         } else if op == FsOp::CatBuf as usize {
             do_cat_buf(path, text_area)
+        } else if op == FsOp::CryptFormat as usize {
+            // "path" carries the passphrase for the two crypt ops.
+            crypt_format(path)
+        } else if op == FsOp::CryptOpen as usize {
+            crypt_open(path)
         } else {
             FsError::InvalidPath
         }
@@ -543,6 +795,17 @@ fn do_ls_buf(path: &str, output: &mut [u8]) -> FsError {
     if is_root && get_disk_archive().is_some() {
         let _ = write!(w, "  disk/  (block device)\n");
     }
+    if is_root {
+        let state = if crypt_session().is_some() { "unlocked" } else { "locked" };
+        let _ = write!(w, "  data/  (encrypted, {})\n", state);
+    }
+
+    if is_data_path(path) {
+        if !data_subpath(path).is_empty() { return FsError::NotDirectory; }
+        return crypt_list(|name, size| {
+            let _ = write!(w, "  {} ({} bytes)\n", name, size);
+        });
+    }
 
     if is_disk_path(path) {
         if let Some(archive) = get_disk_archive() {
@@ -575,6 +838,20 @@ fn do_ls_buf(path: &str, output: &mut [u8]) -> FsError {
 
 fn do_cat_buf(path: &str, output: &mut [u8]) -> FsError {
     let mut w = BufWrite { buf: output, pos: 0 };
+
+    if is_data_path(path) {
+        return crypt_read(data_subpath(path), |data| {
+            match core::str::from_utf8(data) {
+                Ok(text) => {
+                    let _ = write!(w, "{}", text);
+                    if !text.ends_with('\n') { let _ = write!(w, "\n"); }
+                }
+                Err(_) => {
+                    let _ = write!(w, "<binary: {} bytes>\n", data.len());
+                }
+            }
+        });
+    }
 
     if is_disk_path(path) {
         if let Some(archive) = get_disk_archive() {

@@ -75,6 +75,20 @@ pub enum FsOp {
     /// Buffer-based file read (MutableBorrow).
     /// Same layout as LsBuf.
     CatBuf = 8,
+
+    /// Format the encrypted `/data` area (MutableBorrow, LsBuf layout —
+    /// the "path" field carries the passphrase). Creates a fresh salt,
+    /// erases all slots, leaves the area unlocked.
+    CryptFormat = 9,
+
+    /// Unlock the encrypted `/data` area (MutableBorrow, passphrase in
+    /// the path field). Status: Ok, Locked (bad passphrase), or
+    /// NotFound (area not formatted).
+    CryptOpen = 10,
+
+    /// Lock the `/data` area (BlockingScalar, no args): drops the key.
+    /// Returns Scalar1(FsError::Ok).
+    CryptLock = 11,
 }
 
 /// Error codes returned by the FS service.
@@ -90,6 +104,72 @@ pub enum FsError {
     NoSpace = 6,
     ReadOnly = 7,
     InvalidPath = 8,
+    /// The encrypted `/data` area is locked (or the passphrase given
+    /// to `CryptOpen` was wrong).
+    Locked = 9,
+    /// Authenticated decryption failed — on-disk data was tampered
+    /// with or corrupted.
+    Corrupt = 10,
+}
+
+// ============================================================================
+// Encrypted /data slot-entry format
+// ============================================================================
+//
+// One file = one cryptblock slot. Inside the slot's plaintext payload:
+//
+//   [ name_len u8 | reserved u8 | data_len u16 LE | name | data ]
+//
+// No central directory: lookup scans slots and matches names, so there
+// is no metadata sector to corrupt and every file write is a single
+// atomic sealed-sector write.
+
+/// Max file-name length inside a `/data` slot entry.
+pub const DATA_NAME_MAX: usize = 32;
+/// Entry header bytes before the name.
+pub const DATA_ENTRY_HDR: usize = 4;
+
+/// Pack `(name, data)` into `out` (a slot plaintext buffer). Returns
+/// the packed length, or `None` if name/data don't fit.
+pub fn pack_data_entry(name: &str, data: &[u8], out: &mut [u8]) -> Option<usize> {
+    let name = name.as_bytes();
+    if name.is_empty() || name.len() > DATA_NAME_MAX {
+        return None;
+    }
+    let total = DATA_ENTRY_HDR + name.len() + data.len();
+    if total > out.len() {
+        return None;
+    }
+    out[0] = name.len() as u8;
+    out[1] = 0;
+    out[2..4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    out[4..4 + name.len()].copy_from_slice(name);
+    out[4 + name.len()..total].copy_from_slice(data);
+    // Zero the tail so re-used slots don't leak previous plaintext
+    // lengths through the (encrypted) payload.
+    for b in &mut out[total..] {
+        *b = 0;
+    }
+    Some(total)
+}
+
+/// Unpack a slot entry: returns `(name, data)` or `None` if the
+/// payload doesn't parse (wrong lengths, non-UTF8 name).
+pub fn unpack_data_entry(payload: &[u8]) -> Option<(&str, &[u8])> {
+    if payload.len() < DATA_ENTRY_HDR {
+        return None;
+    }
+    let name_len = payload[0] as usize;
+    if name_len == 0 || name_len > DATA_NAME_MAX {
+        return None;
+    }
+    let data_len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+    let total = DATA_ENTRY_HDR + name_len + data_len;
+    if total > payload.len() {
+        return None;
+    }
+    let name = core::str::from_utf8(&payload[4..4 + name_len]).ok()?;
+    Some((name, &payload[4 + name_len..total]))
 }
 
 /// Pack a path (up to 32 bytes) into 4 usize values for Scalar messages.
@@ -132,4 +212,57 @@ pub fn read_path_from_buf(buf: &[u8]) -> &str {
     let max = MAX_PATH_LEN.min(buf.len());
     let len = buf[..max].iter().position(|&b| b == 0).unwrap_or(max);
     core::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+#[cfg(test)]
+mod data_entry_tests {
+    use super::*;
+
+    #[test]
+    fn entry_roundtrip() {
+        let mut buf = [0xAAu8; 484];
+        let n = pack_data_entry("secret", b"hello world", &mut buf).unwrap();
+        assert_eq!(n, 4 + 6 + 11);
+        let (name, data) = unpack_data_entry(&buf).unwrap();
+        assert_eq!(name, "secret");
+        assert_eq!(data, b"hello world");
+        // Tail must be zeroed (no stale-plaintext leak on slot reuse).
+        assert!(buf[n..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn empty_data_ok() {
+        let mut buf = [0u8; 484];
+        pack_data_entry("touch", b"", &mut buf).unwrap();
+        let (name, data) = unpack_data_entry(&buf).unwrap();
+        assert_eq!(name, "touch");
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn oversize_rejected() {
+        let mut buf = [0u8; 484];
+        let big = [0u8; 481]; // 4 + 1 + 481 > 484 with 1-char name? 486 > 484
+        assert!(pack_data_entry("x", &big, &mut buf).is_none());
+        let max = [0u8; 479]; // 4 + 1 + 479 = 484 exactly
+        assert!(pack_data_entry("x", &max, &mut buf).is_some());
+    }
+
+    #[test]
+    fn bad_names_rejected() {
+        let mut buf = [0u8; 484];
+        assert!(pack_data_entry("", b"x", &mut buf).is_none());
+        let long = "ñ".repeat(20); // 40 bytes > DATA_NAME_MAX
+        assert!(pack_data_entry(&long, b"x", &mut buf).is_none());
+    }
+
+    #[test]
+    fn garbage_unparses_cleanly() {
+        assert!(unpack_data_entry(&[0u8; 484]).is_none()); // name_len 0
+        assert!(unpack_data_entry(&[40, 0, 0, 0]).is_none()); // name_len > max... 40 > 32
+        let mut bad = [0u8; 16];
+        bad[0] = 4;
+        bad[2] = 0xFF; bad[3] = 0xFF; // data_len way past payload
+        assert!(unpack_data_entry(&bad).is_none());
+    }
 }

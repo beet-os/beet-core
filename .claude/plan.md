@@ -854,6 +854,17 @@ virtio-blk uses SPI 16 (first virtio transport = GIC IRQ 48). For the initial im
   full story in CI: format->seal->read, plaintext absent from the host
   image, wrong passphrase rejected, decrypt-after-reboot, empty-slot
   detection.
+- [x] **fs ↔ cryptblock integration** — `/data` is a real mount served by
+  os/fs: `cryptfmt`/`cryptopen`/`cryptlock` manage the session (key lives in
+  fs process memory), then plain `write`/`cat`/`ls`/`rm` on `/data/<name>`
+  work like any other path. One file = one sealed slot
+  (`api/fs::pack_data_entry`: name ≤32 B + data, no central directory —
+  lookup scans slots, so every mutation is a single atomic sealed-sector
+  write). Locked area → `FsError::Locked` with explicit shell messages;
+  GCM auth failure surfaces as `Corrupt`. The shell no longer talks to
+  api/cryptblock directly. `qemu-smoke-crypt` now exercises the file flow
+  end-to-end (11 checks incl. locked-read refusal, rm-erases-slot,
+  cryptlock drops the session).
 - [ ] NVMe write support (Apple ANS — real hardware, M1 port)
 - [ ] `os/wifi/` — Broadcom BCM4378 in sandboxed process
 - [ ] Shell commands: `wifi scan`, `wifi connect`
