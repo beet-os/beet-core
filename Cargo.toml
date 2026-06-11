@@ -19,6 +19,7 @@ members = [
     "api/fs",
     "api/storage",
     "api/block",
+    "api/cryptblock",
     "os/app-manifest",
     "xous/async-rt",
     "examples/async-demo",

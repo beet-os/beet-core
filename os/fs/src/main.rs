@@ -104,11 +104,18 @@ fn populate_disk_cache_via_ipc() -> usize {
         }
     };
     if total_bytes == 0 { return 0; }
-    if total_bytes > MAX_DISK_SIZE {
-        let _ = write!(UartWriter, "[fs] disk {} B exceeds cache {} B\n",
+    // The fs only parses the tar at the head of the disk; the tail
+    // (api/cryptblock's encrypted area, and any future partitions) is
+    // none of its business. Cache just the head when the device is
+    // bigger than the cache — the tar's end-of-archive zero blocks
+    // land inside the cached window as long as the tar itself fits.
+    let total_bytes = if total_bytes > MAX_DISK_SIZE {
+        let _ = write!(UartWriter, "[fs] disk {} B, caching first {} B (tar head)\n",
             total_bytes, MAX_DISK_SIZE);
-        return 0;
-    }
+        MAX_DISK_SIZE
+    } else {
+        total_bytes
+    };
 
     // One page is the IPC buffer; (PAGE_SIZE - BUF_DATA_OFFSET)/block_size
     // tells us how many blocks we can move per round-trip.
@@ -134,7 +141,11 @@ fn populate_disk_cache_via_ipc() -> usize {
     let mut bytes_done: usize = 0;
     while bytes_done < total_bytes {
         let remaining_blocks = info.capacity_blocks - lba;
-        let n = (remaining_blocks as u32).min(blocks_per_round);
+        // Also cap by what's left in the (possibly clamped) cache
+        // window, or the final round overruns DISK_CACHE.
+        let remaining_cache = ((total_bytes - bytes_done) / block_size) as u64;
+        let n = (remaining_blocks.min(remaining_cache) as u32).min(blocks_per_round);
+        if n == 0 { break; }
         if let Err(e) = client.read_blocks(lba, n, buf_range) {
             let _ = write!(UartWriter,
                 "[fs] cache read FAILED at LBA {} ({} blocks, {}/{} B done): {:?}\n",

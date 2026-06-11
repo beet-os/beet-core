@@ -15,6 +15,7 @@ beetos-api-console = { path = "../../api/console" }
 beetos-api-procman = { path = "../../api/procman" }
 beetos-api-fs = { path = "../../api/fs" }
 beetos-api-block = { path = "../../api/block" }
+beetos-api-cryptblock = { path = "../../api/cryptblock" }
 beetos-api-net = { path = "../../api/net" }
 
 [lints.rust]

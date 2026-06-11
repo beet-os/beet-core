@@ -835,8 +835,26 @@ virtio-blk uses SPI 16 (first virtio transport = GIC IRQ 48). For the initial im
 
 ## Milestone 8 — Encrypted Storage & WiFi
 
-- [ ] NVMe write support
-- [ ] Encrypted data partition (AES-256-GCM)
+- [x] **Block write path (QEMU slice of "NVMe write support")** — os/block
+  serves `WriteBlocks` by updating the kernel-mapped disk mirror and flushing
+  the touched sectors to virtio-blk via the new PID-restricted
+  `SysCall::BlockFlush` (no user pointer crosses EL0/EL1). Shell `dwrite`/
+  `dread` exercise it; persistence verified byte-for-byte on the host image
+  after QEMU exit. The ANS (Apple NVMe) backend remains for the M1 port —
+  same `BlockOp` IPC, different driver behind it.
+- [x] **Encrypted data area (AES-256-GCM)** — `api/cryptblock`: the disk tail
+  (128 sectors) holds a header (magic + salt + authenticated passphrase
+  check) and 127 self-contained sealed slots `[nonce 12 | tag 16 | ct 484]`.
+  Fresh `SysCall::GetRandom` nonce per write (RNDR on M1, xorshift fallback
+  on QEMU), absolute LBA as AAD so sectors can't be relocated undetected.
+  KDF is dev-grade SHA-256(salt||pass) — **must become Argon2id + device
+  secret before real hardware**. Pure seal/open/header layer is host-unit-
+  tested (10 tests incl. tamper/wrong-LBA/wrong-key); shell `cryptfmt`/
+  `cryptopen`/`cwrite`/`cread`; `cargo xtask qemu-smoke-crypt` proves the
+  full story in CI: format->seal->read, plaintext absent from the host
+  image, wrong passphrase rejected, decrypt-after-reboot, empty-slot
+  detection.
+- [ ] NVMe write support (Apple ANS — real hardware, M1 port)
 - [ ] `os/wifi/` — Broadcom BCM4378 in sandboxed process
 - [ ] Shell commands: `wifi scan`, `wifi connect`
 

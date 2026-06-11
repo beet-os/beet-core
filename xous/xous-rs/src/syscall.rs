@@ -605,6 +605,15 @@ pub enum SysCall {
     #[cfg(beetos)]
     BlockFlush(usize /* lba */, usize /* n_blocks */),
 
+    /// Fill two machine words with kernel entropy (RNDR on CPUs with
+    /// FEAT_RNG — Apple M1 — xorshift seeded from the cycle counter
+    /// otherwise). 16 bytes per call; call repeatedly for more.
+    ///
+    /// # Returns
+    /// * **Scalar2(r0, r1)**: two random usizes
+    #[cfg(beetos)]
+    GetRandom,
+
     /// Block the calling thread until any notification bits matching `mask`
     /// are set on the current process.  Returns the bits that fired
     /// (intersection of pending bits and mask) and clears them; the read
@@ -784,6 +793,7 @@ pub enum SysCallNumber {
     NetPingSend = 78,
     NetPingPoll = 79,
     BlockFlush = 80,
+    GetRandom = 81,
 
     Invalid,
 }
@@ -871,6 +881,7 @@ impl SysCallNumber {
             78 => NetPingSend,
             79 => NetPingPoll,
             80 => BlockFlush,
+            81 => GetRandom,
             _ => Invalid,
         }
     }
@@ -1285,6 +1296,10 @@ impl SysCall {
             SysCall::BlockFlush(lba, n) => {
                 [SysCallNumber::BlockFlush as usize, *lba, *n, 0, 0, 0, 0, 0]
             }
+            #[cfg(beetos)]
+            SysCall::GetRandom => {
+                [SysCallNumber::GetRandom as usize, 0, 0, 0, 0, 0, 0, 0]
+            }
 
             SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7) => {
                 [SysCallNumber::Invalid as usize, *a1, *a2, *a3, *a4, *a5, *a6, *a7]
@@ -1516,6 +1531,8 @@ impl SysCall {
             SysCallNumber::NetPingPoll => SysCall::NetPingPoll,
             #[cfg(beetos)]
             SysCallNumber::BlockFlush => SysCall::BlockFlush(a1, a2),
+            #[cfg(beetos)]
+            SysCallNumber::GetRandom => SysCall::GetRandom,
 
             #[cfg(not(beetos))]
             SysCallNumber::FutexWait
@@ -1547,7 +1564,8 @@ impl SysCall {
             | SysCallNumber::NetSocketClose
             | SysCallNumber::NetPingSend
             | SysCallNumber::NetPingPoll
-            | SysCallNumber::BlockFlush => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
+            | SysCallNumber::BlockFlush
+            | SysCallNumber::GetRandom => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
             SysCallNumber::Invalid => SysCall::Invalid(a1, a2, a3, a4, a5, a6, a7),
         })
     }

@@ -1,0 +1,12 @@
+[package]
+name = "beetos-api-cryptblock"
+version = "0.1.0"
+edition = "2021"
+description = "BeetOS encrypted block layer (AES-256-GCM over the block service)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+xous = { path = "../../xous/xous-rs" }
+beetos-api-block = { path = "../block" }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+sha2 = { version = "0.10", default-features = false }

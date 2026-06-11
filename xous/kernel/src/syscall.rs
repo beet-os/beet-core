@@ -420,7 +420,8 @@ fn check_syscall_permission(call: &SysCall) -> core::result::Result<(), Error> {
         | SysCall::NetSocketClose(..)
         | SysCall::NetPingSend(..)
         | SysCall::NetPingPoll
-        | SysCall::BlockFlush(..) => Ok(()),
+        | SysCall::BlockFlush(..)
+        | SysCall::GetRandom => Ok(()),
 
         // Notification syscalls
         #[cfg(beetos)]
@@ -873,6 +874,15 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             blk::flush_mirror(lba as u64, n_blocks as u32)
                 .map(|_| Result::Ok)
                 .map_err(|_| Error::InvalidArguments)
+        }
+
+        #[cfg(beetos)]
+        SysCall::GetRandom => {
+            let r0 = ((crate::arch::rand::get_u32() as usize) << 32)
+                | crate::arch::rand::get_u32() as usize;
+            let r1 = ((crate::arch::rand::get_u32() as usize) << 32)
+                | crate::arch::rand::get_u32() as usize;
+            Ok(Result::Scalar2(r0, r1))
         }
 
         #[cfg(all(beetos, not(feature = "platform-qemu-virt")))]

@@ -356,6 +356,10 @@ fn execute_line(line: &[u8]) {
         "blkinfo" => cmd_blkinfo(),
         "dread" => cmd_dread(cmd_args),
         "dwrite" => cmd_dwrite(cmd_args, line_str),
+        "cryptfmt" => cmd_cryptfmt(cmd_args),
+        "cryptopen" => cmd_cryptopen(cmd_args),
+        "cwrite" => cmd_cwrite(cmd_args, line_str),
+        "cread" => cmd_cread(cmd_args),
         "mem" => cmd_mem(),
         "ifconfig" => cmd_ifconfig(),
         "ping" => cmd_ping(cmd_args),
@@ -390,6 +394,10 @@ fn cmd_help() {
     puts("  blkinfo           Block device info\n");
     puts("  dread <lba>       Read one 512-byte block (printable preview)\n");
     puts("  dwrite <lba> <text>  Write one 512-byte block (zero-padded)\n");
+    puts("  cryptfmt <pass>   Format the encrypted area (AES-256-GCM)\n");
+    puts("  cryptopen <pass>  Open the encrypted area\n");
+    puts("  cwrite <slot> <text>  Seal text into an encrypted slot\n");
+    puts("  cread <slot>      Decrypt + authenticate a slot\n");
     puts("  mem               Filesystem statistics\n");
     puts("  ifconfig          Show network interface configuration\n");
     puts("  ping <ip> [count] ICMP echo (default 4 packets)\n");
@@ -839,6 +847,112 @@ fn cmd_dwrite(args: &[&str], line: &str) {
         Err(e) => {
             let _ = write!(DualWriter, "dwrite: FAILED ({:?})\n", e);
         }
+    }
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
+}
+
+// ============================================================================
+// Encrypted area (api/cryptblock — AES-256-GCM over the block service)
+// ============================================================================
+
+/// Session state: the open CryptDisk (passphrase already verified).
+/// One slot is plenty for the shell.
+static mut CRYPT_SESSION: Option<beetos_api_cryptblock::CryptDisk> = None;
+
+fn crypt_session() -> Option<beetos_api_cryptblock::CryptDisk> {
+    unsafe { *core::ptr::addr_of!(CRYPT_SESSION) }
+}
+
+fn cmd_cryptfmt(args: &[&str]) {
+    let pass = match args.first() {
+        Some(p) if !p.is_empty() => *p,
+        _ => { puts("usage: cryptfmt <passphrase>\n"); return; }
+    };
+    let Some((client, buf)) = open_block("cryptfmt") else { return };
+    match beetos_api_cryptblock::CryptDisk::format(client, buf, pass.as_bytes()) {
+        Ok(disk) => {
+            unsafe { CRYPT_SESSION = Some(disk) };
+            let _ = write!(
+                DualWriter,
+                "cryptfmt: formatted ({} slots of {} bytes), session open\n",
+                beetos_api_cryptblock::CRYPT_SLOTS,
+                beetos_api_cryptblock::SLOT_PAYLOAD,
+            );
+        }
+        Err(e) => { let _ = write!(DualWriter, "cryptfmt: FAILED ({:?})\n", e); }
+    }
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
+}
+
+fn cmd_cryptopen(args: &[&str]) {
+    let pass = match args.first() {
+        Some(p) if !p.is_empty() => *p,
+        _ => { puts("usage: cryptopen <passphrase>\n"); return; }
+    };
+    let Some((client, buf)) = open_block("cryptopen") else { return };
+    match beetos_api_cryptblock::CryptDisk::open(client, buf, pass.as_bytes()) {
+        Ok(disk) => {
+            unsafe { CRYPT_SESSION = Some(disk) };
+            puts("cryptopen: session open\n");
+        }
+        Err(e) => {
+            unsafe { CRYPT_SESSION = None };
+            let _ = write!(DualWriter, "cryptopen: FAILED ({:?})\n", e);
+        }
+    }
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
+}
+
+fn cmd_cwrite(args: &[&str], line: &str) {
+    let slot = match args.first().and_then(|s| parse_u64(s)) {
+        Some(v) => v,
+        None => { puts("usage: cwrite <slot> <text>\n"); return; }
+    };
+    let mut tokens = line.split_whitespace();
+    tokens.next(); // cwrite
+    tokens.next(); // slot
+    let payload = match tokens.next() {
+        Some(p) => p,
+        None => { puts("usage: cwrite <slot> <text>\n"); return; }
+    };
+    let Some(disk) = crypt_session() else {
+        puts("cwrite: no open session (cryptfmt/cryptopen first)\n");
+        return;
+    };
+    let Some((_, buf)) = open_block("cwrite") else { return };
+    match disk.write_slot(buf, slot, payload.as_bytes()) {
+        Ok(()) => {
+            let _ = write!(
+                DualWriter,
+                "cwrite: sealed {} byte(s) into slot {}\n",
+                payload.len(), slot,
+            );
+        }
+        Err(e) => { let _ = write!(DualWriter, "cwrite: FAILED ({:?})\n", e); }
+    }
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
+}
+
+fn cmd_cread(args: &[&str]) {
+    let slot = match args.first().and_then(|s| parse_u64(s)) {
+        Some(v) => v,
+        None => { puts("usage: cread <slot>\n"); return; }
+    };
+    let Some(disk) = crypt_session() else {
+        puts("cread: no open session (cryptfmt/cryptopen first)\n");
+        return;
+    };
+    let Some((_, buf)) = open_block("cread") else { return };
+    match disk.read_slot(buf, slot) {
+        Ok(plain) => {
+            let stop = plain.iter().position(|&b| b == 0).unwrap_or(plain.len());
+            let _ = write!(DualWriter, "slot {}: ", slot);
+            for &b in &plain[..stop] {
+                if (0x20..=0x7e).contains(&b) { putc(b); } else { putc(b'.'); }
+            }
+            putc(b'\n');
+        }
+        Err(e) => { let _ = write!(DualWriter, "cread: FAILED ({:?})\n", e); }
     }
     xous::rsyscall(xous::SysCall::UnmapMemory(buf)).ok();
 }

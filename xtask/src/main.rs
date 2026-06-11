@@ -13,6 +13,7 @@ fn main() -> anyhow::Result<()> {
         Some("qemu-smoke-nodisk") => qemu_smoke_nodisk()?,
         Some("qemu-smoke-net") => qemu_smoke_net()?,
         Some("qemu-smoke-net-userspace") => qemu_smoke_net_userspace()?,
+        Some("qemu-smoke-crypt") => qemu_smoke_crypt()?,
         Some("qemu-bench") => qemu_bench(&args[1..])?,
         Some("qemu-screenshot") => qemu_screenshot(&args[1..])?,
         Some("qemu-animation") => qemu_animation(&args[1..])?,
@@ -32,6 +33,8 @@ fn main() -> anyhow::Result<()> {
             println!("  qemu-smoke-nodisk  Boot QEMU *without* a disk image — verifies graceful degradation");
             println!("  qemu-smoke-net     Boot QEMU with networking, drive the TCP remote console over a host socket");
             println!("  qemu-smoke-net-userspace   Boot QEMU and exercise api/net via shell commands (listen + connect)");
+            println!("  qemu-smoke-crypt   Two-boot AES-256-GCM area test: format/seal/read, plaintext");
+            println!("                     absence on the host image, reopen + decrypt after reboot");
             println!("  qemu-bench [--update] [--tolerance PCT]");
             println!("                     Run kernel micro-benchmarks under deterministic icount and");
             println!("                     compare against xtask/qemu-bench-baseline.txt (CI perf gate)");
@@ -429,8 +432,21 @@ fn create_test_disk(root: &std::path::Path) -> anyhow::Result<PathBuf> {
         .status()?;
     anyhow::ensure!(status.success(), "tar creation failed");
 
+    // Append the encrypted area: pad the tar to a 16 KiB boundary
+    // (zero blocks read as tar end-of-archive, so the parser is
+    // unaffected), then add 128 zero sectors = the CRYPT_AREA the
+    // api/cryptblock layer claims at the disk tail (header + slots).
+    let tar_size = std::fs::metadata(&disk_img)?.len() as usize;
+    let padded = (tar_size + 16383) & !16383;
+    const CRYPT_AREA_BYTES: usize = 128 * 512;
+    let total = padded + CRYPT_AREA_BYTES;
+    let mut img = std::fs::read(&disk_img)?;
+    img.resize(total, 0);
+    std::fs::write(&disk_img, &img)?;
+
     let size = std::fs::metadata(&disk_img)?.len();
-    println!("Disk image: {} ({} bytes)", disk_img.display(), size);
+    println!("Disk image: {} ({} bytes: {} tar + pad + {} crypt area)",
+             disk_img.display(), size, tar_size, CRYPT_AREA_BYTES);
     Ok(disk_img)
 }
 
@@ -900,7 +916,9 @@ fn qemu_smoke() -> anyhow::Result<()> {
         "Disk: mapped into block service",
         "EL0: launching shell",
         "PREEMPT: timer switched",
-        "[fs] started, disk=10240 bytes via IPC",
+        // 65536 = the fs cache window (the 81920-byte image exceeds it,
+        // so fs caches just the tar head — see os/fs MAX_DISK_SIZE).
+        "[fs] started, disk=65536 bytes via IPC",
         "[block] started, disk=",
         "[shell] block self-test: OK",
         "bsh>",
@@ -1447,6 +1465,150 @@ fn qemu_bench(args: &[String]) -> anyhow::Result<()> {
         }
         anyhow::bail!("Result: BENCH FAILED — {} regression(s)", regressions.len());
     }
+}
+
+/// Two-boot end-to-end test of the encrypted area (api/cryptblock):
+///
+/// Boot 1: `cryptfmt` + `cwrite` + `cread` round-trip in the guest.
+/// Host:   the plaintext must NOT appear anywhere in the disk image,
+///         and the header magic must sit at the area base.
+/// Boot 2: wrong passphrase rejected, right passphrase opens, the
+///         sealed slot decrypts to the same bytes across the reboot.
+fn qemu_smoke_crypt() -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    const HOST_CONSOLE_PORT: u16 = 5562;
+    const PASS: &str = "p4ss-crypt-smoke";
+    const SECRET: &str = "CRYPT_SMOKE_SECRET_42";
+
+    let root = workspace_root();
+
+    let nostd_target = root.join("target/aarch64-unknown-none/debug");
+    std::fs::create_dir_all(&nostd_target)?;
+    let hello_std = nostd_target.join("hello-std.stripped");
+    if !hello_std.exists() {
+        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
+    }
+
+    build(&["--platform".to_string(), "qemu-virt".to_string()])?;
+    let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
+    anyhow::ensure!(kernel_elf.exists(), "kernel binary not found");
+    let kernel = elf_to_image(&kernel_elf)?;
+
+    // Scratch copy: this test writes to the disk, never touch the
+    // shared image other smokes read.
+    let pristine = create_test_disk(&root)?;
+    let disk = root.join("target/qemu-smoke-crypt-disk.img");
+    std::fs::copy(&pristine, &disk)?;
+
+    println!();
+    println!("Launching QEMU crypt smoke test (two boots, timeout 60s each)...");
+    println!();
+
+    let boot = |serial_tag: &str| -> anyhow::Result<(std::process::Child, std::path::PathBuf)> {
+        let serial_log = root.join(format!("target/qemu-smoke-crypt-{serial_tag}.log"));
+        let _ = std::fs::remove_file(&serial_log);
+        let qemu_args = vec![
+            "-machine".to_string(), "virt,gic-version=3".to_string(),
+            "-cpu".to_string(), "neoverse-n1".to_string(),
+            "-m".to_string(), "2G".to_string(),
+            "-display".to_string(), "none".to_string(),
+            "-chardev".to_string(),
+            format!("file,id=c0,path={}", serial_log.display()),
+            "-serial".to_string(), "chardev:c0".to_string(),
+            "-drive".to_string(),
+            format!("file={},format=raw,if=none,id=disk0", disk.display()),
+            "-device".to_string(), "virtio-blk-device,drive=disk0".to_string(),
+            "-netdev".to_string(),
+            format!("user,id=net0,hostfwd=tcp:127.0.0.1:{HOST_CONSOLE_PORT}-:2323"),
+            "-device".to_string(), "virtio-net-device,netdev=net0".to_string(),
+            "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),
+        ];
+        let child = Command::new("qemu-system-aarch64")
+            .args(&qemu_args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        Ok((child, serial_log))
+    };
+
+    let connect_console = |serial_log: &std::path::Path| -> anyhow::Result<std::net::TcpStream> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        wait_for_marker(serial_log, "bsh>", deadline)?;
+        let mut console = retry_connect(HOST_CONSOLE_PORT, deadline)?;
+        console.set_read_timeout(Some(Duration::from_millis(200)))?;
+        console.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let initial = drain_until(&mut console, "bsh>", Duration::from_secs(15));
+        anyhow::ensure!(initial.contains("bsh>"), "no shell prompt: {initial:?}");
+        let _ = drain_quiet(&mut console, Duration::from_millis(300), Duration::from_secs(2));
+        Ok(console)
+    };
+
+    // Send one command, wait for `expect` in the reply.
+    let cmd = |console: &mut std::net::TcpStream, line: &str, expect: &str| -> anyhow::Result<()> {
+        console.write_all(format!("{line}\n").as_bytes())?;
+        console.flush()?;
+        let reply = drain_until(console, expect, Duration::from_secs(15));
+        anyhow::ensure!(
+            reply.contains(expect),
+            "`{line}`: expected {expect:?}, got: {reply:?}"
+        );
+        Ok(())
+    };
+
+    // ── Boot 1: format, seal, read back ────────────────────────────
+    let (mut child, serial1) = boot("boot1")?;
+    let result1 = (|| -> anyhow::Result<()> {
+        let mut console = connect_console(&serial1)?;
+        cmd(&mut console, &format!("cryptfmt {PASS}"), "session open")?;
+        println!("  [ok] area formatted");
+        cmd(&mut console, &format!("cwrite 3 {SECRET}"), "sealed")?;
+        println!("  [ok] secret sealed into slot 3");
+        cmd(&mut console, "cread 3", SECRET)?;
+        println!("  [ok] decrypts in-session");
+        Ok(())
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result1?;
+
+    // ── Host-side: ciphertext only ─────────────────────────────────
+    let image = std::fs::read(&disk)?;
+    anyhow::ensure!(
+        !image
+            .windows(SECRET.len())
+            .any(|w| w == SECRET.as_bytes()),
+        "plaintext secret found in the on-disk image!"
+    );
+    println!("  [ok] plaintext absent from host image");
+    anyhow::ensure!(
+        image.windows(8).any(|w| w == b"BEETCRY1"),
+        "header magic missing from image"
+    );
+    println!("  [ok] header magic present");
+
+    // ── Boot 2: auth + persistence across reboot ───────────────────
+    let (mut child, serial2) = boot("boot2")?;
+    let result2 = (|| -> anyhow::Result<()> {
+        let mut console = connect_console(&serial2)?;
+        cmd(&mut console, "cryptopen totally-wrong", "BadPassphrase")?;
+        println!("  [ok] wrong passphrase rejected");
+        cmd(&mut console, &format!("cryptopen {PASS}"), "session open")?;
+        println!("  [ok] reopened after reboot");
+        cmd(&mut console, "cread 3", SECRET)?;
+        println!("  [ok] slot decrypts across reboot");
+        cmd(&mut console, "cread 7", "Empty")?;
+        println!("  [ok] untouched slot reads Empty");
+        Ok(())
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result2?;
+
+    println!();
+    println!("Result: CRYPT SMOKE TEST PASSED");
+    Ok(())
 }
 
 fn retry_connect(port: u16, deadline: std::time::Instant) -> anyhow::Result<std::net::TcpStream> {
