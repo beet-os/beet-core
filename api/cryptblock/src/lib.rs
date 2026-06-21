@@ -212,15 +212,19 @@ mod disk {
     use beetos_api_block::BlockClient;
 
     /// Fill `out` with kernel entropy (16 bytes per syscall).
+    ///
+    /// **Fails loudly on entropy failure.** Earlier this fell back to
+    /// fixed constants — that would have made every nonce identical
+    /// and broken GCM completely (key recovery). In practice
+    /// `GetRandom` cannot refuse, but if it ever did we'd much rather
+    /// crash than silently destroy the security of every subsequent
+    /// sealed sector.
     pub fn rand_bytes(out: &mut [u8]) {
         let mut i = 0;
         while i < out.len() {
             let (r0, r1) = match xous::rsyscall(xous::SysCall::GetRandom) {
                 Ok(xous::Result::Scalar2(a, b)) => (a as u64, b as u64),
-                // Entropy syscall refused — keep going with the bytes
-                // we have rather than looping forever; the caller's
-                // nonce quality degrades but nothing blocks.
-                _ => (0x5DEE_CE66_0DD5_EED5, 0xA5A5_A5A5_5A5A_5A5A),
+                _ => panic!("cryptblock: GetRandom failed — refusing to seal with predictable nonce"),
             };
             for half in [r0, r1] {
                 for b in half.to_le_bytes() {

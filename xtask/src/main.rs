@@ -1605,6 +1605,16 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
         cmd(&mut console, "rm /data/secret", "bsh>")?;
         cmd(&mut console, "cat /data/secret", "not found")?;
         println!("  [ok] rm erases the slot");
+
+        // Tamper detection end-to-end: write a probe, scribble over
+        // its slot via the raw dwrite, confirm cat surfaces Corrupt
+        // (the silent "not found" was caught by the adversarial pass).
+        cmd(&mut console, "write /data/probe TAMPER_ME", "bsh>")?;
+        // Slot 0 in a fresh area ≡ LBA base+1 = (160-128)+1 = 33.
+        cmd(&mut console, "dwrite 33 ZZZZZ_GARBAGE_ZZZZZ", "wrote")?;
+        cmd(&mut console, "cat /data/probe", "CORRUPT (auth failed)")?;
+        println!("  [ok] tamper detected on read (not silent NotFound)");
+
         cmd(&mut console, "cryptlock", "locked")?;
         cmd(&mut console, "ls /data", "locked (cryptopen first)")?;
         println!("  [ok] cryptlock drops the session");

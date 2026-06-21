@@ -736,6 +736,9 @@ fn cmd_rm(args: &[&str]) {
         Some(code) if code == FsError::Locked as usize => {
             let _ = write!(DualWriter, "rm: {}: locked (cryptopen first)\n", args[0]);
         }
+        Some(code) if code == FsError::IsDirectory as usize => {
+            let _ = write!(DualWriter, "rm: {}: is a directory\n", args[0]);
+        }
         Some(code) if code == FsError::ReadOnly as usize => {
             let _ = write!(DualWriter, "rm: {}: read-only\n", args[0]);
         }

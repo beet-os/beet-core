@@ -354,9 +354,18 @@ fn crypt_remove(name: &str) -> FsError {
 }
 
 /// Read `name` and hand the decrypted bytes to `sink`.
+///
+/// **Tamper surfacing**: when the named file isn't found but at least
+/// one slot failed authentication during the scan, the result is
+/// `Corrupt` rather than `NotFound` — we can't recover the tampered
+/// slot's name (auth failed before we could parse the entry), so we
+/// can't be sure the missing file wasn't the corrupted one. Surfacing
+/// `Corrupt` is the honest answer: "looked everywhere, some bytes
+/// were tampered with, we can't say it isn't yours".
 fn crypt_read(name: &str, mut sink: impl FnMut(&[u8])) -> FsError {
     let Some(disk) = crypt_session() else { return FsError::Locked };
     let Some(buf) = crypt_buf() else { return FsError::NoSpace };
+    let mut saw_corrupt = false;
     for slot in 0..CRYPT_SLOTS {
         match disk.read_slot(buf, slot) {
             Ok(payload) => {
@@ -368,13 +377,12 @@ fn crypt_read(name: &str, mut sink: impl FnMut(&[u8])) -> FsError {
                 }
             }
             Err(CryptError::Corrupt) => {
-                // Can't know the name without authenticating — surface
-                // corruption only when nothing else matches, below.
+                saw_corrupt = true;
             }
             _ => {}
         }
     }
-    FsError::NotFound
+    if saw_corrupt { FsError::Corrupt } else { FsError::NotFound }
 }
 
 /// List entries: `cb(name, size)` per file.
