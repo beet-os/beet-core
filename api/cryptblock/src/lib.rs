@@ -282,14 +282,27 @@ mod disk {
             client.write_blocks(lba, 1, buf).map_err(|_| CryptError::Io)
         }
 
-        /// Format the area: fresh salt, header written, all slots
-        /// zeroed (zero = "empty", see [`open_sector`]).
+        /// Format the area: zero all slots, then commit the header.
+        ///
+        /// **Order matters.** A crash between header and slot-zero
+        /// writes would leave an area that *opens* (valid header) but
+        /// whose unwritten slots still hold the previous key's
+        /// ciphertext, surfacing as `Corrupt` to every read — looking
+        /// like silent tampering. Zeroing first means a crash mid-
+        /// format leaves the *header* missing, so `open` returns
+        /// `NotFormatted` and the next `format` cleanly retries from
+        /// scratch.
         pub fn format(
             client: BlockClient,
             buf: xous::MemoryRange,
             passphrase: &[u8],
         ) -> Result<Self, CryptError> {
             let base = Self::area_base(&client)?;
+
+            let zero = [0u8; SECTOR_SIZE];
+            for slot in 0..CRYPT_SLOTS {
+                Self::write_sector(&client, buf, base + 1 + slot, &zero)?;
+            }
 
             let mut salt = [0u8; SALT_LEN];
             rand_bytes(&mut salt);
@@ -299,11 +312,6 @@ mod disk {
             let key = derive_key(&salt, passphrase);
             let header = build_header(&salt, &check_nonce, &key)?;
             Self::write_sector(&client, buf, base, &header)?;
-
-            let zero = [0u8; SECTOR_SIZE];
-            for slot in 0..CRYPT_SLOTS {
-                Self::write_sector(&client, buf, base + 1 + slot, &zero)?;
-            }
 
             Ok(Self { client, base_lba: base, key })
         }

@@ -1600,6 +1600,14 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
         println!("  [ok] wrong passphrase rejected");
         cmd(&mut console, &format!("cryptopen {PASS}"), "unlocked")?;
         println!("  [ok] reopened after reboot");
+
+        // A bad-pass open while a session is live MUST NOT log the
+        // operator out (would be a free DoS for anyone with IPC
+        // access to the fs server).
+        cmd(&mut console, "cryptopen totally-wrong-again", "bad passphrase")?;
+        cmd(&mut console, "cat /data/secret", SECRET)?;
+        println!("  [ok] bad-pass open preserves live session");
+
         cmd(&mut console, "cat /data/secret", SECRET)?;
         println!("  [ok] file decrypts across reboot");
         cmd(&mut console, "rm /data/secret", "bsh>")?;
@@ -1618,6 +1626,12 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
         cmd(&mut console, "cryptlock", "locked")?;
         cmd(&mut console, "ls /data", "locked (cryptopen first)")?;
         println!("  [ok] cryptlock drops the session");
+
+        // Re-format gate: an untrusted IPC sender (anyone connected to
+        // FS_SID) must not be able to wipe a formatted area without
+        // first proving they hold the passphrase.
+        cmd(&mut console, "cryptfmt some-other-pass", "refused (area already formatted")?;
+        println!("  [ok] cryptfmt refused while locked");
         Ok(())
     })();
     let _ = child.kill();

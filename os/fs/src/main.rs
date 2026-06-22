@@ -275,8 +275,36 @@ fn crypt_find_free(disk: &CryptDisk, buf: xous::MemoryRange) -> Option<u64> {
     None
 }
 
+/// Is there a valid header on disk right now?
+///
+/// Used to gate `cryptfmt` against a destructive re-format by an
+/// untrusted IPC sender: once the area is formatted, the operator
+/// must unlock it (prove they know the passphrase) before any new
+/// `cryptfmt` is accepted.
+fn crypt_is_formatted() -> bool {
+    use beetos_api_block::BlockClient;
+    let Some(buf) = crypt_buf() else { return false };
+    let Ok(client) = BlockClient::connect_with_retries(8) else { return false };
+    let Ok(info) = client.info() else { return false };
+    if info.capacity_blocks < beetos_api_cryptblock::CRYPT_AREA_SECTORS {
+        return false;
+    }
+    let base = info.capacity_blocks - beetos_api_cryptblock::CRYPT_AREA_SECTORS;
+    if client.read_blocks(base, 1, buf).is_err() { return false }
+    let slice = unsafe { core::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+    let sector = beetos_api_block::data(slice);
+    sector.len() >= 8 && &sector[..8] == beetos_api_cryptblock::MAGIC
+}
+
 fn crypt_format(passphrase: &str) -> FsError {
     use beetos_api_block::BlockClient;
+    // Once the area is formatted, only an authenticated operator can
+    // wipe it. Anyone with IPC access to the fs server can send
+    // CryptFormat, so without this gate any sibling service could
+    // erase /data without knowing the passphrase.
+    if crypt_is_formatted() && crypt_session().is_none() {
+        return FsError::Locked;
+    }
     let Some(buf) = crypt_buf() else { return FsError::NoSpace };
     let client = match BlockClient::connect_with_retries(8) {
         Ok(c) => c,
@@ -303,10 +331,11 @@ fn crypt_open(passphrase: &str) -> FsError {
             unsafe { CRYPT = Some(disk) };
             FsError::Ok
         }
-        Err(e) => {
-            unsafe { CRYPT = None };
-            map_crypt_err(e)
-        }
+        // **Preserve the existing session on failure.** A bad-pass
+        // attempt by an attacker (or a typo by another tab) must not
+        // log out an already-unlocked operator — that would be a free
+        // local DoS for anyone with IPC access to the fs server.
+        Err(e) => map_crypt_err(e),
     }
 }
 

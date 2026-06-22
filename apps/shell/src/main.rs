@@ -881,6 +881,9 @@ fn cmd_cryptfmt(args: &[&str]) {
         Some(code) if code == FsError::Ok as usize => {
             puts("cryptfmt: /data formatted and unlocked\n");
         }
+        Some(code) if code == FsError::Locked as usize => {
+            puts("cryptfmt: refused (area already formatted — cryptopen first)\n");
+        }
         Some(code) => { let _ = write!(DualWriter, "cryptfmt: error {}\n", code); }
         None => puts("cryptfmt: fs service not available\n"),
     }

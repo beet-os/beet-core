@@ -56,6 +56,11 @@ fn capacity_blocks() -> u64 {
 /// Returns `BlockResult` so the IPC layer can stamp the right
 /// status byte.
 fn handle_read(lba: u64, n_blocks: u32, data: &mut [u8]) -> BlockResult {
+    // 0-block ops are a no-op success — they round-trip through the
+    // service without touching the device. Otherwise the kernel would
+    // refuse the matching 0-block BlockFlush and the caller would see
+    // a spurious Io error.
+    if n_blocks == 0 { return BlockResult::Ok; }
     let needed = (n_blocks as usize) * BLOCK_SIZE as usize;
     if data.len() < needed { return BlockResult::BadBuffer; }
 
@@ -81,6 +86,7 @@ fn handle_read(lba: u64, n_blocks: u32, data: &mut [u8]) -> BlockResult {
 /// `boot.rs::disk_va`), and `SysCall::BlockFlush` is restricted to
 /// this PID by the kernel.
 fn handle_write(lba: u64, n_blocks: u32, data: &[u8]) -> BlockResult {
+    if n_blocks == 0 { return BlockResult::Ok; }
     let needed = (n_blocks as usize) * BLOCK_SIZE as usize;
     if data.len() < needed { return BlockResult::BadBuffer; }
 
