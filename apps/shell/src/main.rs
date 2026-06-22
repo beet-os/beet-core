@@ -398,7 +398,7 @@ fn cmd_help() {
     puts("  cryptlock         Lock /data (drop the key)\n");
     puts("  mem               Filesystem statistics\n");
     puts("  ifconfig          Show network interface configuration\n");
-    puts("  ping <ip> [count] ICMP echo (default 4 packets)\n");
+    puts("  ping <ip> [count] ICMP echo (default 4, max 16)\n");
     puts("  nettest-listen <port>     Echo server: listen, accept one, echo, close\n");
     puts("  nettest-connect <ip> <port>   Connect, send 'hi', print reply, close\n");
     puts("  bench             Kernel micro-benchmarks (syscall/IPC/MMU)\n");
@@ -1030,12 +1030,16 @@ fn cmd_ping(args: &[&str]) {
             return;
         }
     };
+    // Cap the burst at PING_MAX_COUNT: each ping takes up to 1 s of
+    // wall-clock for a missing reply, so without a cap a typoed count
+    // (parse_u16 accepts up to 65535) could pin the shell for hours.
+    const PING_MAX_COUNT: u64 = 16;
     let count = args
         .get(1)
         .and_then(|s| parse_u16(s))
         .map(|n| n as u64)
         .unwrap_or(4)
-        .max(1);
+        .clamp(1, PING_MAX_COUNT);
 
     let freq = perf::frequency().max(1);
     let mut received = 0u64;
