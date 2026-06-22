@@ -1125,6 +1125,13 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             let args = [a0, a1, a2, a3];
             let name_bytes = xous::unpack_name_from_usize(&args);
             let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidString)?;
+            // Refuse to respawn services the kernel boots itself — a
+            // duplicate would loop forever on a SID it cannot
+            // register, holding any caller blocked in WaitProcess.
+            #[cfg(beetos)]
+            if crate::arch::boot::INTERNAL_SERVICES.contains(&name) {
+                return Err(Error::ProcessNotFound);
+            }
             SystemServices::with_mut(|ss| {
                 ss.spawn_by_name(name).map(Result::ProcessID)
             })
@@ -1137,6 +1144,9 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
             let name_raw = unsafe { core::slice::from_raw_parts(name_words.as_ptr() as *const u8, 2 * ws) };
             let name_end = name_raw.iter().position(|&b| b == 0).unwrap_or(2 * ws);
             let name = core::str::from_utf8(&name_raw[..name_end]).map_err(|_| Error::InvalidString)?;
+            if crate::arch::boot::INTERNAL_SERVICES.contains(&name) {
+                return Err(Error::ProcessNotFound);
+            }
             SystemServices::with_mut(|ss| {
                 ss.spawn_by_name_with_args(name, argv_ptr, argv_len).map(Result::ProcessID)
             })

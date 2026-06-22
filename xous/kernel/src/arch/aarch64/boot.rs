@@ -579,7 +579,10 @@ pub fn lookup_binary(name: &str) -> Option<&'static [u8]> {
     None
 }
 
-const INTERNAL_SERVICES: &[&str] = &[
+/// Service names spawned by the kernel at boot — userland is not
+/// allowed to respawn them through `SpawnByName`/procman, since the
+/// duplicate would deadlock trying to register an already-taken SID.
+pub(crate) const INTERNAL_SERVICES: &[&str] = &[
     "log", "idle", "shell", "procman", "fs", "block", "console", "beetos-test",
 ];
 
