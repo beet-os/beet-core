@@ -278,6 +278,14 @@ fn resolve_path<'a>(input: &str, buf: &'a mut [u8; MAX_PATH]) -> &'a str {
 fn prompt() { puts("bsh> "); }
 
 fn process_char(c: u8) {
+    // Pair-cancellation state for CRLF: when a \r commits a line, the
+    // \n that follows it (terminating the same CRLF pair) must be
+    // ignored — but ONLY if it arrives immediately. Anything typed
+    // between the \r and the next \n resets the state so the \n
+    // commits its own line. Round-7 adversarial caught the original
+    // unconditional version: a stray \r in the input stream silently
+    // ate the next \n, concatenating two unrelated commands into one.
+    static mut LAST_WAS_CR: bool = false;
     unsafe {
         match c {
             0x7F | 0x08 => {
@@ -285,9 +293,9 @@ fn process_char(c: u8) {
                     SHELL.pos -= 1;
                     putc(0x08); putc(b' '); putc(0x08);
                 }
+                LAST_WAS_CR = false;
             }
             b'\r' | b'\n' => {
-                static mut LAST_WAS_CR: bool = false;
                 if c == b'\n' && LAST_WAS_CR { LAST_WAS_CR = false; return; }
                 LAST_WAS_CR = c == b'\r';
                 putc(b'\n');
@@ -300,14 +308,16 @@ fn process_char(c: u8) {
                 }
                 prompt();
             }
-            0x03 => { puts("^C\n"); SHELL.pos = 0; prompt(); }
+            0x03 => { puts("^C\n"); SHELL.pos = 0; LAST_WAS_CR = false; prompt(); }
             0x04 => {
                 if SHELL.pos == 0 {
                     puts("\n(type 'reboot' to restart)\n");
                     prompt();
                 }
+                LAST_WAS_CR = false;
             }
             0x20..=0x7E => {
+                LAST_WAS_CR = false;
                 if SHELL.pos < MAX_LINE - 1 {
                     SHELL.line[SHELL.pos] = c;
                     SHELL.pos += 1;
