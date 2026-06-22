@@ -662,7 +662,30 @@ fn cmd_write(args: &[&str], full_line: &str) {
         args[1]
     };
 
-    // Pack path into arg1-arg2 (16 bytes max) and content into arg3-arg4 (16 bytes max)
+    // WriteShort packs the path into args 1-2 (16 bytes, 15 chars +
+    // null) and the content into args 3-4 (same). Anything longer is
+    // *silently truncated* on the wire — caught by the adversarial
+    // pass: `write /data/this_is_a_very_long_name AB` created a file
+    // named `this_is_a_`. Reject loudly here; a future buffer-based
+    // WriteOp can lift the cap when something needs it.
+    const WRITE_SHORT_LIMIT: usize = 15;
+    if path.len() > WRITE_SHORT_LIMIT {
+        let _ = write!(
+            DualWriter,
+            "write: path too long ({} > {} chars) — short-write path limit\n",
+            path.len(), WRITE_SHORT_LIMIT,
+        );
+        return;
+    }
+    if content.len() > WRITE_SHORT_LIMIT {
+        let _ = write!(
+            DualWriter,
+            "write: content too long ({} > {} bytes) — short-write content limit\n",
+            content.len(), WRITE_SHORT_LIMIT,
+        );
+        return;
+    }
+
     let path_packed = beetos_api_fs::pack_path(path);
     let content_bytes = content.as_bytes();
     let ws = core::mem::size_of::<usize>();
