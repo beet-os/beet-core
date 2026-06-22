@@ -579,7 +579,9 @@ pub fn lookup_binary(name: &str) -> Option<&'static [u8]> {
     None
 }
 
-const INTERNAL_SERVICES: &[&str] = &["log", "idle", "shell", "procman", "fs", "block", "beetos-test"];
+const INTERNAL_SERVICES: &[&str] = &[
+    "log", "idle", "shell", "procman", "fs", "block", "console", "beetos-test",
+];
 
 /// Return the nth user-spawnable program name (skipping internal services).
 /// Returns None when index is out of range.

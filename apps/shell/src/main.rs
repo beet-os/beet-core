@@ -421,7 +421,10 @@ fn cmd_info() {
 }
 
 fn cmd_pid() {
+    // Kernel returns Result::ProcessID, not Scalar1. The mismatch
+    // here silently broke `pid` (round-5 adversarial).
     match xous::rsyscall(xous::SysCall::GetProcessId) {
+        Ok(xous::Result::ProcessID(pid)) => { let _ = write!(DualWriter, "PID: {}\n", pid.get()); }
         Ok(xous::Result::Scalar1(pid)) => { let _ = write!(DualWriter, "PID: {}\n", pid); }
         _ => puts("pid: syscall failed\n"),
     }
