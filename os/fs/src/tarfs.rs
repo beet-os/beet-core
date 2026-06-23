@@ -43,10 +43,28 @@ impl<'a> TarHeader<'a> {
         self.type_flag() == b'5'
     }
 
-    /// Is this a valid header? (Check for zeroed block = end of archive.)
+    /// Is this a valid header?
+    ///
+    /// Two-part check:
+    ///   1. A zeroed 512-byte block marks end of archive (per the
+    ///      tar spec). Stop iterating.
+    ///   2. The POSIX ustar magic must be present at offset 257.
+    ///      Round-9 adversarial caught the missing magic check: a
+    ///      disk filled with `0xFF` garbage parsed as a series of
+    ///      "valid" headers (data[0] != 0), producing phantom empty-
+    ///      name entries in `ls /disk`. The magic check makes the
+    ///      parser refuse non-tar input cleanly — the worst case for
+    ///      a corrupted disk is now an empty listing, not garbage
+    ///      entries that could in principle leak data through
+    ///      attacker-controlled offsets.
     fn is_valid(&self) -> bool {
-        // A zeroed 512-byte block marks end of archive.
-        self.data[0] != 0
+        if self.data[0] == 0 {
+            return false;
+        }
+        // "ustar" at offset 257 (5 bytes). POSIX leaves bytes 262..263
+        // for the version ("00") and GNU writes "ustar  \0" with a
+        // space variant — matching the 5-byte prefix covers both.
+        self.data.len() >= 262 && &self.data[257..262] == b"ustar"
     }
 }
 
