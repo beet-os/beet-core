@@ -700,6 +700,11 @@ fn do_ls(path: &str) -> FsError {
 
 fn do_mkdir(path: &str) -> FsError {
     if is_disk_path(path) { return FsError::ReadOnly; }
+    // /data is a flat encrypted-slot namespace; no subdirectories,
+    // and the mount root itself always exists. Round-10 adversarial
+    // caught `mkdir /data` silently creating a *ramfs* /data entry
+    // that then shadowed the virtual mount in ls listings.
+    if is_data_path(path) { return FsError::AlreadyExists; }
     match ramfs::mkdir(path) {
         Ok(()) => FsError::Ok,
         Err(ramfs::FsError::AlreadyExists) => FsError::AlreadyExists,
