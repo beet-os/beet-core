@@ -564,6 +564,10 @@ fn unpack_short_content(args: &[usize; 2]) -> &[u8] {
 
 fn do_cat(path: &str) -> FsError {
     if is_data_path(path) {
+        // /data itself is the directory; reading it should report
+        // IsDirectory, not the misleading NotFound the empty-subpath
+        // scan would return.
+        if data_subpath(path).is_empty() { return FsError::IsDirectory; }
         let st = crypt_read(data_subpath(path), |data| {
             match core::str::from_utf8(data) {
                 Ok(text) => {
@@ -882,6 +886,7 @@ fn do_cat_buf(path: &str, output: &mut [u8]) -> FsError {
     let mut w = BufWrite { buf: output, pos: 0 };
 
     if is_data_path(path) {
+        if data_subpath(path).is_empty() { return FsError::IsDirectory; }
         return crypt_read(data_subpath(path), |data| {
             match core::str::from_utf8(data) {
                 Ok(text) => {
