@@ -446,6 +446,56 @@ impl MemoryManager {
         self.free_pages_zeroed[offset..offset + pages].fill(true);
     }
 
+    /// Drain up to `budget` dirty pages, zero them, and move them to
+    /// the zeroed pool. Returns the number of pages zeroed this call.
+    ///
+    /// Meant to be called from the kernel idle loop. With IRQs
+    /// **masked** by the caller — internally unmasks them around the
+    /// heavy memset so input / timer / virtio rings stay live during
+    /// the work, then re-masks before returning to the alloc bitmaps.
+    /// A single ~64 KiB visit is bounded enough to keep idle latency
+    /// imperceptible while letting the zeroed pool refill steadily
+    /// under sustained allocation churn (the synchronous-zero hot path
+    /// in alloc_range otherwise dominates `map_unmap` by ~6×).
+    #[cfg(beetos)]
+    pub fn zero_some_dirty_pages(&mut self, budget: usize) -> usize {
+        let mut zeroed_this_visit = 0;
+        while zeroed_this_visit < budget {
+            let (phys_start, mut pages) = match self.take_dirty_pages() {
+                Some(v) => v,
+                None => break, // no dirty pages right now
+            };
+            // Clamp to remaining budget. take_dirty_pages can return
+            // a run of up to 512 pages; we want to bound idle-loop
+            // work even when a big contiguous range is free.
+            let remaining = budget - zeroed_this_visit;
+            if pages > remaining {
+                // Return the tail of the run to the dirty bitmap so a
+                // future visit can pick it up — we never want to take
+                // more than our budget out of either pool.
+                let tail_offset = self.address_to_allocation_offset(
+                    phys_start + remaining * PAGE_SIZE,
+                ).unwrap();
+                self.free_pages_dirty[tail_offset..tail_offset + (pages - remaining)].fill(true);
+                pages = remaining;
+            }
+            // Heavy work: 16 KiB per page memset. Drop the IRQ mask so
+            // UART / timer / virtio handlers can still run during the
+            // zero. We do NOT re-enter alloc paths while IRQs are open
+            // because the taken range is in neither bitmap, so a
+            // concurrent alloc just misses these pages temporarily.
+            unsafe {
+                core::arch::asm!("msr daifclr, #2", options(nostack));
+                let va = beetos::phys_to_virt(phys_start);
+                core::ptr::write_bytes(va as *mut u8, 0, pages * PAGE_SIZE);
+                core::arch::asm!("msr daifset, #2", options(nostack));
+            }
+            self.set_pages_to_zeroed(phys_start, pages);
+            zeroed_this_visit += pages;
+        }
+        zeroed_this_visit
+    }
+
     /// Find a virtual address in the current process that is big enough
     /// to fit `size` bytes.
     pub fn find_virtual_address(

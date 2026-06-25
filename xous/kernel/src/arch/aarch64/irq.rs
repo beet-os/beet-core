@@ -467,6 +467,21 @@ unsafe fn idle_wait_then_load(frame: *mut super::process::Thread) {
             });
             continue;
         }
+        // Background page zeroer: drain a small slice of the dirty
+        // free pool each visit. This is what keeps alloc_range's hot
+        // path on the cheap "zeroed pool" branch — without it every
+        // sustained allocation pays a synchronous 16 KiB memset per
+        // page (~85% of `map_unmap` in the bench). Bound at 4 pages
+        // = 64 KiB per visit so idle latency stays imperceptible.
+        // The mem::zero_some_dirty_pages helper unmasks IRQs around
+        // its internal memset for the same reason the compose does.
+        let zeroed = crate::mem::MemoryManager::with_mut(|mm| mm.zero_some_dirty_pages(4));
+        if zeroed > 0 {
+            let _ = crate::services::SystemServices::with_mut(|ss| {
+                crate::scheduler::Scheduler::with_mut(|s| s.activate_current(ss))
+            });
+            continue;
+        }
         // Enable IRQs, wait for an interrupt, then re-mask.
         // The kernel IRQ handler (EL1 SPx) will run and return here.
         core::arch::asm!(
