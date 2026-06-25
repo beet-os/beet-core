@@ -280,6 +280,32 @@ for kernel-level changes:
 
 **Debugging rule of thumb:** when a memory corruption bug resists all logical hypotheses (TLB, cache, allocator, page tables), check where SP_EL1 actually points. Stack pointer misconfigurations are the first thing to verify, not the last.
 
+## IPC memory borrows: break-then-make is NOT yet implemented (gated)
+
+KeyOS/Xous implement memory-bearing IPC as the article's
+"MMU-as-borrow-checker": a `MutableBorrow`/`Borrow` revokes the
+sender's page (break-then-make), validates the *same physical page* on
+return (`ShareViolation` otherwise), and restores the sender's mapping.
+
+**Our AArch64 port does NOT do this yet.** `arch::aarch64::mem::lend_page`
+adds a second mapping to the same frame in the receiver and leaves the
+sender's mapping live; `return_page` just drops the receiver's copy. It
+is correct *only* because the lending thread blocks for the whole borrow
+and our services are single-threaded — so no sibling thread of the
+sender races the receiver on the still-writable shared page.
+
+- A `debug_assert!` in `services::lend_memory` trips loudly if a process
+  lends memory while it has another `Ready` thread — the exact unsafe
+  precondition. Don't silence it; implement break-then-make instead.
+- The full design (reserved-PTE: clear `PTE_VALID`, set a software
+  `PTE_LENT` bit, keep the frame + flags; validate + restore on return;
+  death-edge restoration on the termination path) is specced inline at
+  `lend_page`/`return_page`. It is **gated behind real multi-thread or
+  SMP need** because the death edges touch the termination path (the
+  riskiest code in the kernel) for a currently-unreachable hazard.
+- **Prerequisite for SMP and for any multi-threaded service that lends
+  memory.** Do this before either.
+
 ## Things to Avoid
 
 - No `unwrap()` in library/kernel code. Use proper error propagation.

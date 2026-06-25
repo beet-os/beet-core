@@ -611,6 +611,34 @@ impl MemoryMapping {
     }
 
     /// Lend a page to another address space (shared memory).
+    ///
+    /// NOTE — this is NOT break-then-make. It adds a second mapping to
+    /// the same physical page in `dest_space` and leaves `self`'s
+    /// mapping live. Safe only because the lending thread blocks for the
+    /// whole borrow and our processes are single-threaded in practice
+    /// (a `debug_assert!` in `services::lend_memory` trips if that
+    /// assumption is violated).
+    ///
+    /// To make this the article's MMU-as-borrow-checker discipline,
+    /// implement the reserved-PTE design (the AArch64 PTE has free
+    /// software bits 55-58; `PTE_ADDR_MASK` preserves the frame across
+    /// an invalid entry):
+    ///   * lend: read phys P here, then rewrite `self`'s leaf PTE to
+    ///     RESERVED — clear `PTE_VALID`, set a software `PTE_LENT` bit,
+    ///     keep P and the original AP/attr flags. TLB-invalidate
+    ///     `src_addr`. Then map P into `dest_space`. The sender can no
+    ///     longer read/write the page.
+    ///   * return (`return_page`): read P' from the server's PTE, read
+    ///     P_expected from `self`'s reserved PTE (and require `PTE_LENT`
+    ///     set + `PTE_VALID` clear). If `P' != P_expected` or the LENT
+    ///     bit is absent → `Error::ShareViolation`. Otherwise re-set
+    ///     `PTE_VALID` / clear `PTE_LENT` (flags survive in the PTE),
+    ///     unmap the server, TLB-invalidate both.
+    ///   * death edges (§8): on server death, walk its outstanding
+    ///     borrows and restore each client's reserved PTE; on client
+    ///     death, don't free a page still lent to a live server. This is
+    ///     the risky part and is why the switch is gated on real
+    ///     multi-thread / SMP need rather than landed speculatively.
     pub fn lend_page(
         &mut self,
         mm: &mut MemoryManager,
@@ -629,6 +657,13 @@ impl MemoryMapping {
     }
 
     /// Return a lent page.
+    ///
+    /// Counterpart to the simplified [`lend_page`]: since the lend never
+    /// revoked the sender, returning is just unmapping the borrower's
+    /// second mapping; the original is still live in `dest_space`. When
+    /// `lend_page` becomes break-then-make, this must instead validate
+    /// the returned frame against the sender's reserved PTE and restore
+    /// it (see the design note on [`lend_page`]).
     pub fn return_page(
         &mut self,
         src_addr: *mut usize,

@@ -646,6 +646,48 @@ impl SystemServices {
             })?;
             return Ok(src_virt);
         }
+        // ── Cross-domain borrow safety tripwire ──────────────────────
+        //
+        // Our AArch64 port implements a lend as "add a second mapping
+        // to the same physical page in the receiver" WITHOUT revoking
+        // the sender's mapping (see arch::aarch64::mem::lend_page). That
+        // is only safe because the lending thread blocks for the whole
+        // borrow and BeetOS services are single-threaded in practice —
+        // so no *other* thread of the sender runs while the page is also
+        // writable in the receiver.
+        //
+        // It is NOT the article's break-then-make discipline: if the
+        // sender had a second runnable thread, that thread could race
+        // the receiver on the shared page across the protection-domain
+        // boundary, and Rust cannot see it. The proper fix (revoke the
+        // sender at lend, validate + restore at return, with
+        // ShareViolation on a substituted page) is specced at the lend_
+        // page/return_page call sites and gated behind real multi-thread
+        // / SMP need — it requires death-edge restoration on the
+        // termination path, which is too risky to graft on for a
+        // currently-unreachable hazard.
+        //
+        // Until then, make the unsafe precondition LOUD instead of
+        // silent: if the lending process has another thread ready to
+        // run, the single-thread assumption is violated. Debug-only, so
+        // it costs nothing in production but trips our CI smokes the day
+        // someone adds a multi-threaded lender.
+        #[cfg(beetos)]
+        debug_assert!(
+            {
+                let proc = self.current_process();
+                let ready = (1..crate::arch::process::MAX_THREAD_COUNT)
+                    .filter(|&t| proc.thread_state(t) == crate::process::ThreadState::Ready)
+                    .count();
+                ready <= 1
+            },
+            "lend_memory from a multi-threaded process (PID {}): the AArch64 \
+             lend keeps the sender's mapping live, so a sibling thread can race \
+             the receiver on the shared page. Implement break-then-make before \
+             lending from multi-threaded processes (see arch/aarch64/mem.rs).",
+            current_pid.get(),
+        );
+
         let src_mapping = &mut self.process_mut(current_pid)?.mapping;
         // Opt out of the borrow checker, because we know these are two different mappings.
         let src_mapping = unsafe { &mut *(src_mapping as *mut _) };
