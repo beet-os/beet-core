@@ -162,6 +162,15 @@ cargo xtask qemu           # launch QEMU virt with the kernel (UART output to te
 
 Requires: `qemu-system-aarch64` installed on host.
 
+**Reproducible toolchain (`flake.nix`):** `nix develop` drops you into a
+shell with a pinned qemu (**with its option ROMs** — the thing that
+breaks when a bare qemu is installed piecemeal), socat, ImageMagick, the
+LLVM objcopy/strip tools, and the Rust toolchain read from
+`rust-toolchain.toml`. Then run `cargo xtask …` as usual. With direnv,
+`direnv allow` auto-enters it. It's a dev *shell*, not a Nix build of the
+project. The M9 std fork (`beetos/rust`) is out of scope. First
+`nix develop` generates `flake.lock` — commit it to pin inputs exactly.
+
 ### Apple M1 (real hardware)
 
 ```bash
