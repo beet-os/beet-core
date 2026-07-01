@@ -783,8 +783,40 @@ fn handle_mutable_borrow(sender: xous::MessageSender, mem: &xous::MemoryMessage)
     let path_len = path_copy.iter().position(|&b| b == 0).unwrap_or(32);
     let path = core::str::from_utf8(&path_copy[..path_len]).unwrap_or("");
 
-    // Determine status and write output into the text area directly via raw pointer.
-    let status: FsError = if full_len > BUF_TEXT_OFFSET {
+    // WriteBuf carries content as INPUT, so it must be read before the
+    // read-ops branch below zeroes the text area. Length-prefixed
+    // (u16 at WRITE_LEN_OFFSET) so content may contain NULs and an
+    // oversized declaration is rejected rather than truncated.
+    let status: FsError = if op == FsOp::WriteBuf as usize {
+        use beetos_api_fs::{WRITE_CONTENT_OFFSET, WRITE_LEN_OFFSET, WRITE_MAX_CONTENT};
+        if full_len < WRITE_CONTENT_OFFSET {
+            FsError::InvalidPath
+        } else {
+            let content_len = {
+                let lo = unsafe { *mem.buf.as_ptr().add(WRITE_LEN_OFFSET) } as usize;
+                let hi = unsafe { *mem.buf.as_ptr().add(WRITE_LEN_OFFSET + 1) } as usize;
+                lo | (hi << 8)
+            };
+            if content_len > WRITE_MAX_CONTENT
+                || WRITE_CONTENT_OFFSET + content_len > full_len
+            {
+                FsError::NoSpace
+            } else {
+                // Copy content to a stack buffer before calling do_write
+                // (which may re-enter IPC via the block service for
+                // /data), so nothing aliases the borrowed page.
+                let mut content = [0u8; WRITE_MAX_CONTENT];
+                let src = unsafe {
+                    core::slice::from_raw_parts(
+                        mem.buf.as_ptr().add(WRITE_CONTENT_OFFSET),
+                        content_len,
+                    )
+                };
+                content[..content_len].copy_from_slice(src);
+                do_write(path, &content[..content_len])
+            }
+        }
+    } else if full_len > BUF_TEXT_OFFSET {
         let text_ptr = unsafe { mem.buf.as_mut_ptr().add(BUF_TEXT_OFFSET) };
         let text_len = full_len - BUF_TEXT_OFFSET;
         // Zero text area.

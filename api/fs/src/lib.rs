@@ -89,7 +89,29 @@ pub enum FsOp {
     /// Lock the `/data` area (BlockingScalar, no args): drops the key.
     /// Returns Scalar1(FsError::Ok).
     CryptLock = 11,
+
+    /// Buffer-based file write (MutableBorrow). Lifts `WriteShort`'s
+    /// 15-byte scalar cap. Layout:
+    ///   `[0..32]`   path (null-terminated) — client writes
+    ///   `[32]`      status (`FsError` as u8) — server writes on return
+    ///   `[33..35]`  content length u16 LE — client writes
+    ///   `[35..]`    content bytes (may include NUL) — client writes
+    /// Server reads path + length + content, performs the write, stamps
+    /// the status at [32]. Content is capped at [`WRITE_MAX_CONTENT`];
+    /// a longer declared length is rejected (`NoSpace`), never
+    /// truncated silently.
+    WriteBuf = 12,
 }
+
+/// Offset of the u16 LE content length in a `WriteBuf` buffer.
+pub const WRITE_LEN_OFFSET: usize = BUF_TEXT_OFFSET; // 33
+/// Offset where `WriteBuf` content begins.
+pub const WRITE_CONTENT_OFFSET: usize = BUF_TEXT_OFFSET + 2; // 35
+/// Largest content a single `WriteBuf` carries. Comfortably above the
+/// shell's 256-byte line limit and the encrypted-slot payload (~448 B),
+/// so realistic writes never truncate; a larger declared length is a
+/// loud `NoSpace`, not a silent cut.
+pub const WRITE_MAX_CONTENT: usize = 512;
 
 /// Error codes returned by the FS service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

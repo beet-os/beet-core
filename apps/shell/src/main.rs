@@ -582,6 +582,56 @@ fn fs_buf_op(op: FsOp, path: &str) -> Option<usize> {
     status
 }
 
+/// Buffer-based file write (MutableBorrow) — lifts WriteShort's 15-byte
+/// cap. Packs path + length-prefixed content into a page and sends
+/// `WriteBuf`. Returns the server's status code, or `None` if the fs
+/// service is unavailable / the map failed.
+fn fs_write_buf(path: &str, content: &[u8]) -> Option<usize> {
+    use beetos_api_fs::{WRITE_CONTENT_OFFSET, WRITE_LEN_OFFSET, WRITE_MAX_CONTENT};
+    let cid = get_fs_cid();
+    if cid == 0 { return None; }
+
+    let page_size = xous::MemorySize::new(beetos::PAGE_SIZE)?;
+    let buf_range = match xous::rsyscall(xous::SysCall::MapMemory(
+        None, None, page_size, xous::MemoryFlags::W,
+    )) {
+        Ok(xous::Result::MemoryRange(r)) => r,
+        _ => return None,
+    };
+    unsafe { core::ptr::write_bytes(buf_range.as_mut_ptr(), 0, buf_range.len()); }
+
+    let clen = content.len().min(WRITE_MAX_CONTENT);
+    let page = unsafe { core::slice::from_raw_parts_mut(buf_range.as_mut_ptr(), buf_range.len()) };
+    // Path (null-terminated, capped at MAX_PATH_LEN-1 like the read ops).
+    let pbytes = path.as_bytes();
+    let plen = pbytes.len().min(beetos_api_fs::MAX_PATH_LEN - 1);
+    page[..plen].copy_from_slice(&pbytes[..plen]);
+    page[plen] = 0;
+    // Content length (u16 LE) then content bytes.
+    page[WRITE_LEN_OFFSET] = (clen & 0xff) as u8;
+    page[WRITE_LEN_OFFSET + 1] = ((clen >> 8) & 0xff) as u8;
+    page[WRITE_CONTENT_OFFSET..WRITE_CONTENT_OFFSET + clen].copy_from_slice(&content[..clen]);
+
+    let result = xous::rsyscall(xous::SysCall::SendMessage(
+        cid,
+        xous::Message::MutableBorrow(xous::MemoryMessage {
+            id: FsOp::WriteBuf as usize,
+            buf: buf_range,
+            offset: None,
+            valid: None,
+        }),
+    ));
+    let status = match result {
+        Ok(xous::Result::MemoryReturned(_, _)) | Ok(xous::Result::Ok) => {
+            let page = unsafe { core::slice::from_raw_parts(buf_range.as_ptr(), buf_range.len()) };
+            Some(page[BUF_STATUS_OFFSET] as usize)
+        }
+        _ => None,
+    };
+    xous::rsyscall(xous::SysCall::UnmapMemory(buf_range)).ok();
+    status
+}
+
 /// Send a BlockingScalar to the FS service and return the result code.
 fn fs_scalar(op: FsOp, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> Option<usize> {
     let cid = get_fs_cid();
@@ -675,42 +725,29 @@ fn cmd_write(args: &[&str], full_line: &str) {
         args[1]
     };
 
-    // WriteShort packs the path into args 1-2 (16 bytes, 15 chars +
-    // null) and the content into args 3-4 (same). Anything longer is
-    // *silently truncated* on the wire — caught by the adversarial
-    // pass: `write /data/this_is_a_very_long_name AB` created a file
-    // named `this_is_a_`. Reject loudly here; a future buffer-based
-    // WriteOp can lift the cap when something needs it.
-    const WRITE_SHORT_LIMIT: usize = 15;
-    if path.len() > WRITE_SHORT_LIMIT {
+    // Buffer-based write (WriteBuf): path up to 31 chars (the shared
+    // buffer path field, same limit as cat/ls), content up to
+    // WRITE_MAX_CONTENT. Both are rejected loudly rather than
+    // truncated — the round-4 adversarial finding was silent
+    // truncation via the old 15-byte WriteShort scalar path.
+    if path.len() > beetos_api_fs::MAX_PATH_LEN - 1 {
         let _ = write!(
             DualWriter,
-            "write: path too long ({} > {} chars) — short-write path limit\n",
-            path.len(), WRITE_SHORT_LIMIT,
+            "write: path too long ({} > {} chars)\n",
+            path.len(), beetos_api_fs::MAX_PATH_LEN - 1,
         );
         return;
     }
-    if content.len() > WRITE_SHORT_LIMIT {
+    if content.len() > beetos_api_fs::WRITE_MAX_CONTENT {
         let _ = write!(
             DualWriter,
-            "write: content too long ({} > {} bytes) — short-write content limit\n",
-            content.len(), WRITE_SHORT_LIMIT,
+            "write: content too long ({} > {} bytes)\n",
+            content.len(), beetos_api_fs::WRITE_MAX_CONTENT,
         );
         return;
     }
 
-    let path_packed = beetos_api_fs::pack_path(path);
-    let content_bytes = content.as_bytes();
-    let ws = core::mem::size_of::<usize>();
-    let mut c_args = [0usize; 2];
-    for (i, chunk) in content_bytes.chunks(ws).enumerate() {
-        if i >= 2 { break; }
-        let mut buf = [0u8; core::mem::size_of::<usize>()];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        c_args[i] = usize::from_le_bytes(buf);
-    }
-
-    match fs_scalar(FsOp::WriteShort, path_packed[0], path_packed[1], c_args[0], c_args[1]) {
+    match fs_write_buf(path, content.as_bytes()) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::ReadOnly as usize => {
             let _ = write!(DualWriter, "write: {}: read-only\n", path);

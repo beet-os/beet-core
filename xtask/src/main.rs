@@ -1480,8 +1480,11 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
 
     const HOST_CONSOLE_PORT: u16 = 5562;
     const PASS: &str = "p4ss-crypt-smoke";
-    // ≤16 bytes: `write` packs content into two scalar words.
-    const SECRET: &str = "S3CR3T_M8_OK_42";
+    // Deliberately >15 bytes: exercises the WriteBuf path (the old
+    // WriteShort scalar packing capped content at 15 bytes). A silent
+    // regression back to WriteShort would truncate this and the
+    // read-back assertion would fail.
+    const SECRET: &str = "S3CR3T_M8_much_longer_than_fifteen_bytes_OK_42";
 
     let root = workspace_root();
 
