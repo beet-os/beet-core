@@ -41,6 +41,17 @@ pub(crate) const INPUT_BUF_CAP: usize = 64;
 /// `AcquireInputFocus(sid)` to register where keyboard characters should be
 /// delivered.  Characters arriving while no focus is claimed are buffered in
 /// `input_buf` and drained on the next `AcquireInputFocus`.
+/// Outcome of an `AcquireDisplay` attempt.
+#[cfg(beetos)]
+pub enum AcquireDisplay {
+    /// Ownership is held now; the caller should return the cursor position.
+    Granted,
+    /// The caller was enqueued; it must suspend until woken by `release_display`.
+    Queued,
+    /// The waiter queue is full; the caller was not enqueued and must not suspend.
+    QueueFull,
+}
+
 #[cfg(beetos)]
 struct DisplayState {
     /// Current owner, or `None` if the display is free.
@@ -55,6 +66,10 @@ struct DisplayState {
     waiter_count: usize,
     /// SID to which keyboard characters are currently routed, or `None` to buffer.
     input_sid: Option<[u32; 4]>,
+    /// PID that registered the current input focus.  Tracked so the focus can be
+    /// cleared when that process exits (otherwise `input_sid` dangles and every
+    /// keystroke is delivered to — and dropped by — a dead server).
+    input_pid: Option<PID>,
     /// Ring buffer for characters arriving while no input focus is claimed.
     input_buf: [u8; INPUT_BUF_CAP],
     /// Index of the oldest byte in `input_buf`.
@@ -76,6 +91,7 @@ impl DisplayState {
             waiter_head: 0,
             waiter_count: 0,
             input_sid: None,
+            input_pid: None,
             input_buf: [0u8; INPUT_BUF_CAP],
             input_head: 0,
             input_count: 0,
@@ -104,12 +120,35 @@ impl DisplayState {
         Some(entry)
     }
 
-    fn set_input_focus(&mut self, sid: [u32; 4]) {
+    /// Remove every queued waiter belonging to `pid`, compacting the ring.
+    ///
+    /// Called when a process exits so a later, unrelated process that reuses the
+    /// same PID number can never be mistaken for the dead waiter (which would
+    /// hand it the framebuffer and force-wake one of its threads).
+    fn purge_waiter_pid(&mut self, pid: PID) {
+        let mut kept = self.waiters; // Copy; only the first `n` entries are used
+        let mut n = 0;
+        for i in 0..self.waiter_count {
+            let idx = (self.waiter_head + i) % DISPLAY_WAITER_MAX;
+            let entry = self.waiters[idx];
+            if entry.0 != pid {
+                kept[n] = entry;
+                n += 1;
+            }
+        }
+        self.waiters[..n].copy_from_slice(&kept[..n]);
+        self.waiter_head = 0;
+        self.waiter_count = n;
+    }
+
+    fn set_input_focus(&mut self, pid: PID, sid: [u32; 4]) {
         self.input_sid = Some(sid);
+        self.input_pid = Some(pid);
     }
 
     fn clear_input_focus(&mut self) {
         self.input_sid = None;
+        self.input_pid = None;
     }
 
     /// Push one byte into the ring buffer, dropping the oldest byte when full.
@@ -139,6 +178,62 @@ impl DisplayState {
     }
 }
 
+/// Number of recently-exited processes whose exit code is retained so that a
+/// `WaitProcess` arriving *after* the target already died can still return the
+/// real exit code instead of fabricating success.
+#[cfg(beetos)]
+const EXIT_REAPER_MAX: usize = 32;
+
+/// Ring of `(raw_pid, exit_code)` for processes that have terminated.  Consulted
+/// by `WaitProcess` when the target is no longer in the process table, closing
+/// the spawn→exit→wait race where the child finishes before the waiter parks.
+#[cfg(beetos)]
+struct ExitReaper {
+    entries: [(u8, u32); EXIT_REAPER_MAX],
+    head: usize,
+    count: usize,
+}
+
+#[cfg(beetos)]
+impl ExitReaper {
+    const fn new() -> Self {
+        Self { entries: [(0u8, 0u32); EXIT_REAPER_MAX], head: 0, count: 0 }
+    }
+
+    /// Record a process exit, overwriting the oldest entry when full.
+    fn record(&mut self, pid: PID, exit_code: u32) {
+        let raw = pid.get();
+        // Replace any earlier record for the same raw PID so a lookup can't
+        // return a stale code from a previous life of a reused PID number.
+        for i in 0..self.count {
+            let idx = (self.head + i) % EXIT_REAPER_MAX;
+            if self.entries[idx].0 == raw {
+                self.entries[idx].1 = exit_code;
+                return;
+            }
+        }
+        let tail = (self.head + self.count) % EXIT_REAPER_MAX;
+        self.entries[tail] = (raw, exit_code);
+        if self.count < EXIT_REAPER_MAX {
+            self.count += 1;
+        } else {
+            self.head = (self.head + 1) % EXIT_REAPER_MAX;
+        }
+    }
+
+    /// Look up the exit code recorded for `pid`, if any.
+    fn lookup(&self, pid: PID) -> Option<u32> {
+        let raw = pid.get();
+        for i in 0..self.count {
+            let idx = (self.head + i) % EXIT_REAPER_MAX;
+            if self.entries[idx].0 == raw {
+                return Some(self.entries[idx].1);
+            }
+        }
+        None
+    }
+}
+
 /// A big unifying struct containing all of the system state.
 #[allow(dead_code)]
 pub struct SystemServices {
@@ -157,6 +252,10 @@ pub struct SystemServices {
     /// Exclusive display ownership state.
     #[cfg(beetos)]
     display_state: DisplayState,
+
+    /// Recently-exited process exit codes (see `ExitReaper`).
+    #[cfg(beetos)]
+    exit_reaper: ExitReaper,
 }
 
 #[cfg(not(beetos))]
@@ -175,6 +274,7 @@ static mut SYSTEM_SERVICES: SystemServices = SystemServices {
     panic_message: BufStr::new(),
     panic_message_pid: None,
     display_state: DisplayState::new(),
+    exit_reaper: ExitReaper::new(),
 };
 
 #[allow(dead_code)]
@@ -1086,40 +1186,45 @@ impl SystemServices {
             self.send_event(ppid, SystemEvent::ChildTerminated, [ret as _, 0, 0, 0]).ok();
         }
 
-        // Wake all threads waiting on this process via WaitProcess syscall.
-        // Wake all threads waiting on this process via WaitProcess syscall.
-        // Scan kernel futures for WaitProcessExit { target_pid }.
-        // Collect waiters first to avoid borrow conflicts.
+        // Wake every thread waiting on this process via the WaitProcess syscall.
+        // Scan kernel futures for WaitProcessExit { target_pid == dying_pid }.
+        //
+        // We wake inline rather than collecting into a fixed buffer first: each
+        // `match &self.processes[pidx]` borrow ends before `wake_thread_with_result`
+        // re-borrows `self`, so there is no borrow conflict and no hard cap on the
+        // number of waiters that get woken.
         {
             let dying_pid = pid;
             let exit_code = ret as usize;
-            let mut waiters = [(xous::PID::new(1).unwrap(), 0usize); 64];
-            let mut waiter_count = 0;
 
             for pidx in 0..self.processes.len() {
-                let Some(process) = &self.processes[pidx] else { continue };
-                let waiter_pid = process.pid;
+                let waiter_pid = match &self.processes[pidx] {
+                    Some(process) => process.pid,
+                    None => continue,
+                };
                 for wt in 1..crate::arch::process::MAX_THREAD_COUNT {
-                    let is_waiter = matches!(
-                        process.kernel_future(wt),
-                        Some(crate::kfuture::KernelFuture::WaitProcessExit { target_pid })
-                            if *target_pid == dying_pid
-                    );
-                    if is_waiter && waiter_count < waiters.len() {
-                        waiters[waiter_count] = (waiter_pid, wt);
-                        waiter_count += 1;
+                    let is_waiter = match &self.processes[pidx] {
+                        Some(process) => matches!(
+                            process.kernel_future(wt),
+                            Some(crate::kfuture::KernelFuture::WaitProcessExit { target_pid })
+                                if *target_pid == dying_pid
+                        ),
+                        None => false,
+                    };
+                    if is_waiter {
+                        crate::syscall::wake_thread_with_result(
+                            self, waiter_pid, wt,
+                            xous::Result::Scalar1(exit_code),
+                        );
                     }
                 }
             }
-
-            for i in 0..waiter_count {
-                let (waiter_pid, wt) = waiters[i];
-                crate::syscall::wake_thread_with_result(
-                    self, waiter_pid, wt,
-                    xous::Result::Scalar1(exit_code),
-                );
-            }
         }
+
+        // Retain the exit code so a WaitProcess that arrives after this point
+        // (spawn→exit→wait race) returns the real code instead of a fake 0.
+        #[cfg(beetos)]
+        self.exit_reaper.record(pid, ret);
 
         #[cfg(beetos)]
         if ret != 0 {
@@ -1415,6 +1520,45 @@ impl SystemServices {
         let startup = self.create_process(init)?;
         let pid = startup.pid();
 
+        // From here on, any early return must free the just-created process
+        // slot — otherwise it leaks (orphaned in the table, never scheduled,
+        // never reaped).  The fallible setup lives in a helper so a single
+        // error path covers all of it.
+        let actual_argv_len = match self.setup_spawned_process(pid, argv_ptr, argv_len) {
+            Ok(n) => n,
+            Err(e) => {
+                self.free_process(pid);
+                return Err(e);
+            }
+        };
+
+        // Set x0=uart_va, x1=argv_va (or 0), x2=argv_len
+        {
+            let idx = pid.get() as usize - 1;
+            let argv_va = if actual_argv_len > 0 { beetos::ARGV_PAGE_VA } else { 0 };
+            unsafe {
+                crate::arch::process::set_thread_args(
+                    idx,
+                    crate::arch::boot::SHELL_UART_VA,
+                    argv_va,
+                    actual_argv_len,
+                );
+            }
+        }
+
+        println!("[*] spawn_by_name_with_args: created '{}' as PID {} (argv_len={})",
+            name, pid, actual_argv_len);
+        Ok(pid)
+    }
+
+    /// Fallible setup for a freshly-created spawned process: grant syscall
+    /// permissions, map the UART, and (if provided) copy+map the argv page.
+    /// Returns the number of argv bytes actually mapped.
+    ///
+    /// Kept separate from `spawn_by_name_with_args` so its single error path can
+    /// free the process slot on any failure (see caller).
+    #[cfg(beetos)]
+    fn setup_spawned_process(&mut self, pid: PID, argv_ptr: usize, argv_len: usize) -> Result<usize, Error> {
         // Grant all syscall permissions
         self.process_mut(pid)?.set_syscall_permissions(u64::MAX);
 
@@ -1435,7 +1579,7 @@ impl SystemServices {
         }
 
         // Copy argv data and map into new process
-        let actual_argv_len = if argv_ptr != 0 && argv_len > 0 {
+        if argv_ptr != 0 && argv_len > 0 {
             let clamped_len = argv_len.min(beetos::ARGV_MAX_LEN);
 
             // Copy argv from caller's address space into a kernel buffer.
@@ -1491,28 +1635,18 @@ impl SystemServices {
                 })?;
 
                 Ok(safe_len)
-            })?
+            })
         } else {
-            0
-        };
-
-        // Set x0=uart_va, x1=argv_va (or 0), x2=argv_len
-        {
-            let idx = pid.get() as usize - 1;
-            let argv_va = if actual_argv_len > 0 { beetos::ARGV_PAGE_VA } else { 0 };
-            unsafe {
-                crate::arch::process::set_thread_args(
-                    idx,
-                    crate::arch::boot::SHELL_UART_VA,
-                    argv_va,
-                    actual_argv_len,
-                );
-            }
+            Ok(0)
         }
+    }
 
-        println!("[*] spawn_by_name_with_args: created '{}' as PID {} (argv_len={})",
-            name, pid, actual_argv_len);
-        Ok(pid)
+    /// Look up the exit code of a process that has already terminated, if it is
+    /// still retained in the exit reaper.  Used by `WaitProcess` to close the
+    /// spawn→exit→wait race.
+    #[cfg(beetos)]
+    pub fn reaped_exit_code(&self, pid: PID) -> Option<u32> {
+        self.exit_reaper.lookup(pid)
     }
 
     /// Return the current cursor position stored by the last `release_display` call.
@@ -1534,11 +1668,29 @@ impl SystemServices {
         self.display_state.push_input_char(c);
     }
 
-    /// Clear the keyboard input focus. Subsequent keystrokes go to the kernel
-    /// ring buffer until the next `AcquireInputFocus` call.
+    /// Clear the keyboard input focus if `pid` is the process that registered
+    /// it.  Subsequent keystrokes go to the kernel ring buffer until the next
+    /// `AcquireInputFocus` call.
+    ///
+    /// Guarding by the focus-owner PID prevents an unrelated process from
+    /// silently stealing keyboard input away from the shell.
     #[cfg(beetos)]
-    pub fn release_input_focus(&mut self) {
+    pub fn release_input_focus(&mut self, pid: PID) -> Result<(), xous::Error> {
+        if self.display_state.input_pid != Some(pid) {
+            return Err(xous::Error::AccessDenied);
+        }
         self.display_state.clear_input_focus();
+        Ok(())
+    }
+
+    /// Called when a process exits: if it held the keyboard input focus, clear
+    /// it so keystrokes fall back to the kernel ring buffer instead of being
+    /// delivered to (and dropped by) the dead server's SID.
+    #[cfg(beetos)]
+    pub fn clear_input_focus_on_exit(&mut self, pid: PID) {
+        if self.display_state.input_pid == Some(pid) {
+            self.display_state.clear_input_focus();
+        }
     }
 
     /// Register `sid_words` as the keyboard input destination for the current
@@ -1560,7 +1712,7 @@ impl SystemServices {
             return Err(xous::Error::AccessDenied);
         }
 
-        self.display_state.set_input_focus(sid_words);
+        self.display_state.set_input_focus(pid, sid_words);
 
         let n = self.display_state.drain_input_buf(out_buf);
         Ok(n)
@@ -1568,25 +1720,33 @@ impl SystemServices {
 
     /// Try to acquire exclusive display ownership for `(pid, tid)`.
     ///
-    /// Returns `true` if ownership was granted immediately (the display was
-    /// free).  Returns `false` if another process already owns the display —
-    /// in that case the caller is queued and will be woken when the current
-    /// owner calls `release_display`.
-    ///
-    /// On success the framebuffer pages are mapped into `pid`'s address space
-    /// at `SHELL_FB_VA`.
+    /// - `Granted`: ownership held now (display was free, or `pid` already owns
+    ///   it — acquiring twice is idempotent, not a self-deadlock).  The
+    ///   framebuffer is mapped into `pid` at `SHELL_FB_VA`.
+    /// - `Queued`: another process owns the display; the caller was enqueued and
+    ///   will be woken by `release_display`.  The caller must suspend.
+    /// - `QueueFull`: the waiter queue is full; the caller was **not** enqueued
+    ///   and must not suspend (doing so would block it forever).
     #[cfg(beetos)]
-    pub fn try_acquire_display(&mut self, pid: PID, tid: TID) -> bool {
-        if self.display_state.owner.is_some() {
-            // Display is busy — enqueue this thread.
-            self.display_state.push_waiter(pid, tid);
-            return false;
+    pub fn try_acquire_display(&mut self, pid: PID, tid: TID) -> AcquireDisplay {
+        match self.display_state.owner {
+            // Already the owner — idempotent success, don't enqueue behind self.
+            Some((owner_pid, _)) if owner_pid == pid => AcquireDisplay::Granted,
+            // Someone else owns it — enqueue, unless the queue is full.
+            Some(_) => {
+                if self.display_state.push_waiter(pid, tid) {
+                    AcquireDisplay::Queued
+                } else {
+                    AcquireDisplay::QueueFull
+                }
+            }
+            // Display is free — grant ownership immediately.
+            None => {
+                self.display_state.owner = Some((pid, tid));
+                self.map_fb_for(pid);
+                AcquireDisplay::Granted
+            }
         }
-
-        // Display is free — grant ownership immediately.
-        self.display_state.owner = Some((pid, tid));
-        self.map_fb_for(pid);
-        true
     }
 
     /// Release exclusive display ownership, storing the cursor position.
@@ -1633,15 +1793,27 @@ impl SystemServices {
         }
     }
 
-    /// Called when a process exits: if it held the display, release it.
+    /// Called when a process exits.  Cleans up every piece of display/input
+    /// state the process might hold:
+    /// 1. Removes it from the waiter queue (so a reused PID can't inherit its
+    ///    queued slot).
+    /// 2. Clears keyboard input focus if it held it (even without owning the
+    ///    display), so keystrokes fall back to the kernel ring buffer.
+    /// 3. If it owned the display, hands ownership to the next live waiter.
     #[cfg(beetos)]
     pub fn release_display_on_exit(&mut self, pid: PID) {
+        // (1) Purge any queued waiter entries for this PID.
+        self.display_state.purge_waiter_pid(pid);
+
+        // (2) Drop dangling input focus held by the exiting process.
+        self.clear_input_focus_on_exit(pid);
+
+        // (3) Hand off display ownership if this process owned it.
         if self.display_state.owner.map(|(p, _)| p) == Some(pid) {
             let row = self.display_state.cursor_row;
             let col = self.display_state.cursor_col;
             // Don't unmap — the process page tables are being freed anyway.
             self.display_state.owner = None;
-            self.display_state.clear_input_focus();
 
             // Hand off to next waiter, skipping any that exited while waiting.
             loop {

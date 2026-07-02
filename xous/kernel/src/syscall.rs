@@ -940,9 +940,21 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         }
         #[cfg(beetos)]
         SysCall::WaitProcess(target_pid) => SystemServices::with_mut(|ss| {
-            // If the process already exited, return immediately.
+            // Waiting on yourself, or on the never-exiting kernel PID 1, can only
+            // ever deadlock — reject it rather than park the caller forever.
+            if target_pid == crate::arch::process::current_pid() || target_pid.get() == 1 {
+                return Err(Error::InvalidArguments);
+            }
+
+            // If the target is not currently live, it may have already exited.
             if ss.process(target_pid).is_err() {
-                return Ok(Result::Scalar1(0));
+                // Return the retained exit code if the reaper still has it;
+                // otherwise the PID never existed (or aged out), which is a
+                // caller error — not a fabricated success.
+                return match ss.reaped_exit_code(target_pid) {
+                    Some(code) => Ok(Result::Scalar1(code as usize)),
+                    None => Err(Error::ProcessNotFound),
+                };
             }
 
             // Suspend with a kernel future. The wake path in
@@ -1005,19 +1017,27 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
 
         #[cfg(beetos)]
         SysCall::AcquireDisplay => SystemServices::with_mut(|ss| {
+            use crate::services::AcquireDisplay;
             let pid = crate::arch::process::current_pid();
             let (row, col) = ss.display_cursor();
-            if ss.try_acquire_display(pid, tid) {
-                // Granted immediately — return cursor position.
-                Ok(xous::Result::Scalar2(row, col))
-            } else {
-                // Queued — suspend until release_display wakes us.
-                suspend_with_future(
-                    ss, tid,
-                    KernelFuture::WaitDisplay,
-                    crate::kfuture::EVENT_KERNEL,
-                );
-                Scheduler::with_mut(|s| s.activate_current(ss))
+            match ss.try_acquire_display(pid, tid) {
+                AcquireDisplay::Granted => {
+                    // Held now — return cursor position.
+                    Ok(xous::Result::Scalar2(row, col))
+                }
+                AcquireDisplay::Queued => {
+                    // Enqueued — suspend until release_display wakes us.
+                    suspend_with_future(
+                        ss, tid,
+                        KernelFuture::WaitDisplay,
+                        crate::kfuture::EVENT_KERNEL,
+                    );
+                    Scheduler::with_mut(|s| s.activate_current(ss))
+                }
+                AcquireDisplay::QueueFull => {
+                    // Not enqueued — must not suspend (would block forever).
+                    Err(Error::OutOfMemory)
+                }
             }
         }),
 
@@ -1047,7 +1067,8 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
 
         #[cfg(beetos)]
         SysCall::ReleaseInputFocus => SystemServices::with_mut(|ss| {
-            ss.release_input_focus();
+            let pid = crate::arch::process::current_pid();
+            ss.release_input_focus(pid)?;
             Ok(xous::Result::Ok)
         }),
 

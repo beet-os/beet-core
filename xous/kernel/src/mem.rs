@@ -63,7 +63,11 @@ impl core::fmt::Display for MemoryRangeExtra {
             ((self.mem_tag >> 24) & 0xff) as u8 as char,
             self.mem_tag,
             self.mem_start,
-            self.mem_start + self.mem_size,
+            // Widen before adding: `mem_start + mem_size` in u32 wraps for a
+            // region ending at/above 4 GiB (debug builds panic).  The fields
+            // stay u32 because they are memcpy'd from the fixed 16-byte
+            // kernel-args layout; a 64-bit region format is an M3b task.
+            self.mem_start as u64 + self.mem_size as u64,
             self.mem_size
         )
     }
@@ -867,7 +871,7 @@ impl MemoryManager {
         offset += RAM_PAGES;
         // Go through additional regions looking for this address
         for region in &self.extra_regions {
-            if addr >= (region.mem_start as usize) && addr < (region.mem_start + region.mem_size) as usize {
+            if addr >= (region.mem_start as usize) && addr < (region.mem_start as usize) + (region.mem_size as usize) {
                 offset += (addr - (region.mem_start as usize)) / PAGE_SIZE;
                 return Some(offset);
             }

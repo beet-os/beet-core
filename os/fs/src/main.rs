@@ -278,6 +278,11 @@ fn do_ls(path: &str) -> FsError {
     if is_disk_path(path) {
         if let Some(archive) = get_disk_archive() {
             let subpath = disk_subpath(path);
+            // Listing a nonexistent directory must fail, not silently succeed
+            // with no entries.
+            if !archive.has_dir(subpath) {
+                return FsError::NotFound;
+            }
             archive.list(subpath, |name, is_dir, size| {
                 if is_dir {
                     let _ = write!(UartWriter, "  {}/\n", name);
@@ -412,6 +417,10 @@ fn do_ls_buf(path: &str, output: &mut [u8]) -> FsError {
     if is_disk_path(path) {
         if let Some(archive) = get_disk_archive() {
             let subpath = disk_subpath(path);
+            // Listing a nonexistent directory must fail, not silently succeed.
+            if !archive.has_dir(subpath) {
+                return FsError::NotFound;
+            }
             archive.list(subpath, |name, is_dir, size| {
                 if is_dir {
                     let _ = write!(w, "  {}/\n", name);
@@ -486,5 +495,6 @@ fn do_cat_buf(path: &str, output: &mut [u8]) -> FsError {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     puts("PANIC in fs!\n");
-    loop { unsafe { core::arch::asm!("wfe", options(nomem, nostack)) }; }
+    // Terminate rather than spin so the kernel reclaims any held resources.
+    xous::terminate_process(1);
 }

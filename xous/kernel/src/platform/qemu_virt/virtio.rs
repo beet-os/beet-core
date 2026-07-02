@@ -272,15 +272,28 @@ impl Virtqueue {
     /// Check if there are new entries in the used ring.
     /// Returns Some((desc_head_idx, bytes_written)) if available.
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
-        fence(Ordering::Acquire);
+        // Load the device-published used index first, then place the acquire
+        // barrier *before* reading the ring element it makes visible.  The
+        // barrier must sit between the idx load and the element/data loads
+        // (this is Linux's `virtio_rmb()`); putting it ahead of the idx load
+        // orders nothing useful and lets the CPU read a stale ring element or
+        // stale status/data on a weakly-ordered host (e.g. ARM under KVM/HVF).
         let used_idx = unsafe { core::ptr::read_volatile(&(*self.used).idx) };
         if self.last_used_idx == used_idx {
             return None;
         }
+        fence(Ordering::Acquire);
         let ring_base = unsafe { (self.used as *mut u8).add(4) as *mut VirtqUsedElem };
         let slot = self.last_used_idx as usize % self.num as usize;
         let elem = unsafe { core::ptr::read_volatile(ring_base.add(slot)) };
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
+
+        // The descriptor id is written by the device; a malfunctioning or
+        // hostile device could return an out-of-range value.  Reject it rather
+        // than let `free_chain`/`free_desc` index past the descriptor table.
+        if elem.id >= self.num as u32 {
+            return None;
+        }
         Some((elem.id as u16, elem.len))
     }
 }

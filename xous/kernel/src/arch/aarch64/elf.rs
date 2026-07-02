@@ -137,6 +137,20 @@ pub unsafe fn load_elf(
         0
     };
 
+    // Bound the program-header table against the buffer before dereferencing
+    // it: e_phoff/e_phnum come straight from the (untrusted) ELF and, unchecked,
+    // let `phdr_base.add(i)` read arbitrary kernel memory as phdrs.
+    let phentsize = core::mem::size_of::<Elf64Phdr>();
+    let phdr_bytes = (header.e_phnum as usize)
+        .checked_mul(phentsize)
+        .ok_or(Error::BadAddress)?;
+    let phdr_end = (header.e_phoff as usize)
+        .checked_add(phdr_bytes)
+        .ok_or(Error::BadAddress)?;
+    if phdr_end > len {
+        return Err(Error::BadAddress);
+    }
+
     // Validate W^X: no segment should be both writable and executable
     let phdr_base = base.add(header.e_phoff as usize) as *const Elf64Phdr;
     for i in 0..header.e_phnum as usize {
@@ -166,9 +180,18 @@ pub unsafe fn load_elf(
         if phdr.p_flags & PF_W != 0 { flags |= MemoryFlags::W; }
         if phdr.p_flags & PF_X != 0 { flags |= MemoryFlags::X; }
 
-        // Map pages for this segment
+        // Map pages for this segment.  Guard vaddr+memsz against overflow: a
+        // malformed p_memsz could otherwise wrap and short-map / skip the
+        // segment.  filesz must also not exceed memsz.
+        if filesz > memsz {
+            return Err(Error::BadAddress);
+        }
         let page_start = vaddr & !(beetos::PAGE_SIZE - 1);
-        let page_end = (vaddr + memsz + beetos::PAGE_SIZE - 1) & !(beetos::PAGE_SIZE - 1);
+        let seg_end = vaddr.checked_add(memsz).ok_or(Error::BadAddress)?;
+        let page_end = seg_end
+            .checked_add(beetos::PAGE_SIZE - 1)
+            .ok_or(Error::BadAddress)?
+            & !(beetos::PAGE_SIZE - 1);
         let mut offset = 0;
 
         while page_start + offset < page_end {
@@ -203,6 +226,14 @@ pub unsafe fn load_elf(
                         actual_copy,
                     );
                 }
+            }
+
+            // If this page holds executable code, make the freshly-written
+            // bytes visible to the instruction fetch path.  Without this, a core
+            // with separate I/D caches (Apple Silicon) executes stale bytes.
+            // We sync through the kernel linear-map VA where we just wrote.
+            if phdr.p_flags & PF_X != 0 {
+                super::asm::sync_icache(page_kern_va, beetos::PAGE_SIZE);
             }
 
             mapping.map_page(mm, page_phys, page_virt, flags, true)?;
@@ -259,6 +290,13 @@ unsafe fn apply_relocations(
     for i in 0..header.e_phnum as usize {
         let phdr = core::ptr::read_unaligned(phdr_base.add(i));
         if phdr.p_type == PT_DYNAMIC {
+            // Bound the dynamic table against the buffer before reading it.
+            let dyn_end = (phdr.p_offset as usize)
+                .checked_add(phdr.p_filesz as usize)
+                .ok_or(Error::BadAddress)?;
+            if dyn_end > elf_len {
+                return Err(Error::BadAddress);
+            }
             let dyn_base = base.add(phdr.p_offset as usize) as *const Elf64Dyn;
             let count = phdr.p_filesz as usize / core::mem::size_of::<Elf64Dyn>();
             for j in 0..count {
@@ -286,6 +324,16 @@ unsafe fn apply_relocations(
         }
 
         let count = rela_size / rela_ent;
+        // Bound the whole relocation table against the buffer: the loop reads
+        // `count` × size_of::<Elf64Rela> bytes from rela_file_off, and count
+        // derives from the untrusted DT_RELASZ.
+        let rela_span = (count as usize)
+            .checked_mul(core::mem::size_of::<Elf64Rela>())
+            .ok_or(Error::BadAddress)?;
+        match rela_file_off.checked_add(rela_span) {
+            Some(end) if end <= elf_len => {}
+            _ => return Err(Error::BadAddress),
+        }
         let rela_base = base.add(rela_file_off) as *const Elf64Rela;
         for i in 0..count as usize {
             let rela = core::ptr::read_unaligned(rela_base.add(i));

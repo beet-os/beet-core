@@ -386,15 +386,20 @@ fn flags_to_pte(flags: MemoryFlags, user: bool) -> u64 {
             pte |= PTE_UXN | PTE_PXN;
         }
     } else {
-        // Kernel mapping: EL1 only
-        if flags.is_set(MemoryFlags::W) {
+        // Kernel mapping: EL1 only.  Enforce W^X the same way as the user
+        // branch: if a page is writable it must not be executable, even if the
+        // caller passed X.  A W|X kernel request otherwise yields an RWX kernel
+        // page (AP_RW_EL1 without PXN) — a direct W^X violation.
+        let writable = flags.is_set(MemoryFlags::W);
+        let executable = flags.is_set(MemoryFlags::X) && !writable;
+
+        if writable {
             pte |= PTE_AP_RW_EL1;
         } else {
             pte |= PTE_AP_RO_EL1;
         }
-        if flags.is_set(MemoryFlags::X) {
-            // Kernel executable
-            pte |= PTE_UXN; // Never user-executable
+        if executable {
+            pte |= PTE_UXN; // kernel-executable, never user-executable
         } else {
             pte |= PTE_UXN | PTE_PXN;
         }
@@ -672,7 +677,16 @@ impl MemoryMapping {
     }
 
     /// Invalidate a page mapping (used after returning memory).
-    pub fn invalidate_page(&self, virt: *mut usize, _phys: usize) {
+    ///
+    /// Also cleans+invalidates the page's data cache lines to the PoC: the page
+    /// may be reallocated to another owner and mapped non-cacheable, so any
+    /// dirty line left behind could be written back later and corrupt that
+    /// owner's data.  We operate through the kernel linear-map VA, which stays
+    /// valid via TTBR1 regardless of the TTBR0 mapping being torn down.
+    pub fn invalidate_page(&self, virt: *mut usize, phys: usize) {
+        if phys != 0 {
+            super::asm::dc_civac_range(beetos::phys_to_virt(phys), beetos::PAGE_SIZE);
+        }
         super::asm::flush_tlb_entry(virt as usize);
     }
 

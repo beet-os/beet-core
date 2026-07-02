@@ -151,7 +151,9 @@ fn handle_irq() -> bool {
         use crate::platform::qemu_virt::{blk, gic, input, net, net_stack, timer, uart};
 
         let irq = gic::ack_irq();
-        if irq == gic::IRQ_SPURIOUS {
+        // INTIDs 1020-1023 are all special (group/reserved/spurious) and must
+        // not be EOI'd or dispatched — filter the whole range, not just 1023.
+        if irq >= 1020 {
             return false;
         }
 
@@ -196,7 +198,8 @@ fn handle_irq() -> bool {
         use crate::platform::bcm2712::{gic, timer};
 
         let irq = gic::ack_irq();
-        if irq == gic::IRQ_SPURIOUS {
+        // INTIDs 1020-1023 are all special and must not be EOI'd or dispatched.
+        if irq >= 1020 {
             return false;
         }
 

@@ -92,6 +92,22 @@ pub enum FsError {
     InvalidPath = 8,
 }
 
+/// Maximum path length carried by `WriteShort`, whose path occupies only the
+/// first two Scalar words (the other two hold the content).
+pub const MAX_SHORT_PATH_LEN: usize = 2 * core::mem::size_of::<usize>();
+
+/// Pack a path into 4 usize values, returning `None` if the path does not fit
+/// in the `MAX_PATH_LEN`-byte scalar capacity.
+///
+/// Callers must use this (not `pack_path`) whenever the path comes from user
+/// input: silently truncating a path makes an operation target the wrong file.
+pub fn pack_path_checked(path: &str) -> Option<[usize; 4]> {
+    if path.as_bytes().len() > MAX_PATH_LEN {
+        return None;
+    }
+    Some(pack_path(path))
+}
+
 /// Pack a path (up to 32 bytes) into 4 usize values for Scalar messages.
 pub fn pack_path(path: &str) -> [usize; 4] {
     let bytes = path.as_bytes();

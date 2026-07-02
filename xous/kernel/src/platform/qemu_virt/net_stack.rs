@@ -200,7 +200,11 @@ fn handle_ipv4(frame: &[u8], ip: &[u8]) {
         Ok(v) => v,
         Err(_) => return,
     };
-    let payload = &ip[ihl..];
+    // Bound the payload by the IP total-length field (bytes 2-3), not the raw
+    // frame: small packets are padded to the 60-byte Ethernet minimum, and
+    // echoing that link padding back inflates the ICMP reply length/checksum.
+    let total_len = (((ip[2] as usize) << 8) | ip[3] as usize).clamp(ihl, ip.len());
+    let payload = &ip[ihl..total_len];
 
     match proto {
         1 => handle_icmp(frame, src_ip, dst_ip, payload),

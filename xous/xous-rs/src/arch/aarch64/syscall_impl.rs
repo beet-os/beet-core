@@ -18,43 +18,52 @@ use crate::{SysCall, SysCallResult};
 /// and converts the 8 return values back to a `Result`.
 pub fn syscall(call: SysCall) -> SysCallResult {
     let args = call.as_args();
-    let r0: usize;
-    let r1: usize;
-    let r2: usize;
-    let r3: usize;
-    let r4: usize;
-    let r5: usize;
-    let r8: usize;
-    let r9: usize;
-    unsafe {
-        asm!(
-            "svc #0",
-            inout("x0") args[0] => r0,
-            inout("x1") args[1] => r1,
-            inout("x2") args[2] => r2,
-            inout("x3") args[3] => r3,
-            inout("x4") args[4] => r4,
-            inout("x5") args[5] => r5,
-            inout("x8") args[6] => r8,
-            inout("x9") args[7] => r9,
-            // Clobber caller-saved registers not used for args/results
-            lateout("x6") _,
-            lateout("x7") _,
-            lateout("x10") _,
-            lateout("x11") _,
-            lateout("x12") _,
-            lateout("x13") _,
-            lateout("x14") _,
-            lateout("x15") _,
-            lateout("x16") _,
-            lateout("x17") _,
-        );
-    }
+    // Retry loop for `Result::RetryCall`: when a server's message queue is full,
+    // the kernel parks this thread (RetryQueueFull) and, when space frees up,
+    // wakes it returning past the SVC with `RetryCall` in x0 *without* rewinding
+    // ELR.  Userspace must therefore re-issue the SVC — otherwise the syscall
+    // (e.g. a blocking SendMessage) silently returns RetryCall and the message
+    // is dropped.  The kernel does the blocking between attempts, so this is not
+    // a busy-wait.  Mirrors the hosted wrapper's loop.
+    loop {
+        let r0: usize;
+        let r1: usize;
+        let r2: usize;
+        let r3: usize;
+        let r4: usize;
+        let r5: usize;
+        let r8: usize;
+        let r9: usize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") args[0] => r0,
+                inout("x1") args[1] => r1,
+                inout("x2") args[2] => r2,
+                inout("x3") args[3] => r3,
+                inout("x4") args[4] => r4,
+                inout("x5") args[5] => r5,
+                inout("x8") args[6] => r8,
+                inout("x9") args[7] => r9,
+                // Clobber caller-saved registers not used for args/results
+                lateout("x6") _,
+                lateout("x7") _,
+                lateout("x10") _,
+                lateout("x11") _,
+                lateout("x12") _,
+                lateout("x13") _,
+                lateout("x14") _,
+                lateout("x15") _,
+                lateout("x16") _,
+                lateout("x17") _,
+            );
+        }
 
-    let ret = [r0, r1, r2, r3, r4, r5, r8, r9];
-    let result = crate::Result::from_args(ret);
-    match result {
-        crate::Result::Error(e) => Err(e),
-        other => Ok(other),
+        let ret = [r0, r1, r2, r3, r4, r5, r8, r9];
+        match crate::Result::from_args(ret) {
+            crate::Result::Error(e) => return Err(e),
+            crate::Result::RetryCall => continue,
+            other => return Ok(other),
+        }
     }
 }

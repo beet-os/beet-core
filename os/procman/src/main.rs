@@ -232,7 +232,6 @@ fn handle_mutable_borrow_ref(sender: xous::MessageSender, mem: &xous::MemoryMess
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     puts("PANIC in procman!\n");
-    loop {
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
-    }
+    // Terminate rather than spin so the kernel reclaims any held resources.
+    xous::terminate_process(1);
 }

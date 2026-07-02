@@ -367,18 +367,28 @@ fn cmd_pwd() {
 fn cmd_cd(args: &[&str]) {
     let target = if args.is_empty() { "/" } else { args[0] };
 
-    // `cd -` switches to the previous directory
+    // Materialise the resolved target into a local buffer *before* touching any
+    // global.  For `cd -` the target lives in PREV_BUF, which the swap below
+    // overwrites — reading it lazily would corrupt the new CWD (self-aliasing).
     let mut buf = [0u8; MAX_PATH];
-    let resolved = if target == "-" {
+    let resolved_len = if target == "-" {
         let prev_len = unsafe { PREV_LEN };
         if prev_len == 0 {
             puts("cd: no previous directory\n");
             return;
         }
-        unsafe { core::str::from_utf8(&PREV_BUF[..prev_len]).unwrap_or("/") }
+        let len = prev_len.min(MAX_PATH);
+        buf[..len].copy_from_slice(unsafe { &PREV_BUF[..len] });
+        len
     } else {
-        resolve_path(target, &mut buf)
+        let r = resolve_path(target, &mut buf);
+        r.as_bytes().len()
     };
+    let resolved = core::str::from_utf8(&buf[..resolved_len]).unwrap_or("/");
+
+    if path_too_long("cd", resolved, beetos_api_fs::MAX_PATH_LEN) {
+        return;
+    }
 
     let packed = beetos_api_fs::pack_path(resolved);
     match fs_scalar(FsOp::IsDir, packed[0], packed[1], packed[2], packed[3]) {
@@ -387,7 +397,7 @@ fn cmd_cd(args: &[&str]) {
                 // Save current CWD as previous
                 PREV_BUF[..CWD_LEN].copy_from_slice(&CWD_BUF[..CWD_LEN]);
                 PREV_LEN = CWD_LEN;
-                // Update CWD
+                // Update CWD (resolved is backed by the local `buf`, not PREV_BUF)
                 let bytes = resolved.as_bytes();
                 let len = bytes.len().min(MAX_PATH);
                 CWD_BUF[..len].copy_from_slice(&bytes[..len]);
@@ -491,6 +501,21 @@ fn fs_scalar(op: FsOp, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> Op
     }
 }
 
+/// Report and reject a path that exceeds the FS scalar capacity (`max` bytes).
+///
+/// The FS protocol carries paths inline in the IPC scalar words, so a path that
+/// does not fit cannot be sent without truncation.  Truncating would make the
+/// operation target a different file, so we refuse it with a clear error
+/// instead.  Returns `true` when the path is too long (caller should abort).
+fn path_too_long(cmd: &str, path: &str, max: usize) -> bool {
+    if path.as_bytes().len() > max {
+        let _ = write!(DualWriter, "{}: {}: path too long (max {} bytes)\n", cmd, path, max);
+        true
+    } else {
+        false
+    }
+}
+
 /// Query filesystem statistics, returning (ram_used, ram_total, ram_bytes, disk_size, disk_files).
 fn fs_stats() -> Option<(usize, usize, usize, usize, usize)> {
     let cid = get_fs_cid();
@@ -513,6 +538,7 @@ fn cmd_ls(args: &[&str]) {
     } else {
         resolve_path(args[0], &mut buf)
     };
+    if path_too_long("ls", path, beetos_api_fs::MAX_PATH_LEN) { return; }
     match fs_buf_op(FsOp::LsBuf, path) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::NotFound as usize => {
@@ -533,6 +559,7 @@ fn cmd_cat(args: &[&str]) {
     if args.is_empty() { puts("usage: cat <path>\n"); return; }
     let mut buf = [0u8; MAX_PATH];
     let path = resolve_path(args[0], &mut buf);
+    if path_too_long("cat", path, beetos_api_fs::MAX_PATH_LEN) { return; }
     match fs_buf_op(FsOp::CatBuf, path) {
         Some(code) if code == FsError::Ok as usize => {}
         Some(code) if code == FsError::NotFound as usize => {
@@ -553,12 +580,25 @@ fn cmd_write(args: &[&str], full_line: &str) {
     if args.len() < 2 { puts("usage: write <path> <text>\n"); return; }
     let mut path_buf = [0u8; MAX_PATH];
     let path = resolve_path(args[0], &mut path_buf);
-    let content = if let Some(pos) = full_line.find(path) {
-        let after_path = pos + path.len();
-        full_line[after_path..].trim_start()
-    } else {
-        args[1]
+    if path_too_long("write", path, beetos_api_fs::MAX_SHORT_PATH_LEN) { return; }
+
+    // Content is everything after the first whitespace-separated token (the raw,
+    // unresolved path argument).  Deriving it from the *resolved* path via
+    // `find` is wrong: a relative arg won't appear in the line, and a resolved
+    // path may coincide with the content — both drop or shift the real content.
+    let content = {
+        let trimmed = full_line.trim_start();
+        // Skip the command word ("write"), then the first argument (the path).
+        let after_cmd = trimmed.split_once(char::is_whitespace).map(|(_, r)| r.trim_start()).unwrap_or("");
+        after_cmd.split_once(char::is_whitespace).map(|(_, r)| r.trim_start()).unwrap_or("")
     };
+
+    // Content is carried in arg3-arg4 (16 bytes max); refuse rather than
+    // silently write a truncated file.
+    if content.as_bytes().len() > beetos_api_fs::MAX_SHORT_PATH_LEN {
+        let _ = write!(DualWriter, "write: content too long (max {} bytes)\n", beetos_api_fs::MAX_SHORT_PATH_LEN);
+        return;
+    }
 
     // Pack path into arg1-arg2 (16 bytes max) and content into arg3-arg4 (16 bytes max)
     let path_packed = beetos_api_fs::pack_path(path);
@@ -595,6 +635,7 @@ fn cmd_mkdir(args: &[&str]) {
     if args.is_empty() { puts("usage: mkdir <path>\n"); return; }
     let mut buf = [0u8; MAX_PATH];
     let path = resolve_path(args[0], &mut buf);
+    if path_too_long("mkdir", path, beetos_api_fs::MAX_PATH_LEN) { return; }
     let packed = beetos_api_fs::pack_path(path);
     match fs_scalar(FsOp::Mkdir, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {}
@@ -619,6 +660,7 @@ fn cmd_rm(args: &[&str]) {
     if args.is_empty() { puts("usage: rm <path>\n"); return; }
     let mut buf = [0u8; MAX_PATH];
     let path = resolve_path(args[0], &mut buf);
+    if path_too_long("rm", path, beetos_api_fs::MAX_PATH_LEN) { return; }
     let packed = beetos_api_fs::pack_path(path);
     match fs_scalar(FsOp::Remove, packed[0], packed[1], packed[2], packed[3]) {
         Some(code) if code == FsError::Ok as usize => {}
@@ -914,5 +956,8 @@ pub extern "C" fn _start(uart_base: usize) -> ! {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     puts("PANIC in shell!\n");
-    loop { unsafe { core::arch::asm!("wfe", options(nomem, nostack)) }; }
+    // Terminate rather than spin: a spinning panic never releases the display
+    // or input focus, which would freeze the whole console for every other
+    // process.  Kernel cleanup on exit reclaims both.
+    xous::terminate_process(1);
 }

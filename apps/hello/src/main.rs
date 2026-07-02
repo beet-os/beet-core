@@ -308,7 +308,6 @@ pub extern "C" fn _start() -> ! {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     puts("PANIC in hello!\n");
-    loop {
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
-    }
+    // Terminate rather than spin so the kernel reclaims any held resources.
+    xous::terminate_process(1);
 }

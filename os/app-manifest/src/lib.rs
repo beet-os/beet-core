@@ -68,7 +68,19 @@ impl Manifest {
 
     pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> { serde_json::from_slice(bytes) }
 
-    pub fn app_id_bytes(&self) -> [u8; 16] { hex::decode(&self.app_id[2..]).unwrap().try_into().unwrap() }
+    /// Decode the `0x…`-prefixed hex app id into 16 bytes.
+    ///
+    /// Returns all-zero on a malformed id (too short, non-hex, or wrong length)
+    /// rather than panicking — the id comes from a `manifest.toml`, and a typo
+    /// should surface as a bad id, not an unexplained crash in the build tools
+    /// or name server.
+    pub fn app_id_bytes(&self) -> [u8; 16] {
+        let hex_str = self.app_id.get(2..).unwrap_or("");
+        match hex::decode(hex_str) {
+            Ok(bytes) => bytes.try_into().unwrap_or([0u8; 16]),
+            Err(_) => [0u8; 16],
+        }
+    }
 
     pub fn app_name_en(&self) -> String {
         self.app_name.get(&Locale("en".into())).cloned().unwrap_or("N/A".to_string())

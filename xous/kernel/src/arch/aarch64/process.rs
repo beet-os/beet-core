@@ -502,6 +502,18 @@ impl Process {
     }
 
     /// Set up the IRQ handler thread for the current process.
+    ///
+    /// ⚠️ KNOWN HAZARD — do not enable user IRQ handlers (`ClaimInterrupt`)
+    /// without fixing this first.  Every other thread accessor indexes
+    /// `proc.threads[tid - 1]`, so `INITIAL_TID` (1) lives in slot 0 — the same
+    /// slot this writes for `IRQ_TID` (0).  Delivering a hardware IRQ to a
+    /// user-registered handler therefore overwrites the interrupted MAIN
+    /// thread's saved PC/registers, so that thread cannot correctly resume.
+    /// The IRQ context needs its own storage (a dedicated field or a reserved
+    /// slot) separate from the main-thread slot.  This is latent today only
+    /// because QEMU handles the timer/UART in-kernel (`IrqHandler::Kernel`) and
+    /// no `IrqHandler::User` is ever registered — the path is unreachable on the
+    /// current platforms.  Fix when wiring user IRQ handlers in M3+.
     pub fn run_irq_handler(&mut self, pc: usize, irq_no: usize, arg: usize) {
         let idx = self.pid.get() as usize - 1;
         unsafe {

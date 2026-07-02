@@ -147,8 +147,19 @@ pub fn poll_recv() -> Option<(u16, usize)> {
 /// Only one RX descriptor should be "live" at a time (single-threaded kernel).
 pub fn get_rx_frame(desc_head: u16, frame_len: usize) -> &'static [u8] {
     unsafe {
-        let dev = (*(&raw const NET_DEV)).as_ref().expect("net not initialized");
+        // Return an empty frame rather than panicking if called before init or
+        // with an out-of-range descriptor — this is on the RX IRQ path.
+        let dev = match (*(&raw const NET_DEV)).as_ref() {
+            Some(d) => d,
+            None => return &[],
+        };
+        if (desc_head as usize) >= dev.rx_desc_to_buf.len() {
+            return &[];
+        }
         let buf_idx = dev.rx_desc_to_buf[desc_head as usize];
+        if buf_idx >= RX_BUFS.len() || VNET_HDR_SIZE + frame_len > RX_BUFS[buf_idx].0.len() {
+            return &[];
+        }
         &RX_BUFS[buf_idx].0[VNET_HDR_SIZE..VNET_HDR_SIZE + frame_len]
     }
 }

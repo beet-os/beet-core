@@ -160,6 +160,78 @@ pub fn dc_ivac(addr: usize) {
     }
 }
 
+/// Make freshly-written instructions at `[addr, addr+len)` visible to the
+/// instruction fetch path (I-cache coherence to the Point of Unification).
+///
+/// Required after loading code into memory through the (cached) data side and
+/// before executing it.  On cores with separate, non-coherent instruction and
+/// data caches — e.g. Apple Silicon — omitting this makes the CPU fetch stale
+/// bytes for a freshly loaded process and execute garbage.  (QEMU TCG models
+/// coherent caches, so the bug is invisible there.)
+///
+/// Sequence per ARM ARM: clean D-cache to PoU (`dc cvau`), `dsb ish`,
+/// invalidate I-cache to PoU (`ic ivau`), `dsb ish`, `isb`.  Cache line sizes
+/// are read from `CTR_EL0` so the stride matches the hardware.
+///
+/// `addr` is any VA that maps the physical code pages (the kernel linear-map VA
+/// is fine — I-cache is physically tagged, so invalidation by PA applies to all
+/// aliases).
+#[inline]
+pub fn sync_icache(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    unsafe {
+        let ctr: usize;
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nomem, nostack));
+        // DminLine/IminLine hold log2(words-per-line); line size = 4 << field.
+        let dline = 4usize << ((ctr >> 16) & 0xF);
+        let iline = 4usize << (ctr & 0xF);
+
+        // Clean the data cache to PoU over the region.
+        let mut p = addr & !(dline - 1);
+        while p < addr + len {
+            core::arch::asm!("dc cvau, {p}", p = in(reg) p, options(nomem, nostack));
+            p += dline;
+        }
+        core::arch::asm!("dsb ish", options(nomem, nostack));
+
+        // Invalidate the instruction cache to PoU over the region.
+        let mut p = addr & !(iline - 1);
+        while p < addr + len {
+            core::arch::asm!("ic ivau, {p}", p = in(reg) p, options(nomem, nostack));
+            p += iline;
+        }
+        core::arch::asm!("dsb ish", options(nomem, nostack));
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
+}
+
+/// Clean and invalidate the data cache over `[addr, addr+len)` to the Point of
+/// Coherency, one cache line at a time (`dc civac`), with a trailing `dsb sy`.
+///
+/// Use before handing a page back to the allocator: a later owner may map it
+/// non-cacheable (DMA/shared), and any dirty line the cache controller writes
+/// back afterward would corrupt that owner's data.  The stride comes from
+/// `CTR_EL0` so it matches the hardware line size.
+#[inline]
+pub fn dc_civac_range(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    unsafe {
+        let ctr: usize;
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nomem, nostack));
+        let dline = 4usize << ((ctr >> 16) & 0xF); // DminLine: log2(words) → bytes
+        let mut p = addr & !(dline - 1);
+        while p < addr + len {
+            core::arch::asm!("dc civac, {p}", p = in(reg) p, options(nomem, nostack));
+            p += dline;
+        }
+        core::arch::asm!("dsb sy", options(nomem, nostack));
+    }
+}
+
 extern "C" {
     /// Resume execution of a saved thread context, defined in `asm.S`.
     ///

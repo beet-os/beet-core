@@ -83,9 +83,12 @@ impl FbConsole {
     /// Clear the screen and reset the cursor.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
-        let total = self.width * self.height;
+        // The framebuffer is `stride` (not `width`) pixels per physical row, so
+        // it spans `stride * height` words.  Using `width` would leave the
+        // per-row padding uncleared when stride > width.
+        let fb_words = self.stride * self.height;
 
-        unsafe { core::ptr::write_bytes(self.fb as *mut u8, 0, total * 4); }
+        unsafe { core::ptr::write_bytes(self.fb as *mut u8, 0, fb_words * 4); }
 
         self.col = 0;
         self.row = 0;
@@ -109,17 +112,20 @@ impl FbConsole {
     fn scroll(&mut self) {
         let row_pixels = font::CHAR_H * SCALE; // pixel rows per text row
         let row_words  = row_pixels * self.stride; // u32 words per text row
-        let total      = self.width * self.height;
+        // Span the whole framebuffer by physical rows (`stride`), not the
+        // visible `width`: otherwise, with row padding (stride > width), the
+        // bottom rows never scroll and the cleared strip lands mid-screen.
+        let fb_words   = self.stride * self.height;
 
         unsafe {
             core::ptr::copy(
                 self.fb.add(row_words),
                 self.fb,
-                total - row_words,
+                fb_words - row_words,
             );
 
             // Clear the last text row.
-            let clear_start = self.fb.add(total - row_words) as *mut u8;
+            let clear_start = self.fb.add(fb_words - row_words) as *mut u8;
             core::ptr::write_bytes(clear_start, 0, row_words * 4);
         }
 

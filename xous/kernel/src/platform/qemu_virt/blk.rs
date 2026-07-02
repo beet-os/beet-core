@@ -129,8 +129,9 @@ pub fn read_sectors(lba: u64, buf: &mut [u8]) -> Result<(), BlkError> {
         }
     };
 
-    if lba + count as u64 > dev.capacity {
-        return Err(BlkError::OutOfRange);
+    match lba.checked_add(count as u64) {
+        Some(end) if end <= dev.capacity => {}
+        _ => return Err(BlkError::OutOfRange),
     }
 
     // Submit one request per call (synchronous, polling).
@@ -156,8 +157,9 @@ pub fn write_sectors(lba: u64, buf: &[u8]) -> Result<(), BlkError> {
         }
     };
 
-    if lba + count as u64 > dev.capacity {
-        return Err(BlkError::OutOfRange);
+    match lba.checked_add(count as u64) {
+        Some(end) if end <= dev.capacity => {}
+        _ => return Err(BlkError::OutOfRange),
     }
 
     unsafe {
@@ -360,6 +362,13 @@ unsafe fn do_block_request(
         }
         spins += 1;
         if spins > 10_000_000 {
+            // Reclaim the descriptors we allocated for this request.  Without
+            // this, every timeout leaks 3 of the 16 descriptors and after a few
+            // timeouts `alloc_desc` fails forever — turning a transient stall
+            // into permanent I/O death.  (The device may still complete this
+            // request later; `pop_used` bounds-checks the returned id, and the
+            // next request re-initialises the header/status before reuse.)
+            q.free_chain(d0);
             return Err(BlkError::DeviceFailed);
         }
         core::hint::spin_loop();

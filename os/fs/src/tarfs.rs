@@ -50,15 +50,47 @@ impl<'a> TarHeader<'a> {
     }
 }
 
-/// Parse an octal ASCII string into a usize.
+/// Parse a tar numeric field into a usize.
+///
+/// Handles the awkward corners of the ustar size field:
+/// - **Leading padding:** some writers space-pad the field (`"   12345\0"`).
+///   The old code broke on the first space and returned 0, which made the
+///   archive walk step by only one block and desync into the file data.
+/// - **Trailing padding:** the field ends at the first space or NUL.
+/// - **Invalid bytes:** stop rather than silently fold them into the value.
+/// - **GNU base-256:** if the high bit of the first byte is set, the field is a
+///   big-endian binary integer, not octal ASCII.
 fn parse_octal(bytes: &[u8]) -> usize {
-    let mut result: usize = 0;
-    for &b in bytes {
-        if b == 0 || b == b' ' {
-            break;
+    if bytes.is_empty() {
+        return 0;
+    }
+
+    // GNU base-256 extension: high bit of the first byte marks binary encoding.
+    if bytes[0] & 0x80 != 0 {
+        let mut result: usize = (bytes[0] & 0x7f) as usize;
+        for &b in &bytes[1..] {
+            result = (result << 8) | b as usize;
         }
-        if b >= b'0' && b <= b'7' {
-            result = result * 8 + (b - b'0') as usize;
+        return result;
+    }
+
+    let mut result: usize = 0;
+    let mut seen_digit = false;
+    for &b in bytes {
+        match b {
+            b'0'..=b'7' => {
+                result = result * 8 + (b - b'0') as usize;
+                seen_digit = true;
+            }
+            // Space or NUL: skip while still in the leading pad, stop once the
+            // number has started (trailing terminator).
+            b' ' | 0 => {
+                if seen_digit {
+                    break;
+                }
+            }
+            // Anything else is malformed — stop rather than corrupt the value.
+            _ => break,
         }
     }
     result
@@ -113,17 +145,11 @@ impl<'a> TarArchive<'a> {
 
     /// List entries in a directory. Calls `callback(name, is_dir, size)` for each.
     pub fn list<F: FnMut(&str, bool, usize)>(&self, dir: &str, mut callback: F) {
+        // Normalise the requested directory to a slash-free path component
+        // (e.g. "/bin/" → "bin").  Entry names are likewise stripped of any
+        // leading slash before comparison.
         let normalized = dir.strip_prefix('/').unwrap_or(dir);
-        // Ensure trailing slash for non-root.
-        let prefix = if normalized.is_empty() {
-            ""
-        } else if normalized.ends_with('/') {
-            normalized
-        } else {
-            // We can't dynamically allocate, so we handle this case carefully.
-            // For now, support only root listing (empty prefix) or exact prefix matches.
-            normalized
-        };
+        let prefix = normalized.strip_suffix('/').unwrap_or(normalized);
 
         let mut offset = 0;
         while offset + HEADER_SIZE <= self.data.len() {
@@ -139,20 +165,26 @@ impl<'a> TarArchive<'a> {
 
             let size = header.size();
             let name = header.name();
+            let name = name.strip_prefix('/').unwrap_or(name);
+            let step = HEADER_SIZE + round_up_512(size);
 
-            // Check if this entry is a direct child of the prefix.
+            // Check if this entry is a direct child of the prefix.  The match
+            // must land on a path boundary: prefix "bin" matches "bin/ls" but
+            // NOT "binary.dat" (which would otherwise be listed as "ary.dat").
             let relative = if prefix.is_empty() {
                 name
             } else if let Some(rest) = name.strip_prefix(prefix) {
-                let rest = rest.strip_prefix('/').unwrap_or(rest);
-                if rest.is_empty() {
-                    // This is the directory itself, skip it.
-                    offset = offset + HEADER_SIZE + round_up_512(size);
-                    continue;
+                match rest.strip_prefix('/') {
+                    Some(after) if !after.is_empty() => after,
+                    // Either the directory entry itself (rest == "" or "/"),
+                    // or a partial-component false match — skip in both cases.
+                    _ => {
+                        offset += step;
+                        continue;
+                    }
                 }
-                rest
             } else {
-                offset = offset + HEADER_SIZE + round_up_512(size);
+                offset += step;
                 continue;
             };
 
@@ -162,7 +194,7 @@ impl<'a> TarArchive<'a> {
                 callback(clean, header.is_dir(), size);
             }
 
-            offset = offset + HEADER_SIZE + round_up_512(size);
+            offset += step;
         }
     }
 
