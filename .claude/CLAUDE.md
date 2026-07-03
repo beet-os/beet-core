@@ -8,7 +8,8 @@ BeetOS is **multi-platform**: the `arch/aarch64/` code is generic AArch64 (page 
 
 **Supported platforms:**
 - **QEMU virt** — primary development & CI target (GIC, PL011 UART, virtio)
-- **Apple M1** (MacBook Air j313, T8103) — real hardware target (AIC, m1n1, SPI keyboard, ANS NVMe)
+- **Raspberry Pi 5** (BCM2712) — second target; platform code complete (`cargo xtask rpi5` builds `kernel8.img`), physical-hardware validation pending (see `docs/rpi5.md`)
+- **Apple M1** (MacBook Air j313, T8103) — third target, in progress (AIC, m1n1, SPI keyboard, ANS NVMe)
 - **Raspberry Pi 4** — future
 
 The boot chain on Apple M1 hardware is: iBoot (Apple firmware) → m1n1 (Asahi bootloader) → BeetOS loader → BeetOS kernel + services.
@@ -30,6 +31,7 @@ The `xous/` subtree is cherry-picked from KeyOS, NOT written from scratch. Key f
 | `xous/kernel/src/arch/hosted/`          | KeyOS  | Copied as-is (for dev/test)      |
 | `xous/kernel/src/arch/aarch64/`         | —      | **NEW** (our AArch64 port, generic — no platform-specific code) |
 | `xous/kernel/src/platform/qemu_virt/`   | —      | **NEW** (QEMU virt: GIC, PL011, virtio) |
+| `xous/kernel/src/platform/bcm2712/`     | —      | **NEW** (Raspberry Pi 5: GICv3, PL011, SDHCI, mailbox, PCIe) |
 | `xous/kernel/src/platform/apple_t8103/` | —      | **NEW** (Apple M1: AIC, m1n1, SPI, ANS) |
 | `xous/xous-rs/`                         | KeyOS  | Copied + new `arch/aarch64/`     |
 | `xous/ipc/`                             | KeyOS  | Copied as-is                     |
@@ -46,6 +48,7 @@ xous/           ← Xous microkernel (cherry-picked from KeyOS)
     src/arch/aarch64/   ← our AArch64 port (generic, no platform-specific code)
     src/arch/hosted/    ← hosted mode for dev/test (from KeyOS)
     src/platform/qemu_virt/    ← QEMU virt platform (GIC, PL011, virtio)
+    src/platform/bcm2712/      ← Raspberry Pi 5 platform (GICv3, PL011, SDHCI)
     src/platform/apple_t8103/  ← Apple M1 platform (AIC, m1n1, SPI, ANS)
   xous-rs/      ← userspace syscall library (like libc for Xous)
   ipc/          ← shared IPC types
@@ -62,7 +65,8 @@ os/             ← BeetOS service implementations / drivers
                   (fs, block, console, …)
 apps/           ← user applications (shell)
 loader/         ← loads kernel + services into RAM
-boot/m1n1/      ← git submodule (Asahi bootloader)
+boot/m1n1/      ← git submodule (Asahi bootloader) — planned for the M1
+                  hardware bring-up, not yet added to the tree
 xtask/          ← build system (runs on host)
 ```
 
@@ -190,7 +194,7 @@ Requires: MBA M1 with m1n1 installed, USB-C cable to host, Python 3 + m1n1 proxy
 - **xtask**: normal `std` Rust, runs on host
 - **Hosted mode**: everything compiles for host target with `std`
 
-Full `std` support (via custom Rust toolchain fork) is planned as M7, optional, for when we need `std::net`, `std::thread`, `std::fs` in services. Until then, `alloc` covers 90% of needs.
+Full `std` support landed as M9: the `beet-os/rust` fork provides the `aarch64-unknown-beetos` target, and `apps/hello-std` validates Box/String/Vec/format!/HashMap on QEMU (xtask skips it gracefully when the stage1 rustc is absent). It stays opt-in per app — services still target `no_std` + `alloc`, which covers 90% of needs.
 
 ## Implementation Rules
 

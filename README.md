@@ -57,23 +57,32 @@ beet-core/
 │   │       ├── arch/hosted/         ← Hosted mode (development on macOS/Linux, no hardware)
 │   │       └── platform/
 │   │           ├── qemu_virt/       ← QEMU virt: GICv3, PL011 UART, virtio-blk/net
+│   │           ├── bcm2712/         ← Raspberry Pi 5: GICv3, PL011, SDHCI, mailbox
 │   │           └── apple_t8103/     ← Apple M1: AIC, m1n1 (in progress)
 │   └── xous-rs/         ← Userspace syscall library
 │
 ├── beetos/              ← Shared constants: PAGE_SIZE, memory map, addresses
 ├── api/                 ← Service API crates (IPC types, opcodes, client stubs)
 │   ├── fs/              ← Filesystem IPC protocol
+│   ├── block/           ← Block-device IPC protocol
+│   ├── storage/         ← BlockDevice trait + errors
+│   ├── cryptblock/      ← AES-256-GCM encrypted area over api/block
+│   ├── net/             ← Userspace TCP sockets (TcpListener/TcpStream)
 │   ├── console/         ← Console IPC protocol
 │   ├── procman/         ← Process manager IPC protocol
 │   └── keyboard/        ← Keyboard IPC protocol
 │
 ├── os/                  ← Service implementations (userspace drivers)
-│   ├── fs/              ← Filesystem service (ramfs + tar disk)
+│   ├── fs/              ← Filesystem service (ramfs + tar disk + encrypted /data)
+│   ├── block/           ← Block service (disk reads/writes, flush via kernel)
+│   ├── console/         ← Console output service (UART + TCP fan-out)
 │   └── procman/         ← Process manager service
 │
 ├── apps/
 │   ├── shell/           ← bsh interactive shell (EL0 userspace)
-│   └── hello/           ← Hello world (spawn/exit demo)
+│   ├── coreutils/       ← Small userland utilities
+│   ├── hello/           ← Hello world (spawn/exit demo)
+│   └── hello-std/       ← std-on-BeetOS demo (needs the beet-os/rust fork)
 │
 ├── loader/              ← Bootloader (loads kernel + services into RAM)
 └── xtask/               ← Build system (cargo xtask build/qemu/image/run)
@@ -89,9 +98,15 @@ beet-core/
 | `cargo run`         | Run the OS in hosted mode (kernel as a normal process)       |
 | `cargo xtask build` | Cross-compile everything for `aarch64-unknown-none`          |
 | `cargo xtask qemu`  | Build + launch QEMU virt                                     |
-| `cargo xtask qemu-smoke`      | Boot QEMU and verify 9 progress markers (CI)       |
+| `cargo xtask qemu-smoke`      | Boot QEMU and verify 13 progress markers (CI)      |
+| `cargo xtask qemu-smoke-nodisk` | Boot without a disk — verifies graceful degradation |
+| `cargo xtask qemu-smoke-net`  | DHCP + TCP remote console + `ifconfig`/`ping` (CI) |
+| `cargo xtask qemu-smoke-net-userspace` | `api/net` sockets: listen + connect (CI)  |
+| `cargo xtask qemu-smoke-crypt` | Two-boot encrypted-storage test (format/seal/reboot/decrypt) |
+| `cargo xtask qemu-bench`      | Kernel micro-benchmark perf gate (deterministic icount) |
 | `cargo xtask qemu-screenshot` | Capture the framebuffer via QMP screendump → PNG   |
 | `cargo xtask qemu-animation`  | Capture N FB frames over time → animated GIF       |
+| `cargo xtask rpi5`  | Build `kernel8.img` for the Raspberry Pi 5 SD card           |
 | `cargo xtask image` | Build m1n1 + loader + kernel payload (Apple M1)              |
 | `cargo xtask run`   | Push to Apple M1 via m1n1 USB proxy                          |
 
@@ -102,8 +117,8 @@ beet-core/
 | Platform           | Status     | Notes                                       |
 | ------------------ | ---------- | ------------------------------------------- |
 | **QEMU virt**      | ✅ Working | GICv3, PL011, virtio-blk, virtio-net        |
-| **Raspberry Pi 5** | 🔜 Next    | BCM2712, GICv3 (shared with QEMU), RP1 UART |
-| **Apple M1**       | 🔜 Planned | T8103, AIC, m1n1 boot chain                 |
+| **Raspberry Pi 5** | 🧩 Code complete | BCM2712; `cargo xtask rpi5` builds `kernel8.img`; physical-hardware validation pending (`docs/rpi5.md`) |
+| **Apple M1**       | 🔜 In progress | T8103, AIC, m1n1 boot chain             |
 
 ---
 
@@ -114,13 +129,16 @@ When you `cargo xtask qemu`, the following processes start:
 | Process   | EL  | Description                                                 |
 | --------- | --- | ----------------------------------------------------------- |
 | Kernel    | EL1 | Xous microkernel: IPC, scheduler, memory manager            |
+| `log`     | EL0 | Log sink                                                    |
 | `procman` | EL0 | Process lifecycle: spawn, wait, exit                        |
-| `fs`      | EL0 | Filesystem: ramfs (read/write) + disk image (read-only tar) |
-| `shell`   | EL0 | Interactive shell with UART I/O                             |
+| `shell`   | EL0 | Interactive shell (UART, TCP remote console, framebuffer)   |
+| `fs`      | EL0 | Filesystem: ramfs (r/w) + tar disk (r/o) + encrypted `/data` (AES-256-GCM, r/w) |
+| `block`   | EL0 | Block service: disk reads/writes, flush via kernel syscall  |
+| `console` | EL0 | Console output fan-out: UART + TCP remote console           |
 
 The shell communicates with `fs` and `procman` via Xous blocking IPC. The kernel routes UART IRQ characters to the shell via the console server.
 
-A GUI desktop runs in parallel on the ramfb framebuffer with seven live windows: System Info, boot log, Game of Life, Snake, Mandelbrot fractal, Calculator, and Notes. The window manager (`beetos::gui::WindowManager`) lives kernel-side for now and composes at 10 Hz from the timer IRQ; keyboard input goes through it first (Tab cycles focus, Shift+arrows move the cursor, Ctrl+arrows drag the focused window, Shift+Enter clicks).
+A GUI desktop runs in parallel on the ramfb framebuffer with seven live windows: System Info, boot log, Game of Life, Snake, Mandelbrot fractal, Calculator, and Notes. The window manager (`beetos::gui::WindowManager`) lives kernel-side for now; the timer IRQ only *requests* a repaint at 10 Hz and the actual compose runs from the kernel idle loop with IRQs unmasked (see `docs/gui.md`). Keyboard input goes through the WM first (Tab cycles focus, Shift+arrows move the cursor, Ctrl+arrows drag the focused window, Shift+Enter clicks).
 
 ---
 
@@ -143,7 +161,7 @@ Key design decisions inherited from Xous:
 **Hosted mode first.** All kernel logic, IPC, services, and the shell work as normal host processes. No hardware needed.
 
 ```bash
-cargo test        # 29+ unit tests: ramfs, shell, syscalls, IPC
+cargo test        # 200+ unit tests: ramfs, shell, syscalls, IPC, crypto, net
 cargo run         # full OS as a host process, instant feedback
 ```
 
@@ -165,6 +183,7 @@ cargo xtask qemu  # any developer, any machine, no hardware
 | `xous/xous-rs/`                                                      | KeyOS (copied + AArch64 arch added) |
 | `xous/kernel/src/arch/aarch64/`                                      | BeetOS (new)                        |
 | `xous/kernel/src/platform/qemu_virt/`                                | BeetOS (new)                        |
+| `xous/kernel/src/platform/bcm2712/`                                  | BeetOS (new)                        |
 | `xous/kernel/src/platform/apple_t8103/`                              | BeetOS (new)                        |
 | `api/`, `os/`, `apps/`, `beetos/`                                    | BeetOS (new)                        |
 
