@@ -187,6 +187,20 @@ pub unsafe fn set_thread_args(proc_idx: usize, x0: usize, x1: usize, x2: usize) 
     }
 }
 
+/// Set x0..x3 (first four arguments) for the initial thread of a process.
+///
+/// # Safety
+///
+/// `proc_idx` must be a valid process index (PID - 1).
+pub unsafe fn set_thread_args4(proc_idx: usize, x0: usize, x1: usize, x2: usize, x3: usize) {
+    if let Some(proc) = PROCESS_TABLE[proc_idx].as_mut() {
+        proc.threads[INITIAL_TID - 1].gpr[0] = x0 as u64;
+        proc.threads[INITIAL_TID - 1].gpr[1] = x1 as u64;
+        proc.threads[INITIAL_TID - 1].gpr[2] = x2 as u64;
+        proc.threads[INITIAL_TID - 1].gpr[3] = x3 as u64;
+    }
+}
+
 
 /// Get the current process ID.
 pub fn current_pid() -> PID {

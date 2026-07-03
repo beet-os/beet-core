@@ -860,8 +860,16 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
         super::process::set_thread_arg0(idx, SHELL_UART_VA);
     }
     {
+        // x3 = bitmask of PIDs allowed to WriteBlocks (bit N = PID N).
+        // Reads stay open; only writes are gated so a procman-spawned
+        // app can't wipe the tar image or the encrypted /data area.
+        // Trusted writers: fs (serves /data via cryptblock) and the
+        // shell (raw dwrite debug command). The kernel owns PID
+        // assignment, so this stays correct without magic numbers in
+        // the service.
+        let write_mask = (1usize << shell_pid.get()) | (1usize << fs_pid.get());
         let idx = block_pid.get() as usize - 1;
-        super::process::set_thread_args(idx, SHELL_UART_VA, disk_va, disk_size);
+        super::process::set_thread_args4(idx, SHELL_UART_VA, disk_va, disk_size, write_mask);
     }
     {
         let idx = console_pid.get() as usize - 1;

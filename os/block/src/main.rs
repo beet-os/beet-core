@@ -39,18 +39,31 @@ use beetos_api_block::{
 //
 // Reads AND writes are live (M8): a write patches the in-RAM mirror,
 // then SysCall::BlockFlush pushes the dirtied sectors to virtio-blk.
-// The kernel only grants that syscall to this service's PID. Note there
-// is no per-client ACL yet: any process that can connect to BLOCK_SID
-// can write any LBA, including the tar image and the encrypted /data
-// area (integrity/confidentiality hold via AES-GCM; availability does
-// not). The eventual real-driver backend (SDHCI Host, NVMe Transport)
-// will sit behind a tiny `impl Storage` dispatch.
+// The kernel only grants that syscall to this service's PID. Reads are
+// open to any connecting process, but writes are gated by a PID
+// allowlist (WRITE_MASK, set from boot arg x3) so a procman-spawned app
+// can't wipe the tar image or the encrypted /data area — an
+// availability attack that AES-GCM does not defend against. The
+// eventual real-driver backend (SDHCI Host, NVMe Transport) will sit
+// behind a tiny `impl Storage` dispatch.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BLOCK_SIZE: u32 = 512;
 
 static mut DISK_BASE: usize = 0;
 static mut DISK_SIZE: usize = 0;
+
+/// Bitmask of PIDs allowed to issue WriteBlocks (bit N = PID N), set
+/// from the boot arg x3. Reads are unrestricted. 0 = nobody trusted
+/// (fail closed) — the kernel always sets it, so 0 means a boot without
+/// the arg, which should not silently allow writes.
+static mut WRITE_MASK: usize = 0;
+
+/// True if `pid` may write. Delegates to the shared, unit-tested
+/// predicate in `api/block` so the bit convention stays in sync.
+fn write_allowed(pid: u8) -> bool {
+    block::pid_write_allowed(unsafe { *(&raw const WRITE_MASK) }, pid)
+}
 
 fn capacity_blocks() -> u64 {
     unsafe { DISK_SIZE as u64 / BLOCK_SIZE as u64 }
@@ -150,7 +163,17 @@ fn handle_mutable_borrow(sender: xous::MessageSender, mem: &xous::MemoryMessage)
                 handle_read(lba, n_blocks, block::data_mut(buf))
             }
             id if id == BlockOp::WriteBlocks as usize => {
-                handle_write(lba, n_blocks, block::data(buf))
+                // Write ACL: only trusted PIDs may mutate the disk.
+                // Without this, any process that can connect to
+                // BLOCK_SID could wipe the tar image or the encrypted
+                // /data area (an availability attack — AES-GCM protects
+                // integrity/confidentiality, not availability).
+                match sender.pid() {
+                    Some(pid) if write_allowed(pid.get()) => {
+                        handle_write(lba, n_blocks, block::data(buf))
+                    }
+                    _ => BlockResult::AccessDenied,
+                }
             }
             _ => BlockResult::Other,
         };
@@ -176,14 +199,17 @@ pub extern "C" fn _start() -> ! {
     let uart_base: usize;
     let disk_base: usize;
     let disk_size: usize;
+    let write_mask: usize;
     unsafe {
         core::arch::asm!(
-            "mov {0}, x0", "mov {1}, x1", "mov {2}, x2",
+            "mov {0}, x0", "mov {1}, x1", "mov {2}, x2", "mov {3}, x3",
             out(reg) uart_base, out(reg) disk_base, out(reg) disk_size,
+            out(reg) write_mask,
             options(nomem, nostack),
         );
         DISK_BASE = disk_base;
         DISK_SIZE = disk_size;
+        WRITE_MASK = write_mask;
     }
     beetos::pl011::init(uart_base);
 

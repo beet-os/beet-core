@@ -93,6 +93,9 @@ pub enum BlockResult {
     Io          = 4,
     NotReady    = 5,
     Other       = 6,
+    /// The caller's PID is not on the block service's write allowlist.
+    /// Reads are unrestricted; only writes are gated.
+    AccessDenied = 7,
 }
 
 impl BlockResult {
@@ -104,9 +107,24 @@ impl BlockResult {
             3 => Self::Timeout,
             4 => Self::Io,
             5 => Self::NotReady,
+            7 => Self::AccessDenied,
             _ => Self::Other,
         }
     }
+}
+
+/// Write-ACL predicate: is `pid` allowed to write, per `mask` (bit N =
+/// PID N)? Fails closed for PID 0 (invalid / kernel) and for any PID
+/// that wouldn't fit the mask width, so the shift can never overflow.
+/// The block service builds the mask from a boot arg; this shared
+/// helper keeps the bit convention identical on both sides and is the
+/// unit-tested core of the ACL.
+#[inline]
+pub fn pid_write_allowed(mask: usize, pid: u8) -> bool {
+    if pid == 0 || (pid as u32) >= usize::BITS {
+        return false;
+    }
+    (mask >> pid) & 1 == 1
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,6 +383,31 @@ mod tests {
         assert_eq!(read_status(&buf), BlockResult::OutOfRange);
         write_status(&mut buf, BlockResult::Timeout);
         assert_eq!(read_status(&buf), BlockResult::Timeout);
+    }
+
+    #[test]
+    fn access_denied_status_round_trips() {
+        assert_eq!(BlockResult::from_u8(BlockResult::AccessDenied as u8),
+                   BlockResult::AccessDenied);
+    }
+
+    #[test]
+    fn write_acl_predicate() {
+        // Mask trusting PIDs 4 (shell) and 5 (fs), as boot builds it.
+        let mask = (1usize << 4) | (1usize << 5);
+        assert!(pid_write_allowed(mask, 4));
+        assert!(pid_write_allowed(mask, 5));
+        // A procman-spawned app (PID 8) is denied.
+        assert!(!pid_write_allowed(mask, 8));
+        // Other boot services are denied too (least privilege).
+        assert!(!pid_write_allowed(mask, 3));
+        // PID 0 (invalid) never writes, even against an all-ones mask.
+        assert!(!pid_write_allowed(usize::MAX, 0));
+        // Out-of-width PIDs fail closed instead of overflowing the shift.
+        assert!(!pid_write_allowed(usize::MAX, 64));
+        assert!(!pid_write_allowed(usize::MAX, 255));
+        // Empty mask (boot without the arg) trusts nobody.
+        assert!(!pid_write_allowed(0, 5));
     }
 
     #[test]
