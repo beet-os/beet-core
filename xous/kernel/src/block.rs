@@ -151,6 +151,11 @@ pub use hosted::{FileBlockDevice, MemBlockDevice};
 // NVMe Transport → BlockDevice adapter
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// NVMe scratch / admin-data staging size, one controller page. This
+/// is an NVMe protocol constant, NOT `beetos::PAGE_SIZE` (16384) — do
+/// not "fix" it to the kernel page size.
+const NVME_SCRATCH_LEN: usize = 4096;
+
 /// Wraps an NVMe [`Transport`] + a known namespace into a
 /// [`BlockDevice`]. Single-namespace device today — each
 /// adapter targets one (namespace_id, block_size, capacity)
@@ -172,11 +177,17 @@ impl<T: crate::nvme::Transport> NvmeBlockDevice<T> {
     /// then wrap the transport.  `nsid` is typically 1 on every
     /// consumer drive.
     pub fn new(mut transport: T, nsid: u32) -> Result<Self, BlockError> {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; NVME_SCRATCH_LEN];
         let sqe = crate::nvme::Sqe::identify(0, crate::nvme::cns::IDENTIFY_NAMESPACE, nsid, 0);
         let cqe = transport.submit(&sqe, &mut buf);
         if !cqe.status().is_success() { return Err(BlockError::Io); }
         let ns = crate::nvme::NamespaceInfo::parse(&buf);
+        // A garbage IDENTIFY (block_size 0) would divide-by-zero every
+        // subsequent read/write; an empty namespace can never satisfy a
+        // transfer. Treat both as the device not being usable.
+        if ns.block_size == 0 || ns.size_lba == 0 {
+            return Err(BlockError::NotReady);
+        }
         Ok(Self {
             transport,
             namespace_id: nsid,
@@ -185,6 +196,29 @@ impl<T: crate::nvme::Transport> NvmeBlockDevice<T> {
             next_cid:     1,
         })
     }
+
+    /// Whole blocks covered by a `len`-byte buffer, validated for the
+    /// SQE's 16-bit block-count field. Rejects an empty buffer (the
+    /// SQE encodes NLB as `n - 1` via saturating_sub, so n = 0 would
+    /// silently become a 1-block DMA into a 0-byte buffer) and a count
+    /// that would truncate in the u16 cast (the range check would then
+    /// pass while the device transfers fewer blocks than asked).
+    fn block_count(&self, len: usize) -> Result<u16, BlockError> {
+        if len == 0 || len as u64 % self.block_size as u64 != 0 {
+            return Err(BlockError::BadBuffer);
+        }
+        u16::try_from(len as u64 / self.block_size as u64)
+            .map_err(|_| BlockError::BadBuffer)
+    }
+
+    /// Overflow-safe `lba + n <= n_blocks` bound (`lba = u64::MAX`
+    /// must not wrap past the check).
+    fn check_range(&self, lba: u64, n: u16) -> Result<(), BlockError> {
+        match lba.checked_add(n as u64) {
+            Some(end) if end <= self.n_blocks => Ok(()),
+            _ => Err(BlockError::OutOfRange),
+        }
+    }
 }
 
 impl<T: crate::nvme::Transport> BlockDevice for NvmeBlockDevice<T> {
@@ -192,9 +226,8 @@ impl<T: crate::nvme::Transport> BlockDevice for NvmeBlockDevice<T> {
     fn capacity_blocks(&self) -> u64 { self.n_blocks }
 
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        if buf.len() as u64 % self.block_size as u64 != 0 { return Err(BlockError::BadBuffer); }
-        let n = (buf.len() / self.block_size as usize) as u16;
-        if lba + n as u64 > self.n_blocks { return Err(BlockError::OutOfRange); }
+        let n = self.block_count(buf.len())?;
+        self.check_range(lba, n)?;
         self.next_cid = self.next_cid.wrapping_add(1);
         let sqe = crate::nvme::Sqe::read(self.next_cid, self.namespace_id, lba, n, 0);
         let cqe = self.transport.submit(&sqe, buf);
@@ -205,9 +238,8 @@ impl<T: crate::nvme::Transport> BlockDevice for NvmeBlockDevice<T> {
     }
 
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
-        if buf.len() as u64 % self.block_size as u64 != 0 { return Err(BlockError::BadBuffer); }
-        let n = (buf.len() / self.block_size as usize) as u16;
-        if lba + n as u64 > self.n_blocks { return Err(BlockError::OutOfRange); }
+        let n = self.block_count(buf.len())?;
+        self.check_range(lba, n)?;
         self.next_cid = self.next_cid.wrapping_add(1);
         // Transport::submit takes `&mut [u8]` because a real
         // controller fills the buffer on reads. For writes we need
@@ -216,7 +248,7 @@ impl<T: crate::nvme::Transport> BlockDevice for NvmeBlockDevice<T> {
         // In hardware land the controller DMAs out of the buffer
         // we point it at, so this copy disappears once the driver
         // stages the payload into the DMA region directly.
-        let mut scratch = scratch_buffer(buf.len());
+        let mut scratch = scratch_buffer(buf.len())?;
         scratch.as_mut().copy_from_slice(buf);
         let sqe = crate::nvme::Sqe::write(self.next_cid, self.namespace_id, lba, n, 0);
         let cqe = self.transport.submit(&sqe, scratch.as_mut());
@@ -237,7 +269,7 @@ impl<T: crate::nvme::Transport> BlockDevice for NvmeBlockDevice<T> {
 struct Scratch(Vec<u8>);
 #[cfg(beetos)]
 #[allow(dead_code)]
-struct Scratch { buf: [u8; 4096], len: usize }
+struct Scratch { buf: [u8; NVME_SCRATCH_LEN], len: usize }
 
 #[cfg(not(beetos))]
 impl AsMut<[u8]> for Scratch {
@@ -250,14 +282,18 @@ impl AsMut<[u8]> for Scratch {
 
 #[cfg(not(beetos))]
 #[allow(dead_code)]
-fn scratch_buffer(len: usize) -> Scratch { Scratch(vec![0u8; len]) }
+fn scratch_buffer(len: usize) -> Result<Scratch, BlockError> { Ok(Scratch(vec![0u8; len])) }
 #[cfg(beetos)]
 #[allow(dead_code)]
-fn scratch_buffer(len: usize) -> Scratch {
-    // Kernel-side: bounded to one page. Callers passing larger
-    // payloads need to chunk — enforced by the assert.
-    assert!(len <= 4096, "kernel-side block write > 4 KB not yet supported");
-    Scratch { buf: [0u8; 4096], len }
+fn scratch_buffer(len: usize) -> Result<Scratch, BlockError> {
+    // Kernel-side: bounded to one NVMe scratch page. Callers passing
+    // larger payloads must chunk. An error (not an assert) — a caller
+    // handing us a full beetos::PAGE_SIZE (16 KiB) write must get
+    // BadBuffer back, not halt the whole OS on the storage path.
+    if len > NVME_SCRATCH_LEN {
+        return Err(BlockError::BadBuffer);
+    }
+    Ok(Scratch { buf: [0u8; NVME_SCRATCH_LEN], len })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -478,6 +514,39 @@ mod tests {
         let mut dev = NvmeBlockDevice::new(sim, 1).unwrap();
         let mut buf = [0u8; 512];
         assert_eq!(dev.read_blocks(99, &mut buf), Err(BlockError::OutOfRange));
+    }
+
+    #[test]
+    fn nvme_rejects_empty_buffer() {
+        // An empty buffer must be BadBuffer, not a 1-block DMA (the SQE
+        // encodes NLB as n-1 via saturating_sub, so n=0 would read one
+        // block into a 0-byte destination).
+        let sim = SimNvme::new(512, 4);
+        let mut dev = NvmeBlockDevice::new(sim, 1).unwrap();
+        let mut buf = [0u8; 0];
+        assert_eq!(dev.read_blocks(0, &mut buf), Err(BlockError::BadBuffer));
+        assert_eq!(dev.write_blocks(0, &buf), Err(BlockError::BadBuffer));
+    }
+
+    #[test]
+    fn nvme_rejects_lba_add_overflow() {
+        // lba = u64::MAX must fail the range check, not wrap past it.
+        let sim = SimNvme::new(512, 4);
+        let mut dev = NvmeBlockDevice::new(sim, 1).unwrap();
+        let mut buf = [0u8; 512];
+        assert_eq!(dev.read_blocks(u64::MAX, &mut buf), Err(BlockError::OutOfRange));
+    }
+
+    #[test]
+    fn nvme_block_count_rejects_u16_truncation() {
+        // 65536 blocks of 512 B would truncate to n=0 in the old
+        // `as u16` cast and pass the range check while transferring
+        // nothing. Exercise block_count directly — a 32 MiB test
+        // buffer isn't worth allocating.
+        let sim = SimNvme::new(512, 4);
+        let dev = NvmeBlockDevice::new(sim, 1).unwrap();
+        assert_eq!(dev.block_count(512 * 65536), Err(BlockError::BadBuffer));
+        assert_eq!(dev.block_count(512 * 65535), Ok(65535));
     }
 
     // ── File-backed device ─────────────────────────────────────────────

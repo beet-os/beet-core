@@ -295,11 +295,18 @@ impl Process {
     }
 
     /// Find a free thread slot.
+    ///
+    /// Never hands out TID `MAX_THREAD_COUNT` (32): this arch table is
+    /// indexed by `tid - 1` (TIDs 1..=32 would fit), but the kernel's
+    /// `Process::threads` is indexed by the *raw* TID into an array of
+    /// the same length, so its valid TIDs are 1..=31 — TID 32 would
+    /// panic in `thread_state()` on creation. The last arch slot is
+    /// deliberately sacrificed to keep the two tables consistent.
     pub fn find_free_thread(&self) -> Option<TID> {
         let idx = self.pid.get() as usize - 1;
         unsafe {
             PROCESS_TABLE[idx].as_ref().and_then(|proc| {
-                proc.threads.iter().enumerate().find_map(|(i, t)| {
+                proc.threads.iter().enumerate().take(MAX_THREAD_COUNT - 1).find_map(|(i, t)| {
                     if !t.allocated { Some(i + 1) } else { None }
                 })
             })

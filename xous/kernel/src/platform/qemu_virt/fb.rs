@@ -582,7 +582,8 @@ static mut COMPOSE_IN_PROGRESS: bool = false;
 /// Keys that arrived while a compose was walking the WM, drained
 /// through the normal routing right after the paint. 16 is plenty:
 /// one paint lasts well under two keyboard auto-repeats.
-static mut PENDING_KEYS: [u8; 16] = [0; 16];
+const PENDING_CAP: usize = 16;
+static mut PENDING_KEYS: [u8; PENDING_CAP] = [0; PENDING_CAP];
 static mut PENDING_HEAD: usize = 0;
 static mut PENDING_TAIL: usize = 0;
 
@@ -604,7 +605,7 @@ pub fn compose_in_progress() -> bool {
 /// drops the key, same outcome as a UART FIFO overrun.
 pub fn queue_key_during_compose(c: u8) -> bool {
     unsafe {
-        let next = (PENDING_HEAD + 1) % PENDING_KEYS.len();
+        let next = (PENDING_HEAD + 1) % PENDING_CAP;
         if next == PENDING_TAIL {
             return false;
         }
@@ -620,7 +621,7 @@ fn pop_pending_key() -> Option<u8> {
             return None;
         }
         let c = PENDING_KEYS[PENDING_TAIL];
-        PENDING_TAIL = (PENDING_TAIL + 1) % PENDING_KEYS.len();
+        PENDING_TAIL = (PENDING_TAIL + 1) % PENDING_CAP;
         Some(c)
     }
 }

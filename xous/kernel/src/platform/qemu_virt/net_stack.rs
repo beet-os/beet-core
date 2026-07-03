@@ -283,7 +283,10 @@ pub fn ping_send(dst: [u8; 4], seq: u16) -> bool {
 
 /// Take the last captured echo reply, if any: (source IP, sequence).
 pub fn ping_poll() -> Option<([u8; 4], u16)> {
-    unsafe { LAST_PONG.take() }
+    // Raw-pointer access avoids materialising a `&mut` to the mutable
+    // static (single-core; reads/writes race only with the net IRQ,
+    // which merely overwrites the slot — same guarantees as before).
+    unsafe { (*core::ptr::addr_of_mut!(LAST_PONG)).take() }
 }
 
 // ============================================================================

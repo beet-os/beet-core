@@ -861,11 +861,12 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
         #[cfg(all(beetos, feature = "platform-qemu-virt"))]
         SysCall::BlockFlush(lba, n_blocks) => {
             use crate::platform::qemu_virt::blk;
-            // PID 6 is the block service (boot.rs creates it under that
-            // fixed slot). Nobody else gets to drive virtio-blk writes,
+            // Only the block service (registered at boot via
+            // blk::set_flush_owner) gets to drive virtio-blk writes,
             // since the syscall reaches through the mirror by physical
-            // address without any user pointer.
-            if current_pid().get() != 6 {
+            // address without any user pointer. flush_owner() is 0 when
+            // nothing registered, which can never equal a live PID.
+            if current_pid().get() as usize != blk::flush_owner() {
                 return Err(Error::AccessDenied);
             }
             if n_blocks == 0 || n_blocks > u32::MAX as usize {

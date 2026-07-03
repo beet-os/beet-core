@@ -701,6 +701,10 @@ pub unsafe fn launch_first_process(_boot_info: &BootInfo) -> ! {
     // accessor once FS is migrated).
     let block_pid = PID::new(6).unwrap();
     create_elf_process(block_pid, BLOCK_ELF, b"block", beetos::PERM_FS_SERVER);
+    // Register the flush privilege against the actual PID rather than
+    // hardcoding it in the syscall handler (robust to spawn-order edits).
+    #[cfg(feature = "platform-qemu-virt")]
+    crate::platform::qemu_virt::blk::set_flush_owner(block_pid.get());
 
     // PID 7: console output service. Owns stdout fan-out (UART + TCP
     // remote console). The shell taps its puts() into this service in

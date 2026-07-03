@@ -233,6 +233,24 @@ const MAX_MIRROR_PAGES: usize = 256;
 static mut MIRROR_PAGES: [usize; MAX_MIRROR_PAGES] = [0; MAX_MIRROR_PAGES];
 static mut MIRROR_PAGE_COUNT: usize = 0;
 
+/// PID allowed to drive `SysCall::BlockFlush`. Registered once at boot
+/// when the block service process is created; 0 = nobody (flush always
+/// refused). Replaces a hardcoded PID constant in the syscall handler,
+/// which would silently authorize the wrong process if the boot spawn
+/// order ever changed.
+static FLUSH_OWNER_PID: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Record which PID owns the flush privilege (the block service).
+pub fn set_flush_owner(pid: u8) {
+    FLUSH_OWNER_PID.store(pid as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The PID allowed to call BlockFlush (0 = none registered).
+pub fn flush_owner() -> usize {
+    FLUSH_OWNER_PID.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record the mirror's physical page list. Called once at boot after the
 /// disk has been read into RAM and mapped into the block service.
 pub fn register_mirror(pages: &[usize]) {

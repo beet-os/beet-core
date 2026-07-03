@@ -37,9 +37,14 @@ use beetos_api_block::{
 // ─────────────────────────────────────────────────────────────────────────────
 // Backend — the disk pages the kernel mapped into our address space.
 //
-// Read-only today; writes return Io.  The eventual real-driver backend
-// (SDHCI Host, NVMe Transport) will sit behind a tiny `impl Storage`
-// dispatch.
+// Reads AND writes are live (M8): a write patches the in-RAM mirror,
+// then SysCall::BlockFlush pushes the dirtied sectors to virtio-blk.
+// The kernel only grants that syscall to this service's PID. Note there
+// is no per-client ACL yet: any process that can connect to BLOCK_SID
+// can write any LBA, including the tar image and the encrypted /data
+// area (integrity/confidentiality hold via AES-GCM; availability does
+// not). The eventual real-driver backend (SDHCI Host, NVMe Transport)
+// will sit behind a tiny `impl Storage` dispatch.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BLOCK_SIZE: u32 = 512;

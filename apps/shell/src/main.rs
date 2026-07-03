@@ -944,11 +944,37 @@ fn cmd_dwrite(args: &[&str], line: &str) {
 // Encrypted /data area (owned by the fs service; we just send ops)
 // ============================================================================
 
-fn cmd_cryptfmt(args: &[&str]) {
+/// Validate a crypt passphrase argument, loudly. The passphrase rides in
+/// the buffer op's 32-byte "path" field, and the fs side reads at most
+/// MAX_PATH_LEN bytes — a longer passphrase would silently truncate, so
+/// two passphrases sharing the first 32 bytes would unlock the same area.
+/// Multiple tokens are refused for the same reason: the tokenizer would
+/// silently keep only the first word.
+fn crypt_pass_arg<'a>(cmd: &str, args: &[&'a str]) -> Option<&'a str> {
     let pass = match args.first() {
         Some(p) if !p.is_empty() => *p,
-        _ => { puts("usage: cryptfmt <passphrase>\n"); return; }
+        _ => {
+            let _ = write!(DualWriter, "usage: {} <passphrase>\n", cmd);
+            return None;
+        }
     };
+    if args.len() > 1 {
+        let _ = write!(DualWriter, "{}: passphrase must be a single word (no spaces)\n", cmd);
+        return None;
+    }
+    if pass.len() > beetos_api_fs::MAX_PATH_LEN {
+        let _ = write!(
+            DualWriter,
+            "{}: passphrase too long ({} > {} bytes)\n",
+            cmd, pass.len(), beetos_api_fs::MAX_PATH_LEN,
+        );
+        return None;
+    }
+    Some(pass)
+}
+
+fn cmd_cryptfmt(args: &[&str]) {
+    let Some(pass) = crypt_pass_arg("cryptfmt", args) else { return };
     // The buffer op's "path" field carries the passphrase.
     match fs_buf_op(FsOp::CryptFormat, pass) {
         Some(code) if code == FsError::Ok as usize => {
@@ -963,10 +989,7 @@ fn cmd_cryptfmt(args: &[&str]) {
 }
 
 fn cmd_cryptopen(args: &[&str]) {
-    let pass = match args.first() {
-        Some(p) if !p.is_empty() => *p,
-        _ => { puts("usage: cryptopen <passphrase>\n"); return; }
-    };
+    let Some(pass) = crypt_pass_arg("cryptopen", args) else { return };
     match fs_buf_op(FsOp::CryptOpen, pass) {
         Some(code) if code == FsError::Ok as usize => {
             puts("cryptopen: /data unlocked\n");
