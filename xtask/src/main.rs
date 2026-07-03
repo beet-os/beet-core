@@ -1556,6 +1556,13 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
         println!("  [ok] /data/secret written + decrypts in-session");
         cmd(&mut console, "ls /data", "secret (")?;
         println!("  [ok] ls /data lists the file");
+        // Regression: a relative path + multi-word content must survive
+        // verbatim. The old extractor searched for the *resolved* path in
+        // the raw line, which misses relative paths and silently truncated
+        // content to the first word. Write via ramfs (no cryptopen needed).
+        cmd(&mut console, "write spacetest one two three", "bsh>")?;
+        cmd(&mut console, "cat /spacetest", "one two three")?;
+        println!("  [ok] relative-path multi-word write survives verbatim");
         Ok(())
     })();
     let _ = child.kill();

@@ -19,12 +19,22 @@
 //! ```
 //!
 //! - **Nonce**: fresh kernel entropy (`SysCall::GetRandom`) on every
-//!   write — no counters to persist, no reuse across crash/reboot.
+//!   write — no counters to persist. Reuse resistance is only as good
+//!   as the kernel RNG: on real hardware `GetRandom` is FEAT_RNG (RNDR),
+//!   but on QEMU's default `neoverse-n1` CPU it degrades to a
+//!   counter-mixed xorshift PRNG (see `arch/aarch64/rand.rs`). That
+//!   fallback is fine for the dev/CI loop but is **not** a CSPRNG — do
+//!   not treat the QEMU crypt area as protecting real secrets.
 //! - **AAD**: the slot's absolute LBA. A sealed sector copied to a
 //!   different LBA fails authentication, so ciphertext can't be
 //!   shuffled around the disk undetected.
 //! - **Tag**: GCM authentication over ciphertext + AAD. Any bit flip
-//!   in nonce, payload or position is detected at open time.
+//!   in nonce, payload or position is detected at open time. Note this
+//!   protects *integrity per slot*, NOT freshness: an attacker with
+//!   host-image access can roll a slot (or the whole area) back to an
+//!   older sealed value undetected, and a zeroed slot reads as "empty"
+//!   (indistinguishable from a deleted file). Rollback/rollforward
+//!   resistance needs a monotonic generation counter — a future item.
 //!
 //! ## Key derivation (dev-grade — read this before shipping)
 //!
@@ -252,6 +262,14 @@ mod disk {
     impl CryptDisk {
         fn area_base(client: &BlockClient) -> Result<u64, CryptError> {
             let info = client.info().map_err(|_| CryptError::Io)?;
+            // The whole area layout assumes 512-byte sectors (SECTOR_SIZE):
+            // read_sector/write_sector slice exactly SECTOR_SIZE, and
+            // area_base counts capacity in those units. A device that
+            // reported a different block size would silently read/write
+            // misaligned sectors, so refuse rather than corrupt.
+            if info.block_size as usize != SECTOR_SIZE {
+                return Err(CryptError::BadArgument);
+            }
             if info.capacity_blocks < CRYPT_AREA_SECTORS {
                 return Err(CryptError::NotFormatted);
             }

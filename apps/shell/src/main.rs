@@ -718,12 +718,12 @@ fn cmd_write(args: &[&str], full_line: &str) {
     if args.len() < 2 { puts("usage: write <path> <text>\n"); return; }
     let mut path_buf = [0u8; MAX_PATH];
     let path = resolve_path(args[0], &mut path_buf);
-    let content = if let Some(pos) = full_line.find(path) {
-        let after_path = pos + path.len();
-        full_line[after_path..].trim_start()
-    } else {
-        args[1]
-    };
+    // Content is everything after the command word and the path token in
+    // the raw line, so embedded spaces survive. Skipping raw tokens works
+    // for both `write /abs ...` and `write rel ...`; matching the resolved
+    // (absolute) path against the raw line would miss the relative form and
+    // silently truncate content to args[1] (round-4 regression).
+    let content = rest_after_tokens(full_line, 2);
 
     // Buffer-based write (WriteBuf): path up to 31 chars (the shared
     // buffer path field, same limit as cat/ls), content up to
@@ -908,14 +908,14 @@ fn cmd_dwrite(args: &[&str], line: &str) {
         None => { puts("usage: dwrite <lba> <text>\n"); return; }
     };
     // Re-extract the payload from the original command line so embedded
-    // spaces survive (the splitter would shred them).
-    let mut tokens = line.split_whitespace();
-    tokens.next(); // dwrite
-    tokens.next(); // lba
-    let payload = match tokens.next() {
-        Some(p) => p,
-        None => { puts("usage: dwrite <lba> <text>\n"); return; }
-    };
+    // spaces survive — `split_whitespace().next()` would return only the
+    // first word of the payload, shredding the spaces this comment claims
+    // to preserve.
+    let payload = rest_after_tokens(line, 2); // skip `dwrite` + `<lba>`
+    if payload.is_empty() {
+        puts("usage: dwrite <lba> <text>\n");
+        return;
+    }
 
     let Some((client, buf)) = open_block("dwrite") else { return };
 
@@ -1023,6 +1023,26 @@ fn cmd_ifconfig() {
         }
         _ => puts("ifconfig: NetGetInfo syscall failed\n"),
     }
+}
+
+/// Return the slice of `line` after the first `skip` whitespace-delimited
+/// tokens, with internal spacing of the remainder preserved.
+///
+/// Used to recover a command's free-text tail (e.g. the content of
+/// `write <path> <text...>`) verbatim. Tokenizing with
+/// `split_whitespace().nth(n)` would drop everything after the first
+/// space in the tail; finding the *resolved* path in the raw line fails
+/// outright for relative paths (the resolved form has a leading `/` the
+/// user never typed). Skipping N raw tokens by whitespace sidesteps both.
+fn rest_after_tokens(line: &str, skip: usize) -> &str {
+    let mut rest = line.trim_start();
+    for _ in 0..skip {
+        match rest.find(|c: char| c.is_ascii_whitespace()) {
+            Some(i) => rest = rest[i..].trim_start(),
+            None => return "",
+        }
+    }
+    rest
 }
 
 fn parse_u64(s: &str) -> Option<u64> {
