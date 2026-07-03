@@ -1590,7 +1590,7 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
     );
     println!("  [ok] plaintext absent from host image");
     anyhow::ensure!(
-        image.windows(8).any(|w| w == b"BEETCRY1"),
+        image.windows(8).any(|w| w == b"BEETCRY2"),
         "header magic missing from image"
     );
     println!("  [ok] header magic present");
@@ -1623,10 +1623,24 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
         // its slot via the raw dwrite, confirm cat surfaces Corrupt
         // (the silent "not found" was caught by the adversarial pass).
         cmd(&mut console, "write /data/probe TAMPER_ME", "bsh>")?;
-        // Slot 0 in a fresh area ≡ LBA base+1 = (160-128)+1 = 33.
-        cmd(&mut console, "dwrite 33 ZZZZZ_GARBAGE_ZZZZZ", "wrote")?;
+        // Layout: header @ base+0, version map @ base+1, slots @ base+2.
+        // The just-erased /data/secret freed slot 0, so probe reuses it
+        // ≡ LBA base+2 = (160-128)+2 = 34.
+        cmd(&mut console, "dwrite 34 ZZZZZ_GARBAGE_ZZZZZ", "wrote")?;
         cmd(&mut console, "cat /data/probe", "CORRUPT (auth failed)")?;
         println!("  [ok] tamper detected on read (not silent NotFound)");
+
+        // Rollback detection is anchored in the authenticated version
+        // map at LBA base+1 = 33. A good, untampered file must read
+        // Corrupt once the vmap is scribbled, because read_slot
+        // authenticates the slot against its vmap counter first — the
+        // load-bearing half of rollback resistance, proven end-to-end.
+        // (`keeper` lands in slot 1 = LBA 35; slot 0 is now corrupt.)
+        cmd(&mut console, "write /data/keeper STAYS_GOOD", "bsh>")?;
+        cmd(&mut console, "cat /data/keeper", "STAYS_GOOD")?;
+        cmd(&mut console, "dwrite 33 VMAP_TAMPER_ZZZZ", "wrote")?;
+        cmd(&mut console, "cat /data/keeper", "CORRUPT (auth failed)")?;
+        println!("  [ok] version-map tamper fails an untampered slot (rollback anchor)");
 
         cmd(&mut console, "cryptlock", "locked")?;
         cmd(&mut console, "ls /data", "locked (cryptopen first)")?;

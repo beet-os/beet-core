@@ -9,7 +9,9 @@
 //!
 //! ```text
 //! base+0              header: magic, salt, passphrase check value
-//! base+1 .. base+N    slots:  one sealed sector each
+//! base+1              version map: sealed sector of per-slot u16
+//!                     write counters (rollback detection)
+//! base+2 .. base+N    slots:  one sealed sector each
 //! ```
 //!
 //! Every sealed sector is self-contained:
@@ -32,12 +34,24 @@
 //!   different LBA fails authentication, so ciphertext can't be
 //!   shuffled around the disk undetected.
 //! - **Tag**: GCM authentication over ciphertext + AAD. Any bit flip
-//!   in nonce, payload or position is detected at open time. Note this
-//!   protects *integrity per slot*, NOT freshness: an attacker with
-//!   host-image access can roll a slot (or the whole area) back to an
-//!   older sealed value undetected, and a zeroed slot reads as "empty"
-//!   (indistinguishable from a deleted file). Rollback/rollforward
-//!   resistance needs a monotonic generation counter — a future item.
+//!   in nonce, payload or position is detected at open time.
+//!
+//! ## Rollback detection (and its honest limits)
+//!
+//! Every slot's AAD also includes its current **write counter** from
+//! the sealed version map at `base+1`. Restoring an older sealed image
+//! of a slot (or of a file removed via `erase_slot`, which bumps the
+//! counter before zeroing) fails authentication → `Corrupt`. To roll a
+//! slot back silently, an attacker must also restore the version map —
+//! which then mismatches (detectably) every *other* slot written since
+//! that snapshot. What this deliberately does NOT detect: a rollback of
+//! the **entire area** (header + vmap + all slots) to a fully
+//! consistent older snapshot. That is unfixable with on-disk state
+//! alone — it needs a monotonic counter outside the attacker's reach
+//! (secure element / TPM), which is real-hardware (M1 port) territory.
+//! A zeroed slot with a zero counter still reads as `Empty`
+//! (indistinguishable from never-written) — deletion of a
+//! never-rewritten file is the one silent erase that remains.
 //!
 //! ## Key derivation (dev-grade — read this before shipping)
 //!
@@ -60,11 +74,12 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use sha2::{Digest, Sha256};
 
 /// Size of the encrypted area at the end of the disk, in sectors.
-/// Header + 127 slots.
+/// Header + version map + 126 slots.
 pub const CRYPT_AREA_SECTORS: u64 = 128;
 
-/// Usable slots (sector 0 of the area is the header).
-pub const CRYPT_SLOTS: u64 = CRYPT_AREA_SECTORS - 1;
+/// Usable slots (sector 0 of the area is the header, sector 1 the
+/// version map).
+pub const CRYPT_SLOTS: u64 = CRYPT_AREA_SECTORS - 2;
 
 pub const SECTOR_SIZE: usize = 512;
 pub const NONCE_LEN: usize = 12;
@@ -74,7 +89,8 @@ pub const TAG_LEN: usize = 16;
 pub const SLOT_PAYLOAD: usize = SECTOR_SIZE - NONCE_LEN - TAG_LEN;
 
 /// Header magic — bumped if the layout ever changes.
-pub const MAGIC: &[u8; 8] = b"BEETCRY1";
+/// v2: version-map sector at base+1, write counter in every slot AAD.
+pub const MAGIC: &[u8; 8] = b"BEETCRY2";
 
 const SALT_LEN: usize = 16;
 /// Known plaintext sealed into the header so `open` can verify the
@@ -111,17 +127,25 @@ pub fn derive_key(salt: &[u8; SALT_LEN], passphrase: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// AAD binding a sealed sector to its absolute disk position.
-fn lba_aad(abs_lba: u64) -> [u8; 8] {
-    abs_lba.to_le_bytes()
+/// AAD binding a sealed sector to its absolute disk position AND its
+/// write generation. `version` is the slot's current write counter
+/// from the version map (0 for sectors that don't participate in
+/// rollback tracking: the version map itself).
+fn slot_aad(abs_lba: u64, version: u16) -> [u8; 10] {
+    let mut aad = [0u8; 10];
+    aad[..8].copy_from_slice(&abs_lba.to_le_bytes());
+    aad[8..].copy_from_slice(&version.to_le_bytes());
+    aad
 }
 
 /// Seal `payload` (≤ [`SLOT_PAYLOAD`] bytes, zero-padded) into a
-/// 512-byte sector image bound to `abs_lba`.
+/// 512-byte sector image bound to `abs_lba` and write-generation
+/// `version`.
 pub fn seal_sector(
     key: &[u8; 32],
     nonce: &[u8; NONCE_LEN],
     abs_lba: u64,
+    version: u16,
     payload: &[u8],
 ) -> Result<[u8; SECTOR_SIZE], CryptError> {
     if payload.len() > SLOT_PAYLOAD {
@@ -132,7 +156,11 @@ pub fn seal_sector(
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(nonce), &lba_aad(abs_lba), &mut buf)
+        .encrypt_in_place_detached(
+            Nonce::from_slice(nonce),
+            &slot_aad(abs_lba, version),
+            &mut buf,
+        )
         .map_err(|_| CryptError::BadArgument)?;
 
     let mut sector = [0u8; SECTOR_SIZE];
@@ -142,12 +170,15 @@ pub fn seal_sector(
     Ok(sector)
 }
 
-/// Open a sealed 512-byte sector. Returns the decrypted payload, or
+/// Open a sealed 512-byte sector expected at write-generation
+/// `version`. Returns the decrypted payload, or
 /// [`CryptError::Empty`] for an all-zero (never written) sector, or
-/// [`CryptError::Corrupt`] when authentication fails.
+/// [`CryptError::Corrupt`] when authentication fails — including when
+/// the sector is a stale-but-genuine older generation (rollback).
 pub fn open_sector(
     key: &[u8; 32],
     abs_lba: u64,
+    version: u16,
     sector: &[u8; SECTOR_SIZE],
 ) -> Result<[u8; SLOT_PAYLOAD], CryptError> {
     if sector.iter().all(|&b| b == 0) {
@@ -161,12 +192,38 @@ pub fn open_sector(
     cipher
         .decrypt_in_place_detached(
             Nonce::from_slice(&nonce),
-            &lba_aad(abs_lba),
+            &slot_aad(abs_lba, version),
             &mut buf,
             (&tag).into(),
         )
         .map_err(|_| CryptError::Corrupt)?;
     Ok(buf)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Version map (rollback detection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-slot write counters, packed little-endian u16 into a sealed
+/// sector payload (126 × 2 = 252 bytes ≤ SLOT_PAYLOAD). u16 caps a
+/// slot at 65535 rewrites — `write_slot` refuses further writes rather
+/// than wrapping (a wrapped counter would let an attacker replay the
+/// generation-0 image).
+pub fn pack_vmap(counters: &[u16; CRYPT_SLOTS as usize]) -> [u8; SLOT_PAYLOAD] {
+    let mut out = [0u8; SLOT_PAYLOAD];
+    for (i, c) in counters.iter().enumerate() {
+        out[i * 2..i * 2 + 2].copy_from_slice(&c.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [`pack_vmap`].
+pub fn unpack_vmap(payload: &[u8; SLOT_PAYLOAD]) -> [u16; CRYPT_SLOTS as usize] {
+    let mut out = [0u16; CRYPT_SLOTS as usize];
+    for (i, c) in out.iter_mut().enumerate() {
+        *c = u16::from_le_bytes([payload[i * 2], payload[i * 2 + 1]]);
+    }
+    out
 }
 
 /// Build the header sector: magic, salt, sealed passphrase check.
@@ -322,7 +379,7 @@ mod disk {
 
             let zero = [0u8; SECTOR_SIZE];
             for slot in 0..CRYPT_SLOTS {
-                Self::write_sector(&client, buf, base + 1 + slot, &zero)?;
+                Self::write_sector(&client, buf, base + 2 + slot, &zero)?;
             }
 
             let mut salt = [0u8; SALT_LEN];
@@ -331,10 +388,17 @@ mod disk {
             rand_bytes(&mut check_nonce);
 
             let key = derive_key(&salt, passphrase);
+
+            // Version map before the header (same crash-ordering logic
+            // as the slots): a crash before the header lands leaves the
+            // area NotFormatted, never half-tracked.
+            let disk = Self { client, base_lba: base, key };
+            disk.write_vmap(buf, &[0u16; CRYPT_SLOTS as usize])?;
+
             let header = build_header(&salt, &check_nonce, &key)?;
             Self::write_sector(&client, buf, base, &header)?;
 
-            Ok(Self { client, base_lba: base, key })
+            Ok(disk)
         }
 
         /// Open an existing area, verifying `passphrase` against the
@@ -350,8 +414,52 @@ mod disk {
             Ok(Self { client, base_lba: base, key })
         }
 
+        fn vmap_lba(&self) -> u64 {
+            self.base_lba + 1
+        }
+
+        fn slot_lba(&self, slot: u64) -> u64 {
+            self.base_lba + 2 + slot
+        }
+
+        /// Read + open the version map. The vmap participates in the
+        /// AAD scheme with version 0 (it cannot version itself — see
+        /// the module docs for what that does and does not protect).
+        /// An all-zero vmap sector is `Corrupt`, not `Empty`: format
+        /// always writes one, so its absence means tampering.
+        fn read_vmap(
+            &self,
+            buf: xous::MemoryRange,
+        ) -> Result<[u16; CRYPT_SLOTS as usize], CryptError> {
+            let sector = Self::read_sector(&self.client, buf, self.vmap_lba())?;
+            match open_sector(&self.key, self.vmap_lba(), 0, &sector) {
+                Ok(payload) => Ok(unpack_vmap(&payload)),
+                Err(CryptError::Empty) => Err(CryptError::Corrupt),
+                Err(e) => Err(e),
+            }
+        }
+
+        /// Seal + persist the version map with a fresh nonce.
+        fn write_vmap(
+            &self,
+            buf: xous::MemoryRange,
+            counters: &[u16; CRYPT_SLOTS as usize],
+        ) -> Result<(), CryptError> {
+            let mut nonce = [0u8; NONCE_LEN];
+            rand_bytes(&mut nonce);
+            let payload = pack_vmap(counters);
+            let sector = seal_sector(&self.key, &nonce, self.vmap_lba(), 0, &payload)?;
+            Self::write_sector(&self.client, buf, self.vmap_lba(), &sector)
+        }
+
         /// Seal `payload` (≤ [`SLOT_PAYLOAD`] bytes) into `slot` with a
-        /// fresh random nonce and persist it.
+        /// fresh random nonce and the next write-generation, then
+        /// persist slot and version map.
+        ///
+        /// Ordering: slot first, vmap second. A crash in between leaves
+        /// the slot sealed at generation N+1 while the vmap still says
+        /// N → the next read reports `Corrupt` (loud), never a silent
+        /// stale read.
         pub fn write_slot(
             &self,
             buf: xous::MemoryRange,
@@ -361,15 +469,23 @@ mod disk {
             if slot >= CRYPT_SLOTS {
                 return Err(CryptError::BadArgument);
             }
-            let lba = self.base_lba + 1 + slot;
+            let mut counters = self.read_vmap(buf)?;
+            let next = counters[slot as usize]
+                .checked_add(1)
+                .ok_or(CryptError::BadArgument)?; // wear cap — never wrap to 0
+            let lba = self.slot_lba(slot);
             let mut nonce = [0u8; NONCE_LEN];
             rand_bytes(&mut nonce);
-            let sector = seal_sector(&self.key, &nonce, lba, payload)?;
-            Self::write_sector(&self.client, buf, lba, &sector)
+            let sector = seal_sector(&self.key, &nonce, lba, next, payload)?;
+            Self::write_sector(&self.client, buf, lba, &sector)?;
+            counters[slot as usize] = next;
+            self.write_vmap(buf, &counters)
         }
 
-        /// Read + authenticate `slot`. [`CryptError::Empty`] for a
-        /// never-written slot.
+        /// Read + authenticate `slot` at its current write-generation.
+        /// [`CryptError::Empty`] for a never-written slot;
+        /// [`CryptError::Corrupt`] for tampering INCLUDING a rolled-back
+        /// (stale-but-genuine) sector.
         pub fn read_slot(
             &self,
             buf: xous::MemoryRange,
@@ -378,13 +494,20 @@ mod disk {
             if slot >= CRYPT_SLOTS {
                 return Err(CryptError::BadArgument);
             }
-            let lba = self.base_lba + 1 + slot;
+            let counters = self.read_vmap(buf)?;
+            let lba = self.slot_lba(slot);
             let sector = Self::read_sector(&self.client, buf, lba)?;
-            open_sector(&self.key, lba, &sector)
+            open_sector(&self.key, lba, counters[slot as usize], &sector)
         }
 
         /// Erase `slot` back to the never-written state (raw zero
         /// sector — subsequent reads return [`CryptError::Empty`]).
+        ///
+        /// Bumps the write counter BEFORE zeroing: with the counter
+        /// bumped, restoring the pre-erase sealed image fails auth
+        /// (`Corrupt`) instead of silently resurrecting the file. The
+        /// crash window (counter bumped, slot not yet zeroed) also
+        /// reads `Corrupt` — loud, never stale.
         pub fn erase_slot(
             &self,
             buf: xous::MemoryRange,
@@ -393,8 +516,15 @@ mod disk {
             if slot >= CRYPT_SLOTS {
                 return Err(CryptError::BadArgument);
             }
-            let lba = self.base_lba + 1 + slot;
-            Self::write_sector(&self.client, buf, lba, &[0u8; SECTOR_SIZE])
+            let mut counters = self.read_vmap(buf)?;
+            // Same wear cap as write_slot: a saturated counter would
+            // leave the last sealed image forever-valid, so a worn-out
+            // slot can neither be rewritten nor silently erased.
+            counters[slot as usize] = counters[slot as usize]
+                .checked_add(1)
+                .ok_or(CryptError::BadArgument)?;
+            self.write_vmap(buf, &counters)?;
+            Self::write_sector(&self.client, buf, self.slot_lba(slot), &[0u8; SECTOR_SIZE])
         }
     }
 }
@@ -415,44 +545,81 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip() {
-        let sector = seal_sector(&KEY, &NONCE, 42, b"hello crypt").unwrap();
-        let plain = open_sector(&KEY, 42, &sector).unwrap();
+        let sector = seal_sector(&KEY, &NONCE, 42, 1, b"hello crypt").unwrap();
+        let plain = open_sector(&KEY, 42, 1, &sector).unwrap();
         assert_eq!(&plain[..11], b"hello crypt");
         assert!(plain[11..].iter().all(|&b| b == 0), "padding must be zero");
     }
 
     #[test]
     fn tamper_detected() {
-        let mut sector = seal_sector(&KEY, &NONCE, 42, b"payload").unwrap();
+        let mut sector = seal_sector(&KEY, &NONCE, 42, 1, b"payload").unwrap();
         sector[100] ^= 0x01;
-        assert_eq!(open_sector(&KEY, 42, &sector), Err(CryptError::Corrupt));
+        assert_eq!(open_sector(&KEY, 42, 1, &sector), Err(CryptError::Corrupt));
     }
 
     #[test]
     fn wrong_lba_detected() {
         // A sealed sector moved to another LBA must fail (AAD binding).
-        let sector = seal_sector(&KEY, &NONCE, 42, b"payload").unwrap();
-        assert_eq!(open_sector(&KEY, 43, &sector), Err(CryptError::Corrupt));
+        let sector = seal_sector(&KEY, &NONCE, 42, 1, b"payload").unwrap();
+        assert_eq!(open_sector(&KEY, 43, 1, &sector), Err(CryptError::Corrupt));
+    }
+
+    #[test]
+    fn rollback_detected() {
+        // The core anti-rollback property: a stale-but-genuine sealed
+        // sector (older write-generation) must fail authentication
+        // when the version map says the slot has moved on.
+        let v1 = seal_sector(&KEY, &NONCE, 42, 1, b"old secret").unwrap();
+        let n2: [u8; NONCE_LEN] = [11u8; NONCE_LEN];
+        let v2 = seal_sector(&KEY, &n2, 42, 2, b"new secret").unwrap();
+        // Current generation opens fine…
+        assert!(open_sector(&KEY, 42, 2, &v2).is_ok());
+        // …but restoring the generation-1 image reads Corrupt, not
+        // "old secret".
+        assert_eq!(open_sector(&KEY, 42, 2, &v1), Err(CryptError::Corrupt));
+    }
+
+    #[test]
+    fn erased_slot_restore_detected() {
+        // erase_slot bumps the counter before zeroing, so the
+        // pre-erase image (sealed at generation N) fails against the
+        // post-erase expectation (N+1).
+        let pre_erase = seal_sector(&KEY, &NONCE, 42, 3, b"deleted!").unwrap();
+        assert_eq!(open_sector(&KEY, 42, 4, &pre_erase), Err(CryptError::Corrupt));
+    }
+
+    #[test]
+    fn vmap_pack_roundtrip() {
+        let mut counters = [0u16; CRYPT_SLOTS as usize];
+        counters[0] = 1;
+        counters[7] = 0xBEEF;
+        counters[CRYPT_SLOTS as usize - 1] = u16::MAX;
+        let packed = pack_vmap(&counters);
+        assert_eq!(unpack_vmap(&packed), counters);
+        // The packed map must fit a sealed sector payload with room to
+        // spare (compile-time sanity of the 126×2 ≤ 484 assumption).
+        assert!(CRYPT_SLOTS as usize * 2 <= SLOT_PAYLOAD);
     }
 
     #[test]
     fn wrong_key_detected() {
-        let sector = seal_sector(&KEY, &NONCE, 42, b"payload").unwrap();
+        let sector = seal_sector(&KEY, &NONCE, 42, 1, b"payload").unwrap();
         let other = [8u8; 32];
-        assert_eq!(open_sector(&other, 42, &sector), Err(CryptError::Corrupt));
+        assert_eq!(open_sector(&other, 42, 1, &sector), Err(CryptError::Corrupt));
     }
 
     #[test]
     fn empty_sector_is_empty() {
         let zero = [0u8; SECTOR_SIZE];
-        assert_eq!(open_sector(&KEY, 42, &zero), Err(CryptError::Empty));
+        assert_eq!(open_sector(&KEY, 42, 1, &zero), Err(CryptError::Empty));
     }
 
     #[test]
     fn payload_too_big_rejected() {
         let big = [0u8; SLOT_PAYLOAD + 1];
         assert_eq!(
-            seal_sector(&KEY, &NONCE, 0, &big),
+            seal_sector(&KEY, &NONCE, 0, 1, &big),
             Err(CryptError::BadArgument)
         );
     }
@@ -460,7 +627,7 @@ mod tests {
     #[test]
     fn ciphertext_hides_plaintext() {
         let needle = b"SUPER_SECRET_MARKER";
-        let sector = seal_sector(&KEY, &NONCE, 7, needle).unwrap();
+        let sector = seal_sector(&KEY, &NONCE, 7, 1, needle).unwrap();
         // The plaintext must not appear anywhere in the sealed sector.
         assert!(
             !sector.windows(needle.len()).any(|w| w == needle),
