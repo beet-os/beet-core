@@ -50,6 +50,7 @@ mod hosted {
 
         /// Borrow the backing bytes — handy for tests that want to
         /// snapshot / patch the device behind the trait.
+        #[allow(dead_code)]
         pub fn as_bytes(&self) -> &[u8] { &self.data }
     }
 
@@ -386,8 +387,8 @@ mod tests {
     // Re-export the hosted simulator from nvme's test module by
     // copy-pasting a minimal version here (the original is gated
     // #[cfg(test)] inside nvme.rs so it can't be cross-mod-referenced).
-    use crate::nvme::{self, Sqe, Cqe, sc_generic, cns, Transport, opcode_of,
-                       admin_opc, nvm_opc, pack_cdw0, cid_of};
+    use crate::nvme::{Sqe, Cqe, sc_generic, cns, Transport, opcode_of,
+                       admin_opc, nvm_opc, cid_of};
     use core::cell::RefCell;
     use alloc::vec::Vec;
 

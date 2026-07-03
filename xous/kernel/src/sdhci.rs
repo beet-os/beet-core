@@ -958,7 +958,7 @@ mod tests {
         let mut r2 = [0u32; 4];
 
         // Helper to set a [hi..=lo] (MSB=0) bit range with a value.
-        let mut set = |r2: &mut [u32; 4], lo: u32, hi: u32, v: u64| {
+        let set = |r2: &mut [u32; 4], lo: u32, hi: u32, v: u64| {
             for b in lo..=hi {
                 let bit = ((v >> (hi - b)) & 1) as u32;
                 let word = (b / 32) as usize;

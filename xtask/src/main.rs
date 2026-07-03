@@ -5,6 +5,14 @@ use std::process::Command;
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
+    // Fail early with a clear message instead of a bare "No such file or
+    // directory" from the first Command::spawn deep inside a qemu-* command.
+    if let Some(cmd) = args.first() {
+        if cmd.starts_with("qemu") || cmd == "test" {
+            require_tool("qemu-system-aarch64", "install QEMU or enter `nix develop`")?;
+        }
+    }
+
     match args.first().map(|s| s.as_str()) {
         Some("check") => check()?,
         Some("build") => build(&args[1..])?,
@@ -51,6 +59,19 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Bail with an actionable message if `tool` is not runnable from PATH.
+fn require_tool(tool: &str, hint: &str) -> anyhow::Result<()> {
+    match Command::new(tool).arg("--version").output() {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("`{tool}` not found in PATH — {hint}")
+        }
+        // Present but broken (e.g. missing option ROMs) — let the real
+        // invocation surface its own error.
+        Err(_) => Ok(()),
+    }
 }
 
 fn check() -> anyhow::Result<()> {
@@ -187,6 +208,14 @@ fn build_apps(root: &std::path::Path) -> anyhow::Result<()> {
         build_std_app(root, &stage1_rustc, &user_linker, &ws_target)?;
     } else {
         println!("  [skip] hello-std: stage1 rustc not found (build ../rust first)");
+        // The kernel embeds hello-std.stripped via include_bytes! and only
+        // spawns it on demand from the shell — a dummy ELF stub lets the
+        // kernel link and boot without the stage1 toolchain.
+        std::fs::create_dir_all(&target_dir)?;
+        let stub = target_dir.join("hello-std.stripped");
+        if !stub.exists() {
+            std::fs::write(&stub, b"\x7fELF\x02\x01\x01")?;
+        }
     }
 
     Ok(())
@@ -651,14 +680,6 @@ fn qemu_screenshot(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
-    // Same dummy-stub trick as qemu_smoke so we don't need stage1 rustc.
-    let nostd_target = root.join("target/aarch64-unknown-none/debug");
-    std::fs::create_dir_all(&nostd_target)?;
-    let hello_std = nostd_target.join("hello-std.stripped");
-    if !hello_std.exists() {
-        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
-    }
-
     build(&["--platform".to_string(), "qemu-virt".to_string()])?;
     let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
     let kernel = elf_to_image(&kernel_elf)?;
@@ -778,14 +799,6 @@ fn qemu_animation(args: &[String]) -> anyhow::Result<()> {
             "--out"      => { out_path = PathBuf::from(&args[i+1]); i += 2; }
             o => anyhow::bail!("unknown flag: {o}"),
         }
-    }
-
-    // Same dummy-stub trick as qemu_screenshot so we don't need stage1 rustc.
-    let nostd_target = root.join("target/aarch64-unknown-none/debug");
-    std::fs::create_dir_all(&nostd_target)?;
-    let hello_std = nostd_target.join("hello-std.stripped");
-    if !hello_std.exists() {
-        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
     }
 
     build(&["--platform".to_string(), "qemu-virt".to_string()])?;
@@ -962,14 +975,6 @@ fn qemu_smoke_net() -> anyhow::Result<()> {
 
     let root = workspace_root();
 
-    // Same hello-std placeholder dance as run_smoke so the kernel links.
-    let nostd_target = root.join("target/aarch64-unknown-none/debug");
-    std::fs::create_dir_all(&nostd_target)?;
-    let hello_std = nostd_target.join("hello-std.stripped");
-    if !hello_std.exists() {
-        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
-    }
-
     build(&["--platform".to_string(), "qemu-virt".to_string()])?;
     let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
     anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
@@ -1066,13 +1071,6 @@ fn qemu_smoke_net_userspace() -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     let root = workspace_root();
-
-    let nostd_target = root.join("target/aarch64-unknown-none/debug");
-    std::fs::create_dir_all(&nostd_target)?;
-    let hello_std = nostd_target.join("hello-std.stripped");
-    if !hello_std.exists() {
-        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
-    }
 
     build(&["--platform".to_string(), "qemu-virt".to_string()])?;
     let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
@@ -1284,13 +1282,6 @@ fn qemu_bench(args: &[String]) -> anyhow::Result<()> {
 
     let root = workspace_root();
 
-    let nostd_target = root.join("target/aarch64-unknown-none/debug");
-    std::fs::create_dir_all(&nostd_target)?;
-    let hello_std = nostd_target.join("hello-std.stripped");
-    if !hello_std.exists() {
-        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
-    }
-
     build(&["--platform".to_string(), "qemu-virt".to_string()])?;
     let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
     anyhow::ensure!(kernel_elf.exists(), "kernel binary not found at {}", kernel_elf.display());
@@ -1487,13 +1478,6 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
     const SECRET: &str = "S3CR3T_M8_much_longer_than_fifteen_bytes_OK_42";
 
     let root = workspace_root();
-
-    let nostd_target = root.join("target/aarch64-unknown-none/debug");
-    std::fs::create_dir_all(&nostd_target)?;
-    let hello_std = nostd_target.join("hello-std.stripped");
-    if !hello_std.exists() {
-        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
-    }
 
     build(&["--platform".to_string(), "qemu-virt".to_string()])?;
     let kernel_elf = root.join("target/aarch64-unknown-none/debug/beetos-kernel");
@@ -1839,17 +1823,6 @@ fn run_smoke(name: &str, with_disk: bool, markers: &[&str]) -> anyhow::Result<()
     use std::process::Stdio;
 
     let root = workspace_root();
-
-    // hello-std.stripped is embedded via include_bytes! at kernel build time.
-    // Without the stage1 rustc we can't build it, but the kernel only spawns
-    // it on demand from the shell — a dummy placeholder lets the kernel link
-    // and boot. (build_apps() prints the same "[skip] hello-std" notice.)
-    let nostd_target = root.join("target/aarch64-unknown-none/debug");
-    std::fs::create_dir_all(&nostd_target)?;
-    let hello_std = nostd_target.join("hello-std.stripped");
-    if !hello_std.exists() {
-        std::fs::write(&hello_std, b"\x7fELF\x02\x01\x01")?;
-    }
 
     build(&["--platform".to_string(), "qemu-virt".to_string()])?;
 
