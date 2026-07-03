@@ -42,6 +42,7 @@ mod hosted {
         block_size: u32,
     }
 
+    #[allow(dead_code)] // hosted/test backends, exercised by the #[cfg(test)] contract tests
     impl MemBlockDevice {
         pub fn new(block_size: u32, n_blocks: u64) -> Self {
             let len = (block_size as u64 * n_blocks) as usize;
@@ -92,6 +93,7 @@ mod hosted {
         n_blocks:   u64,
     }
 
+    #[allow(dead_code)]
     impl FileBlockDevice {
         pub fn open_or_create(
             path: impl AsRef<std::path::Path>,
@@ -142,6 +144,7 @@ mod hosted {
 }
 
 #[cfg(not(beetos))]
+#[allow(unused_imports)] // re-exported for the #[cfg(test)] contract tests
 pub use hosted::{FileBlockDevice, MemBlockDevice};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +155,7 @@ pub use hosted::{FileBlockDevice, MemBlockDevice};
 /// [`BlockDevice`]. Single-namespace device today — each
 /// adapter targets one (namespace_id, block_size, capacity)
 /// combination, discovered up-front via IDENTIFY.
+#[allow(dead_code)] // NVMe backend: constructed by the M3b Apple-ANS port + contract tests
 pub struct NvmeBlockDevice<T: crate::nvme::Transport> {
     transport:    T,
     namespace_id: u32,
@@ -162,6 +166,7 @@ pub struct NvmeBlockDevice<T: crate::nvme::Transport> {
     next_cid:     u16,
 }
 
+#[allow(dead_code)]
 impl<T: crate::nvme::Transport> NvmeBlockDevice<T> {
     /// Discover capacity + block size by issuing IDENTIFY_NAMESPACE,
     /// then wrap the transport.  `nsid` is typically 1 on every
@@ -228,8 +233,10 @@ impl<T: crate::nvme::Transport> BlockDevice for NvmeBlockDevice<T> {
 /// call, so the static cap is fine in practice (every Sqe::write we
 /// issue is one block).
 #[cfg(not(beetos))]
+#[allow(dead_code)]
 struct Scratch(Vec<u8>);
 #[cfg(beetos)]
+#[allow(dead_code)]
 struct Scratch { buf: [u8; 4096], len: usize }
 
 #[cfg(not(beetos))]
@@ -242,8 +249,10 @@ impl AsMut<[u8]> for Scratch {
 }
 
 #[cfg(not(beetos))]
+#[allow(dead_code)]
 fn scratch_buffer(len: usize) -> Scratch { Scratch(vec![0u8; len]) }
 #[cfg(beetos)]
+#[allow(dead_code)]
 fn scratch_buffer(len: usize) -> Scratch {
     // Kernel-side: bounded to one page. Callers passing larger
     // payloads need to chunk — enforced by the assert.
@@ -264,12 +273,14 @@ fn scratch_buffer(len: usize) -> Scratch {
 /// don't have to know what the controller's current command set
 /// supports. CMD18 / CMD25 batching lands once we have IRQ-driven
 /// completion.
+#[allow(dead_code)] // SDHCI backend: constructed by the RPi5 platform port + contract tests
 pub struct SdBlockDevice<'a, M: crate::sdhci::Mmio> {
     host:       crate::sdhci::Host<'a, M>,
     block_size: u32,
     capacity:   u64,
 }
 
+#[allow(dead_code)]
 impl<'a, M: crate::sdhci::Mmio> SdBlockDevice<'a, M> {
     /// Build the adapter from an already-initialised Host + the
     /// `CardInfo` returned by [`platform::bcm2712::sdhci_brcm::init`].
@@ -323,6 +334,7 @@ impl<'a, M: crate::sdhci::Mmio> BlockDevice for SdBlockDevice<'a, M> {
     }
 }
 
+#[allow(dead_code)]
 fn map_sdhci_err(e: crate::sdhci::HostError) -> BlockError {
     use crate::sdhci::HostError as H;
     match e {
