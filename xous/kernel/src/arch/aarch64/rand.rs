@@ -14,8 +14,12 @@
 //! (`CNTVCT_EL0`) into the state. The counter advances by a boot-timing- and
 //! workload-dependent amount between the reset vector and the first nonce
 //! draw, so two boots do not replay the same first nonce. This is a
-//! best-effort entropy source, NOT a CSPRNG; the security guarantee for the
-//! crypt area rests on RNDR being present on real hardware.
+//! best-effort entropy source, NOT a CSPRNG.
+//!
+//! NOTE: entropy consumers must go through `crate::platform::rand::get_u32`
+//! rather than calling this module directly — the platform seam upgrades
+//! the source to a hardware RNG where one exists (virtio-rng on QEMU
+//! virt), and only lands here as the last resort.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

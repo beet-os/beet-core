@@ -20,11 +20,14 @@
 //!
 //! - **Nonce**: fresh kernel entropy (`SysCall::GetRandom`) on every
 //!   write — no counters to persist. Reuse resistance is only as good
-//!   as the kernel RNG: on real hardware `GetRandom` is FEAT_RNG (RNDR),
-//!   but on QEMU's default `neoverse-n1` CPU it degrades to a
-//!   counter-mixed xorshift PRNG (see `arch/aarch64/rand.rs`). That
-//!   fallback is fine for the dev/CI loop but is **not** a CSPRNG — do
-//!   not treat the QEMU crypt area as protecting real secrets.
+//!   as the kernel RNG: `GetRandom` routes through the platform seam,
+//!   which is virtio-rng (real host entropy) on QEMU — the xtask
+//!   invocations all pass `-device virtio-rng-device` and the smoke
+//!   suite asserts the device came up — and FEAT_RNG (RNDR) on real
+//!   silicon. Only when both are absent does it degrade to the
+//!   counter-mixed xorshift PRNG in `arch/aarch64/rand.rs`, which is
+//!   **not** a CSPRNG — don't trust the crypt area with real secrets
+//!   on such a configuration.
 //! - **AAD**: the slot's absolute LBA. A sealed sector copied to a
 //!   different LBA fails authentication, so ciphertext can't be
 //!   shuffled around the disk undetected.

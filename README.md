@@ -98,7 +98,7 @@ beet-core/
 | `cargo run`         | Run the OS in hosted mode (kernel as a normal process)       |
 | `cargo xtask build` | Cross-compile everything for `aarch64-unknown-none`          |
 | `cargo xtask qemu`  | Build + launch QEMU virt                                     |
-| `cargo xtask qemu-smoke`      | Boot QEMU and verify 13 progress markers (CI)      |
+| `cargo xtask qemu-smoke`      | Boot QEMU and verify 14 progress markers (CI)      |
 | `cargo xtask qemu-smoke-nodisk` | Boot without a disk — verifies graceful degradation |
 | `cargo xtask qemu-smoke-net`  | DHCP + TCP remote console + `ifconfig`/`ping` (CI) |
 | `cargo xtask qemu-smoke-net-userspace` | `api/net` sockets: listen + connect (CI)  |

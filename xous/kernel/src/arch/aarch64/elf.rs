@@ -124,8 +124,10 @@ pub unsafe fn load_elf(
 
     // Calculate ASLR slide for PIE executables
     let aslr_slide = if header.e_type == ET_DYN {
-        // Generate a random slide aligned to PAGE_SIZE
-        let random = crate::arch::rand::get_u32() as usize;
+        // Generate a random slide aligned to PAGE_SIZE. Goes through
+        // the platform seam so the slide gets hardware entropy where
+        // available (virtio-rng on QEMU, RNDR on real silicon).
+        let random = crate::platform::rand::get_u32() as usize;
         let range = beetos::ASLR_END - beetos::ASLR_START;
         let slide = beetos::ASLR_START + (random % (range / beetos::PAGE_SIZE)) * beetos::PAGE_SIZE;
         slide

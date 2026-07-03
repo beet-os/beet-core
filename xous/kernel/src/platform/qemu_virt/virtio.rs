@@ -50,6 +50,7 @@ pub const STATUS_FAILED: u32 = 128;
 
 /// Device IDs.
 pub const DEVICE_ID_BLOCK: u32 = 2;
+pub const DEVICE_ID_ENTROPY: u32 = 4;
 
 /// QEMU virt: 32 virtio MMIO transports.
 pub const NUM_TRANSPORTS: usize = 32;

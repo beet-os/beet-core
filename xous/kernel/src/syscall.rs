@@ -879,10 +879,15 @@ pub fn handle(tid: TID, call: SysCall) -> SysCallResult {
 
         #[cfg(beetos)]
         SysCall::GetRandom => {
-            let r0 = ((crate::arch::rand::get_u32() as usize) << 32)
-                | crate::arch::rand::get_u32() as usize;
-            let r1 = ((crate::arch::rand::get_u32() as usize) << 32)
-                | crate::arch::rand::get_u32() as usize;
+            // Route through the platform seam, NOT arch::rand directly:
+            // on QEMU the platform layer upgrades this to virtio-rng
+            // (real host entropy). These bytes feed the AES-GCM nonces
+            // in api/cryptblock, so they deserve the best source the
+            // platform has.
+            let r0 = ((crate::platform::rand::get_u32() as usize) << 32)
+                | crate::platform::rand::get_u32() as usize;
+            let r1 = ((crate::platform::rand::get_u32() as usize) << 32)
+                | crate::platform::rand::get_u32() as usize;
             Ok(Result::Scalar2(r0, r1))
         }
 

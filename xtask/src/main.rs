@@ -525,6 +525,7 @@ fn qemu(args: &[String]) -> anyhow::Result<()> {
     let mut qemu_args = vec![
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-device".to_string(), "virtio-rng-device".to_string(),
         "-m".to_string(), "2G".to_string(),
         "-serial".to_string(), "stdio".to_string(),
         "-monitor".to_string(), "none".to_string(),
@@ -698,6 +699,7 @@ fn qemu_screenshot(args: &[String]) -> anyhow::Result<()> {
         .args([
             "-machine", "virt,gic-version=3",
             "-cpu", "neoverse-n1",
+            "-device", "virtio-rng-device",
             "-m", "2G",
             "-display", "none",
             "-device", "ramfb",
@@ -820,6 +822,7 @@ fn qemu_animation(args: &[String]) -> anyhow::Result<()> {
         .args([
             "-machine", "virt,gic-version=3",
             "-cpu", "neoverse-n1",
+            "-device", "virtio-rng-device",
             "-m", "2G",
             "-display", "none",
             "-device", "ramfb",
@@ -924,6 +927,10 @@ fn qemu_smoke() -> anyhow::Result<()> {
         "UART: address from FDT",
         "GIC: initialized (address from FDT)",
         "Timer: initialized",
+        // Real entropy for GetRandom (feeds the AES-GCM nonces in the
+        // crypt area). A regression here silently downgrades to the
+        // xorshift fallback, so it must fail the smoke.
+        "virtio-rng: entropy source ready",
         "MMU: enabled",
         "EL0: loading shell ELF",
         "Disk: mapped into block service",
@@ -995,6 +1002,7 @@ fn qemu_smoke_net() -> anyhow::Result<()> {
     let qemu_args = vec![
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-device".to_string(), "virtio-rng-device".to_string(),
         "-m".to_string(), "2G".to_string(),
         "-display".to_string(), "none".to_string(),
         "-device".to_string(), "ramfb".to_string(),
@@ -1101,6 +1109,7 @@ fn qemu_smoke_net_userspace() -> anyhow::Result<()> {
     let qemu_args = vec![
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-device".to_string(), "virtio-rng-device".to_string(),
         "-m".to_string(), "2G".to_string(),
         "-display".to_string(), "none".to_string(),
         "-device".to_string(), "ramfb".to_string(),
@@ -1300,6 +1309,7 @@ fn qemu_bench(args: &[String]) -> anyhow::Result<()> {
     let qemu_args = vec![
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-device".to_string(), "virtio-rng-device".to_string(),
         "-m".to_string(), "2G".to_string(),
         // Headless on purpose — and *no ramfb*: with a framebuffer
         // present, the kernel recomposes the boot desktop at 10 Hz
@@ -1500,6 +1510,7 @@ fn qemu_smoke_crypt() -> anyhow::Result<()> {
         let qemu_args = vec![
             "-machine".to_string(), "virt,gic-version=3".to_string(),
             "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-device".to_string(), "virtio-rng-device".to_string(),
             "-m".to_string(), "2G".to_string(),
             "-display".to_string(), "none".to_string(),
             "-chardev".to_string(),
@@ -1850,6 +1861,7 @@ fn run_smoke(name: &str, with_disk: bool, markers: &[&str]) -> anyhow::Result<()
     let mut qemu_args = vec![
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-device".to_string(), "virtio-rng-device".to_string(),
         "-m".to_string(), "2G".to_string(),
         "-display".to_string(), "none".to_string(),
         "-device".to_string(), "ramfb".to_string(),
@@ -1959,6 +1971,7 @@ fn test() -> anyhow::Result<()> {
     let mut qemu_args = vec![
         "-machine".to_string(), "virt,gic-version=3".to_string(),
         "-cpu".to_string(), "neoverse-n1".to_string(),
+        "-device".to_string(), "virtio-rng-device".to_string(),
         "-m".to_string(), "2G".to_string(),
         "-nographic".to_string(),
         "-kernel".to_string(), kernel.to_str().expect("non-UTF8 path").to_string(),

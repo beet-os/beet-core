@@ -19,6 +19,7 @@ pub mod fb;
 pub mod gic;
 pub mod input;
 pub mod net;
+pub mod rng;
 pub mod net_stack;
 pub mod tcp;
 pub mod timer;
@@ -91,6 +92,7 @@ pub fn init(fdt_phys: *const u8) {
     }
 
     blk::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
+    rng::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
     net::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
     net_stack::init();
     input::probe_and_init(beetos::phys_to_virt(virtio::VIRTIO_BASE_PHYS));
@@ -119,10 +121,12 @@ pub fn shutdown() -> ! {
     }
 }
 
-/// Platform-specific random number using arch RNDR or counter-based fallback.
+/// Platform random numbers: virtio-rng (real host entropy) when the
+/// device is present, otherwise the arch fallback (RNDR if the CPU has
+/// FEAT_RNG, else the counter-mixed xorshift PRNG).
 pub mod rand {
     pub fn get_u32() -> u32 {
-        crate::arch::rand::get_u32()
+        super::rng::get_u32().unwrap_or_else(crate::arch::rand::get_u32)
     }
 }
 
