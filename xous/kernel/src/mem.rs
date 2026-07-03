@@ -104,6 +104,15 @@ std::thread_local!(static MEMORY_MANAGER: core::cell::RefCell<MemoryManager> = c
 #[cfg(beetos)]
 static mut MEMORY_MANAGER: MemoryManager = MemoryManager::default_hack();
 
+/// Reentrancy tripwire for `with_mut`. `zero_some_dirty_pages` unmasks
+/// IRQs while holding `&mut MEMORY_MANAGER`; if any IRQ-context path
+/// re-entered the allocator we would have two live `&mut` aliases and
+/// silently corrupt the free bitmaps with no panic. No IRQ path touches
+/// the allocator today — this catches the first one that ever does.
+#[cfg(all(beetos, debug_assertions))]
+static MM_BORROWED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Initialize the memory map.
 /// This will go through memory and map anything that the kernel is
 /// using to process 1, then allocate a pagetable for this process
@@ -130,8 +139,17 @@ impl MemoryManager {
         F: FnOnce(&mut MemoryManager) -> R,
     {
         #[cfg(beetos)]
-        unsafe {
-            f(&mut *addr_of_mut!(MEMORY_MANAGER))
+        {
+            #[cfg(debug_assertions)]
+            assert!(
+                !MM_BORROWED.swap(true, core::sync::atomic::Ordering::SeqCst),
+                "MemoryManager::with_mut re-entered — an IRQ path touched the \
+                 allocator during the zeroer's IRQ-open window"
+            );
+            let r = unsafe { f(&mut *addr_of_mut!(MEMORY_MANAGER)) };
+            #[cfg(debug_assertions)]
+            MM_BORROWED.store(false, core::sync::atomic::Ordering::SeqCst);
+            r
         }
 
         #[cfg(not(beetos))]
@@ -473,11 +491,20 @@ impl MemoryManager {
                 // Return the tail of the run to the dirty bitmap so a
                 // future visit can pick it up — we never want to take
                 // more than our budget out of either pool.
-                let tail_offset = self.address_to_allocation_offset(
-                    phys_start + remaining * PAGE_SIZE,
-                ).unwrap();
-                self.free_pages_dirty[tail_offset..tail_offset + (pages - remaining)].fill(true);
-                pages = remaining;
+                match self.address_to_allocation_offset(phys_start + remaining * PAGE_SIZE) {
+                    Some(tail_offset) => {
+                        self.free_pages_dirty[tail_offset..tail_offset + (pages - remaining)]
+                            .fill(true);
+                        pages = remaining;
+                    }
+                    // The offset is always valid (phys_start came from the
+                    // bitmap and the tail is within the same contiguous
+                    // run), but the kernel must not unwrap: if it somehow
+                    // isn't, zero the whole run this visit rather than
+                    // panic or lose the tail pages. Only overshoots the
+                    // idle budget for this one visit.
+                    None => {}
+                }
             }
             // Heavy work: 16 KiB per page memset. Drop the IRQ mask so
             // UART / timer / virtio handlers can still run during the
@@ -546,10 +573,6 @@ impl MemoryManager {
     ) -> Result<MemoryRange, Error> {
         let mut current_mapping = crate::arch::mem::MemoryMapping::current();
         let virt = self.find_virtual_address(&current_mapping, virt_ptr, size)?;
-        #[cfg(beetos)]
-        let mut _zero_after_alloc =
-            beetos::is_address_in_plaintext_dram(phys) || beetos::is_address_encrypted(phys);
-
         if flags.is_set(MemoryFlags::POPULATE) {
             if !flags.is_set(MemoryFlags::W) {
                 return Err(Error::InvalidArguments);
@@ -560,17 +583,30 @@ impl MemoryManager {
             #[cfg(beetos)]
             {
                 let (allocated, zeroed) = self.alloc_range(size / PAGE_SIZE, current_mapping.get_pid())?;
-                _zero_after_alloc = !zeroed;
+                // The background zeroer may hand out a dirty page when the
+                // zeroed pool is empty. A POPULATE mapping goes straight to
+                // userspace (MapMemory is unprivileged), so a dirty page
+                // would leak another process's freed data. Zero eagerly.
+                let mut zero_after_alloc = !zeroed;
                 if flags.is_set(MemoryFlags::PLAINTEXT)
                     || flags.is_set(MemoryFlags::NO_CACHE)
                     || flags.is_set(MemoryFlags::DEV)
                 {
                     // Pages are "encrypted zeroed". If we read them as plaintext, they would be garbage, so
                     // we need to zero it again.
-                    _zero_after_alloc = true;
+                    zero_after_alloc = true;
                     phys = to_plaintext_phys_addr(allocated)
                 } else {
                     phys = allocated;
+                }
+                if zero_after_alloc {
+                    // Zero through the TTBR1 linear map, not the user VA:
+                    // EL1 cannot write to EL0-only pages (the original bug
+                    // that made this zeroing get dropped). `to_plaintext_*`
+                    // is identity today; when a memory-encryption layer
+                    // activates, this must zero the same alias as `phys`.
+                    let va = beetos::phys_to_virt(allocated);
+                    unsafe { core::ptr::write_bytes(va as *mut u8, 0, size); }
                 }
             }
         } else if phys != 0 {
@@ -625,12 +661,12 @@ impl MemoryManager {
             }
         }
 
-        let mut mem = unsafe { MemoryRange::new(virt as usize, size)? };
+        let mem = unsafe { MemoryRange::new(virt as usize, size)? };
 
-        // Note: zeroing of POPULATE'd pages is skipped here.
-        // The dlmalloc allocator handles zeroing in userspace via allocates_zeros=false.
-        // The original code tried to zero via the user VA which caused a permission fault
-        // (EL1 cannot write to EL0-only pages).
+        // POPULATE'd pages are zeroed above (through the TTBR1 linear map)
+        // when they come from the dirty pool, so no un-zeroed page reaches
+        // userspace. dlmalloc still runs with allocates_zeros=false, but we
+        // no longer rely on it for the info-leak guarantee.
         Ok(mem)
     }
 
@@ -944,6 +980,17 @@ impl MemoryManager {
                 // TODO: Do not free lent pages, but instead reparent them, so that when they
                 //       are returned, they can be properly freed.
                 //       This can be done by walking the page tables.
+                //
+                // NOW-ACTIVE HAZARD (was dormant before the background
+                // zeroer): a page this PID lent to a server is still
+                // mapped in that server (our lend_page adds a second
+                // mapping and does not revoke it). Freeing it here drops
+                // it into free_pages_dirty and the zeroer below then
+                // memsets it *while the server may still be reading it* on
+                // a client-abort death edge (TerminatePid mid-borrow).
+                // Previously the freed page merely sat unmodified. The
+                // real fix is the break-then-make / reparent work gated in
+                // arch/aarch64/mem.rs (lend_page) + services::lend_memory.
                 self.allocations[idx] = None;
                 if idx < RAM_PAGES {
                     self.free_pages_dirty.set(idx, true);

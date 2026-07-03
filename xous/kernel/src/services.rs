@@ -668,23 +668,28 @@ impl SystemServices {
         // currently-unreachable hazard.
         //
         // Until then, make the unsafe precondition LOUD instead of
-        // silent: if the lending process has another thread ready to
-        // run, the single-thread assumption is violated. Debug-only, so
-        // it costs nothing in production but trips our CI smokes the day
-        // someone adds a multi-threaded lender.
+        // silent: if the lending process has ANY other live thread, the
+        // single-thread assumption is violated. We count every non-`Free`
+        // sibling, not just `Ready` ones — a thread parked in `WaitEvent`
+        // (e.g. the async-rt reactor) or `RetryQueueFull` is not runnable
+        // at this instant but can be woken *during* the outstanding borrow
+        // (including from an IRQ via post_notification_bits) and then race
+        // the receiver. Debug-only, so it costs nothing in production but
+        // trips our CI smokes the day someone adds a multi-threaded lender.
         #[cfg(beetos)]
         debug_assert!(
             {
                 let proc = self.current_process();
-                let ready = (1..crate::arch::process::MAX_THREAD_COUNT)
-                    .filter(|&t| proc.thread_state(t) == crate::process::ThreadState::Ready)
+                let live = (1..crate::arch::process::MAX_THREAD_COUNT)
+                    .filter(|&t| proc.thread_state(t) != crate::process::ThreadState::Free)
                     .count();
-                ready <= 1
+                live <= 1
             },
             "lend_memory from a multi-threaded process (PID {}): the AArch64 \
-             lend keeps the sender's mapping live, so a sibling thread can race \
-             the receiver on the shared page. Implement break-then-make before \
-             lending from multi-threaded processes (see arch/aarch64/mem.rs).",
+             lend keeps the sender's mapping live, so a sibling thread (ready, \
+             waiting, or retrying) can race the receiver on the shared page. \
+             Implement break-then-make before lending from multi-threaded \
+             processes (see arch/aarch64/mem.rs).",
             current_pid.get(),
         );
 
